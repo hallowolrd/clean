@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -14,6 +15,7 @@ from data.loaders import build_dataloaders
 from data.partition import partition_dataset, partition_summary_to_dict
 from fl.server import build_server, resolve_device
 from utils.config import ensure_run_dir, load_config, save_config
+from utils.logging import tee_output_to_file
 from utils.seed import set_seed
 
 
@@ -39,16 +41,12 @@ def main() -> int:
     """
     训练入口。
 
-    总流程：
+    这里负责：
         1. 读取配置
         2. 设置随机种子
         3. 创建输出目录
-        4. 加载数据集
-        5. 划分客户端数据
-        6. 创建 DataLoader
-        7. 创建 FLServer
-        8. 执行联邦训练
-        9. 保存结果
+        4. 打开 train.log 双写
+        5. 调用 run_training() 执行实际训练
     """
     args = parse_args()
 
@@ -59,12 +57,50 @@ def main() -> int:
         deterministic=bool(cfg.get("deterministic", False)),
     )
 
-    run_dir = ensure_run_dir(cfg)
+    run_dir = Path(ensure_run_dir(cfg))
+    log_path = run_dir / "train.log"
 
+    with tee_output_to_file(log_path):
+        try:
+            return run_training(
+                args=args,
+                cfg=cfg,
+                run_dir=run_dir,
+            )
+        except Exception:
+            print()
+            print("=" * 80)
+            print("[Train] Failed")
+            print("=" * 80)
+            traceback.print_exc()
+            return 1
+
+
+def run_training(
+    args: argparse.Namespace,
+    cfg: Any,
+    run_dir: Path,
+) -> int:
+    """
+    实际训练流程。
+
+    这个函数会被 main() 包在 tee_output_to_file() 里面，
+    所以这里所有 print 和报错都会同时写入控制台和 train.log。
+
+    总流程：
+        1. 保存配置
+        2. 解析设备
+        3. 加载数据集
+        4. 划分客户端数据
+        5. 创建 DataLoader
+        6. 创建 FLServer
+        7. 执行联邦训练
+        8. 保存结果
+    """
     if bool(cfg.get("logging.save_config", True)):
         save_config(
             cfg=cfg,
-            output_path=Path(run_dir) / "config_used.yaml",
+            output_path=run_dir / "config_used.yaml",
         )
 
     device = resolve_device(cfg)
@@ -75,6 +111,7 @@ def main() -> int:
     print(f"[Train] config: {args.config}")
     print(f"[Train] run_name: {cfg.run_name}")
     print(f"[Train] run_dir: {cfg.run_dir}")
+    print(f"[Train] log_file: {run_dir / 'train.log'}")
     print(f"[Train] device: {device}")
     print("=" * 80)
     print()
@@ -100,7 +137,7 @@ def main() -> int:
 
     save_partition_summary(
         partition=partition,
-        output_path=Path(run_dir) / "partition_summary.json",
+        output_path=run_dir / "partition_summary.json",
     )
 
     loader_bundle = build_dataloaders(
@@ -121,7 +158,7 @@ def main() -> int:
 
     save_train_outputs(
         train_result=train_result,
-        output_dir=Path(run_dir),
+        output_dir=run_dir,
         save_csv=bool(cfg.get("logging.save_results_csv", True)),
     )
 
