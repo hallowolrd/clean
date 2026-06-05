@@ -125,6 +125,7 @@ class FisherKFACExpertAggregator(Aggregator):
         solved_params = set()
         fallback_params = set()
         skipped_layers: List[str] = []
+        valid_client_ids = set()
 
         valid_layers = 0
         valid_client_layers = 0
@@ -189,6 +190,7 @@ class FisherKFACExpertAggregator(Aggregator):
             valid_layers += 1
             valid_client_layers += int(layer_diag["valid_clients"])
             total_count += int(layer_diag["total_count"])
+            valid_client_ids.update(int(entry["client_id"]) for entry in entries)
             trace_A_values.extend(layer_diag["trace_A_values"])
             trace_B_values.extend(layer_diag["trace_B_values"])
             grad_norm_values.extend(layer_diag["grad_norm_values"])
@@ -226,6 +228,15 @@ class FisherKFACExpertAggregator(Aggregator):
             param_names=target_param_names,
         )
 
+        mean_count = float(total_count / max(valid_client_layers, 1))
+
+        cos_kfac_uniform = _cos_kfac_uniform(
+            global_state=global_state,
+            new_state_dict=new_state_dict,
+            client_updates=client_updates,
+            param_names=sorted(solved_params),
+        )
+
         diagnostics = {
             "method": self.method_name,
             "param_group": self.param_group_name,
@@ -236,10 +247,12 @@ class FisherKFACExpertAggregator(Aggregator):
                 for client_id, weight in sample_weights.items()
             },
             "valid_layers": int(valid_layers),
+            "valid_clients": int(len(valid_client_ids)),
             "skipped_layers": int(len(skipped_layers)),
             "skipped_layer_names": list(skipped_layers[:20]),
             "valid_client_layers": int(valid_client_layers),
             "total_count": int(total_count),
+            "mean_count": float(mean_count),
             "mean_trace_A": _safe_mean(trace_A_values),
             "mean_trace_B": _safe_mean(trace_B_values),
             "max_trace_A": _safe_max(trace_A_values),
@@ -247,6 +260,7 @@ class FisherKFACExpertAggregator(Aggregator):
             "mean_grad_norm": _safe_mean(grad_norm_values),
             "max_grad_norm": _safe_max(grad_norm_values),
             "mean_delta_norm": _safe_mean(delta_norm_values),
+            "cos_kfac_uniform": float(cos_kfac_uniform),
             "server_steps": int(server_steps),
             "server_lr": float(server_lr),
             "damping": float(damping),
@@ -255,6 +269,25 @@ class FisherKFACExpertAggregator(Aggregator):
             "solved_params": int(len(solved_params)),
             "fallback_params": int(len(fallback_params)),
         }
+
+        if bool(_cfg_get(self.cfg, "kfac.log_detail", True)):
+            print(
+                "[ExpertKFAC] "
+                f"valid_layers={diagnostics['valid_layers']} "
+                f"valid_clients={diagnostics['valid_clients']} "
+                f"skipped_layers={diagnostics['skipped_layers']} "
+                f"total_count={diagnostics['total_count']} "
+                f"mean_count={diagnostics['mean_count']:.2f} "
+                f"mean_trace_A={diagnostics['mean_trace_A']:.6e} "
+                f"mean_trace_B={diagnostics['mean_trace_B']:.6e} "
+                f"solver_steps={diagnostics['server_steps']} "
+                f"server_lr={diagnostics['server_lr']:.6g} "
+                f"mean_grad_norm={diagnostics['mean_grad_norm']:.6e} "
+                f"mean_delta_norm={diagnostics['mean_delta_norm']:.6e} "
+                f"fallback_params={diagnostics['fallback_params']} "
+                f"cos_kfac_uniform={diagnostics['cos_kfac_uniform']:.6f}",
+                flush=True,
+            )
 
         return AggregationResult(
             new_state_dict=new_state_dict,
@@ -672,6 +705,70 @@ def _resolve_param_names(
             raise KeyError(f"global_state 中不存在参数：{name}")
 
     return names
+
+
+def _cos_kfac_uniform(
+    global_state: Mapping[str, torch.Tensor],
+    new_state_dict: Mapping[str, torch.Tensor],
+    client_updates: Sequence[ClientUpdate],
+    param_names: Sequence[str],
+) -> float:
+    """
+    计算 K-FAC 聚合方向和 uniform 直接平均方向的余弦相似度。
+
+    cos 接近 1：
+        K-FAC 基本退化成 uniform 直接平均。
+
+    cos 明显小于 1：
+        K-FAC 改变了专家聚合方向。
+    """
+    if len(param_names) == 0:
+        return 0.0
+
+    if len(client_updates) == 0:
+        return 0.0
+
+    uniform_weight = 1.0 / float(len(client_updates))
+
+    dot = 0.0
+    norm_kfac = 0.0
+    norm_uniform = 0.0
+
+    for name in param_names:
+        if name not in global_state or name not in new_state_dict:
+            continue
+
+        if not torch.is_tensor(global_state[name]):
+            continue
+        if not torch.is_floating_point(global_state[name]):
+            continue
+
+        kfac_delta = (
+            new_state_dict[name].detach().cpu().float()
+            - global_state[name].detach().cpu().float()
+        )
+
+        uniform_delta = torch.zeros_like(kfac_delta)
+
+        for update in client_updates:
+            if name not in update.model_delta:
+                continue
+
+            uniform_delta = uniform_delta + uniform_weight * update.model_delta[
+                name
+            ].detach().cpu().float()
+
+        kfac_flat = kfac_delta.reshape(-1)
+        uniform_flat = uniform_delta.reshape(-1)
+
+        dot += float(torch.dot(kfac_flat, uniform_flat).item())
+        norm_kfac += float(torch.dot(kfac_flat, kfac_flat).item())
+        norm_uniform += float(torch.dot(uniform_flat, uniform_flat).item())
+
+    if norm_kfac <= 0 or norm_uniform <= 0:
+        return 0.0
+
+    return float(dot / ((norm_kfac ** 0.5) * (norm_uniform ** 0.5) + 1.0e-12))
 
 
 def _safe_mean(values: Sequence[float]) -> float:
