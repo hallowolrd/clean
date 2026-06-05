@@ -179,12 +179,21 @@ class FLServer:
             for progress_round_id in range(1, rounds + 1)
         )
 
+        # 进度条只写到 Python 原始 stderr，尽量绕开 train.py 里的 tee 日志捕获。
+        # 如果当前不是交互式终端，比如 nohup / 重定向 / 日志文件，则自动关闭进度条。
+        progress_file = getattr(sys, "__stderr__", sys.stderr)
+        progress_enabled = bool(
+            getattr(progress_file, "isatty", lambda: False)()
+        )
+
         progress_bar = tqdm(
             total=total_client_steps,
             desc="Training",
             dynamic_ncols=True,
             leave=True,
-            file=sys.stderr,
+            file=progress_file,
+            disable=not progress_enabled,
+            mininterval=0.5,
         )
 
         try:
@@ -208,16 +217,23 @@ class FLServer:
 
                     client_updates.extend(single_client_updates)
 
-                    progress_bar.update(len(single_client_updates))
                     progress_bar.set_postfix(
                         round=f"{round_id}/{rounds}",
                         client=int(client.client_id),
                         best=f"{self.train_state.best_acc:.2f}%",
+                        refresh=False,
                     )
+                    progress_bar.update(len(single_client_updates))
+
+                if not progress_bar.disable:
+                    progress_bar.clear()
 
                 aggregation_info = self.aggregate_client_updates(
                     client_updates=client_updates,
                 )
+
+                if not progress_bar.disable:
+                    progress_bar.refresh()
 
                 eval_result = self.evaluate_global_model()
 
@@ -252,10 +268,18 @@ class FLServer:
                     acc=f"{eval_result.acc:.2f}%",
                     best=f"{self.train_state.best_acc:.2f}%",
                     loss=avg_train_loss_text,
+                    refresh=False,
                 )
+                progress_bar.refresh()
 
                 if log_every > 0 and round_id % log_every == 0:
+                    if not progress_bar.disable:
+                        progress_bar.clear()
+
                     self.print_round_summary(round_result)
+
+                    if not progress_bar.disable:
+                        progress_bar.refresh()
 
                 self._cleanup_after_round()
 
@@ -446,7 +470,7 @@ class FLServer:
         else:
             avg_train_acc_text = f"{avg_train_acc:.2f}%"
 
-        tqdm.write(
+        print(
             f"[Round {round_result.round_id:03d}] "
             f"train_loss={avg_train_loss_text} | "
             f"train_acc={avg_train_acc_text} | "
