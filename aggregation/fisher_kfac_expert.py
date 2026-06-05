@@ -143,6 +143,7 @@ class FisherKFACExpertAggregator(Aggregator):
         trace_B_values: List[float] = []
         residual_norm_values: List[float] = []
         delta_norm_values: List[float] = []
+        solver_delta_norm_values: List[float] = []
 
         for layer_name in layer_names:
             entries = _collect_valid_layer_entries(
@@ -205,6 +206,7 @@ class FisherKFACExpertAggregator(Aggregator):
             trace_B_values.extend(layer_diag["trace_B_values"])
             residual_norm_values.extend(layer_diag["residual_norm_values"])
             delta_norm_values.append(float(layer_diag["delta_norm"]))
+            solver_delta_norm_values.append(float(layer_diag["solver_delta_norm"]))
 
             layer_client_counts = {
                 int(entry["client_id"]): int(entry["count"])
@@ -299,7 +301,11 @@ class FisherKFACExpertAggregator(Aggregator):
             # 兼容旧字段名：这里的 grad_norm 实际表示 CG 残差范数。
             "mean_grad_norm": _safe_mean(residual_norm_values),
             "max_grad_norm": _safe_max(residual_norm_values),
+            # mean_delta_norm 表示最终 K-FAC 参数相对上一轮 global 参数的真实更新幅度。
             "mean_delta_norm": _safe_mean(delta_norm_values),
+            "mean_global_delta_norm": _safe_mean(delta_norm_values),
+            # mean_solver_delta_norm 表示 K-FAC 解相对 FedAvg 初始点的修正幅度。
+            "mean_solver_delta_norm": _safe_mean(solver_delta_norm_values),
             "cos_kfac_uniform": float(cos_kfac_uniform),
             "solver_steps": int(solver_steps),
             "server_steps": int(solver_steps),
@@ -324,6 +330,7 @@ class FisherKFACExpertAggregator(Aggregator):
                 f"solver_steps={diagnostics['solver_steps']} "
                 f"mean_residual_norm={diagnostics['mean_residual_norm']:.6e} "
                 f"mean_delta_norm={diagnostics['mean_delta_norm']:.6e} "
+                f"mean_solver_delta_norm={diagnostics['mean_solver_delta_norm']:.6e} "
                 f"fallback_params={diagnostics['fallback_params']} "
                 f"cos_kfac_uniform={diagnostics['cos_kfac_uniform']:.6f}",
                 flush=True,
@@ -432,6 +439,17 @@ def _solve_kfac_linear_layer(
     for weight, entry in zip(weights, processed_entries):
         W_avg = W_avg + float(weight) * entry["local_aug"]
 
+    global_weight = global_state[weight_name].to(device=device, dtype=dtype)
+    global_bias = None
+    if include_bias and bias_name is not None and bias_name in global_state:
+        global_bias = global_state[bias_name].to(device=device, dtype=dtype)
+
+    W_global_aug = _make_augmented_weight(
+        weight=global_weight,
+        bias=global_bias,
+        include_bias=include_bias,
+    )
+
     rhs = torch.zeros_like(W_avg)
     for weight, entry in zip(weights, processed_entries):
         rhs = rhs + float(weight) * _kfac_matvec(
@@ -484,7 +502,10 @@ def _solve_kfac_linear_layer(
         include_bias=include_bias,
     )
 
-    delta_norm = float(
+    global_delta_norm = float(
+        (W_aug.detach().float() - W_global_aug.detach().float()).norm().item()
+    )
+    solver_delta_norm = float(
         (W_aug.detach().float() - W_avg.detach().float()).norm().item()
     )
 
@@ -500,7 +521,9 @@ def _solve_kfac_linear_layer(
             for entry in processed_entries
         ],
         "residual_norm_values": residual_norm_values,
-        "delta_norm": float(delta_norm),
+        "delta_norm": float(global_delta_norm),
+        "global_delta_norm": float(global_delta_norm),
+        "solver_delta_norm": float(solver_delta_norm),
     }
 
     return solved_weight, solved_bias, diagnostics
