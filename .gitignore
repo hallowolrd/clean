@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+datasets/
+outputs/
+*.log
+*.xlsx

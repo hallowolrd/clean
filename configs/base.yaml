@@ -6,7 +6,7 @@
 dataset: cifar10
 
 # 数据集保存路径
-data_root: ./data
+data_root: ./datasets
 
 
 # =========================
