@@ -1,0 +1,149 @@
+# =========================
+# 数据配置
+# =========================
+
+# 数据集名称：当前支持 cifar10 / cifar100
+dataset: cifar10
+
+# 数据集保存路径
+data_root: ./data
+
+
+# =========================
+# 联邦学习配置
+# =========================
+
+# 客户端数量
+num_clients: 10
+
+# Dirichlet non-IID 划分参数
+# alpha 越小，客户端数据越不均衡
+alpha: 0.1
+
+# 每轮参与训练的客户端比例
+# 1.0 表示每轮所有客户端都参与
+frac: 1.0
+
+# 联邦训练轮数
+rounds: 100
+
+# 每个客户端每轮本地训练 epoch 数
+local_epochs: 1
+
+
+# =========================
+# DataLoader 配置
+# =========================
+
+# 客户端本地训练 batch size
+batch_size: 64
+
+# 服务端测试 batch size
+test_batch_size: 256
+
+# DataLoader 使用的子进程数量
+num_workers: 2
+
+
+# =========================
+# 模型配置
+# =========================
+
+# 模型名称：当前先支持 resnet_moe
+model: resnet_moe
+
+# MoE expert 数量
+num_experts: 4
+
+# 每次路由激活的 expert 数量
+topk: 2
+
+
+# =========================
+# 优化器配置
+# =========================
+
+optimizer:
+  # 当前支持 sgd / adam / adamw
+  type: sgd
+
+  # 学习率
+  lr: 0.01
+
+  # SGD momentum
+  momentum: 0.9
+
+  # 权重衰减
+  weight_decay: 0.0001
+
+
+# =========================
+# 聚合配置
+# =========================
+
+agg:
+  # 非专家参数聚合方法
+  # 包括 backbone / router / classifier / shared layers
+  non_expert:
+    method: sample_weighted
+
+  # 专家参数聚合方法
+  # 包括 MoE experts
+  expert:
+    method: uniform
+
+
+# =========================
+# 运行配置
+# =========================
+
+# 随机种子
+seed: 42
+
+# 设备选择
+# auto 表示代码里自动选择 cuda 或 cpu
+device: auto
+
+# 输出根目录
+output_dir: outputs
+
+# 实验名
+# auto 表示自动根据配置生成实验文件夹名
+run_name: auto
+
+run:
+  # 同名实验目录存在时，自动追加 _v2 / _v3
+  unique_name: true
+
+  # 是否允许覆盖已有实验目录
+  overwrite: false
+
+
+# =========================
+# 日志配置
+# =========================
+
+logging:
+  # 每隔多少轮打印一次日志
+  log_every: 1
+
+  # 是否保存最终使用的配置
+  save_config: true
+
+  # 是否保存 results.csv
+  save_results_csv: true
+
+
+# =========================
+# checkpoint 配置
+# =========================
+
+checkpoint:
+  # 是否启用 checkpoint
+  enabled: true
+
+  # 是否保存最新 checkpoint
+  save_latest: true
+
+  # 是否保存最佳 checkpoint
+  save_best: true

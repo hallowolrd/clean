@@ -1,0 +1,8 @@
+include: base.yaml
+
+agg:
+  non_expert:
+    method: sample_weighted
+
+  expert:
+    method: sample_weighted
