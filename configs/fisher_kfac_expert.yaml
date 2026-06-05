@@ -5,4 +5,4 @@ agg:
     method: uniform
 
   expert:
-    method: sample_weighted
+    method: fisher_kfac_expert

@@ -108,7 +108,7 @@ class FisherKFACExpertAggregator(Aggregator):
         server_steps = int(_cfg_get(self.cfg, "kfac.server_steps", 5))
         server_lr = float(_cfg_get(self.cfg, "kfac.server_lr", 0.01))
         damping = float(_cfg_get(self.cfg, "kfac.damping", 1.0e-4))
-        fallback = str(_cfg_get(self.cfg, "kfac.fallback", "sample_weighted")).lower().strip()
+        fallback = str(_cfg_get(self.cfg, "kfac.fallback", "none")).lower().strip()
         max_grad_norm = float(_cfg_get(self.cfg, "kfac.max_grad_norm", 0.0))
 
         if min_count <= 0:
