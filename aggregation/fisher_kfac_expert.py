@@ -21,21 +21,24 @@ class FisherKFACExpertAggregator(Aggregator):
     这个聚合器只用于 expert 参数聚合，不用于 non_expert 参数。
 
     目标函数：
-
-        min_W sum_i p_i (W - W_i)^T F_i (W - W_i)
+        min_W sum_i p_i / 2 * <W - W_i, F_i(W - W_i)>
 
     其中：
-
         F_i ≈ A_i ⊗ B_i
 
     对 Linear 层，K-FAC matvec 为：
-
         F_i vec(DeltaW) ≈ vec(B_i @ DeltaW @ A_i)
+
+    服务端不再额外引入更新步长，而是直接求解 K-FAC/Fisher
+    加权聚合方程：
+        sum_i p_i * (B_i @ W @ A_i + damping * W)
+        =
+        sum_i p_i * (B_i @ W_i @ A_i + damping * W_i)
 
     说明：
         1. 客户端上传的是 A_mean、B_mean、count。
         2. 服务端用 count 作为证据强度，内部归一化成 p_i。
-        3. 没有 K-FAC 信息的参数 fallback 到 默认保持上一轮参数。
+        3. 没有 K-FAC 信息的参数 fallback 到默认保持上一轮参数。
         4. 这里不实现 WoLF / history filter / reliability。
     """
 
@@ -106,18 +109,20 @@ class FisherKFACExpertAggregator(Aggregator):
             new_state_dict = clone_state_dict(base_state)
 
         min_count = int(_cfg_get(self.cfg, "kfac.min_count", 1))
-        server_steps = int(_cfg_get(self.cfg, "kfac.server_steps", 5))
-        server_lr = float(_cfg_get(self.cfg, "kfac.server_lr", 0.01))
+        solver_steps = int(_cfg_get(self.cfg, "kfac.server_steps", 5))
+        cg_tol = float(_cfg_get(self.cfg, "kfac.cg_tol", 1.0e-8))
         damping = float(_cfg_get(self.cfg, "kfac.damping", 1.0e-4))
         fallback = str(_cfg_get(self.cfg, "kfac.fallback", "none")).lower().strip()
-        max_grad_norm = float(_cfg_get(self.cfg, "kfac.max_grad_norm", 0.0))
 
         if min_count <= 0:
             min_count = 1
-        if server_steps < 0:
-            raise ValueError(f"kfac.server_steps 不能小于 0，当前值：{server_steps}")
-        if server_lr <= 0:
-            raise ValueError(f"kfac.server_lr 必须大于 0，当前值：{server_lr}")
+
+        if solver_steps < 0:
+            raise ValueError(f"kfac.server_steps 不能小于 0，当前值：{solver_steps}")
+
+        if cg_tol < 0:
+            raise ValueError(f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}")
+
         if damping < 0:
             raise ValueError(f"kfac.damping 不能小于 0，当前值：{damping}")
 
@@ -133,9 +138,10 @@ class FisherKFACExpertAggregator(Aggregator):
         valid_layers = 0
         valid_client_layers = 0
         total_count = 0
+
         trace_A_values: List[float] = []
         trace_B_values: List[float] = []
-        grad_norm_values: List[float] = []
+        residual_norm_values: List[float] = []
         delta_norm_values: List[float] = []
 
         for layer_name in layer_names:
@@ -172,14 +178,14 @@ class FisherKFACExpertAggregator(Aggregator):
                     weight_name=weight_name,
                     bias_name=bias_name,
                     include_bias=include_bias,
-                    server_steps=server_steps,
-                    server_lr=server_lr,
+                    solver_steps=solver_steps,
+                    cg_tol=cg_tol,
                     damping=damping,
-                    max_grad_norm=max_grad_norm,
                 )
             except Exception:
                 if strict:
                     raise
+
                 skipped_layers.append(layer_name)
                 continue
 
@@ -194,9 +200,10 @@ class FisherKFACExpertAggregator(Aggregator):
             valid_client_layers += int(layer_diag["valid_clients"])
             total_count += int(layer_diag["total_count"])
             valid_client_ids.update(int(entry["client_id"]) for entry in entries)
+
             trace_A_values.extend(layer_diag["trace_A_values"])
             trace_B_values.extend(layer_diag["trace_B_values"])
-            grad_norm_values.extend(layer_diag["grad_norm_values"])
+            residual_norm_values.extend(layer_diag["residual_norm_values"])
             delta_norm_values.append(float(layer_diag["delta_norm"]))
 
             layer_client_counts = {
@@ -211,11 +218,11 @@ class FisherKFACExpertAggregator(Aggregator):
                     for client_id, count in layer_client_counts.items()
                 }
 
-                for client_id, count in layer_client_counts.items():
-                    client_id = int(client_id)
-                    kfac_client_counts[client_id] = (
-                        int(kfac_client_counts.get(client_id, 0)) + int(count)
-                    )
+            for client_id, count in layer_client_counts.items():
+                client_id = int(client_id)
+                kfac_client_counts[client_id] = (
+                    int(kfac_client_counts.get(client_id, 0)) + int(count)
+                )
 
         for name in target_param_names:
             if name in solved_params:
@@ -232,6 +239,7 @@ class FisherKFACExpertAggregator(Aggregator):
 
             if not torch.is_tensor(global_state[name]):
                 continue
+
             if not torch.is_floating_point(global_state[name]):
                 continue
 
@@ -250,12 +258,10 @@ class FisherKFACExpertAggregator(Aggregator):
         )
 
         mean_count = float(total_count / max(valid_client_layers, 1))
-
         kfac_weights = _normalize_kfac_client_counts(
             client_counts=kfac_client_counts,
             client_updates=client_updates,
         )
-
         cos_kfac_uniform = _cos_kfac_uniform(
             global_state=global_state,
             new_state_dict=new_state_dict,
@@ -288,12 +294,16 @@ class FisherKFACExpertAggregator(Aggregator):
             "mean_trace_B": _safe_mean(trace_B_values),
             "max_trace_A": _safe_max(trace_A_values),
             "max_trace_B": _safe_max(trace_B_values),
-            "mean_grad_norm": _safe_mean(grad_norm_values),
-            "max_grad_norm": _safe_max(grad_norm_values),
+            "mean_residual_norm": _safe_mean(residual_norm_values),
+            "max_residual_norm": _safe_max(residual_norm_values),
+            # 兼容旧字段名：这里的 grad_norm 实际表示 CG 残差范数。
+            "mean_grad_norm": _safe_mean(residual_norm_values),
+            "max_grad_norm": _safe_max(residual_norm_values),
             "mean_delta_norm": _safe_mean(delta_norm_values),
             "cos_kfac_uniform": float(cos_kfac_uniform),
-            "server_steps": int(server_steps),
-            "server_lr": float(server_lr),
+            "solver_steps": int(solver_steps),
+            "server_steps": int(solver_steps),
+            "cg_tol": float(cg_tol),
             "damping": float(damping),
             "min_count": int(min_count),
             "fallback": fallback,
@@ -311,9 +321,8 @@ class FisherKFACExpertAggregator(Aggregator):
                 f"mean_count={diagnostics['mean_count']:.2f} "
                 f"mean_trace_A={diagnostics['mean_trace_A']:.6e} "
                 f"mean_trace_B={diagnostics['mean_trace_B']:.6e} "
-                f"solver_steps={diagnostics['server_steps']} "
-                f"server_lr={diagnostics['server_lr']:.6g} "
-                f"mean_grad_norm={diagnostics['mean_grad_norm']:.6e} "
+                f"solver_steps={diagnostics['solver_steps']} "
+                f"mean_residual_norm={diagnostics['mean_residual_norm']:.6e} "
                 f"mean_delta_norm={diagnostics['mean_delta_norm']:.6e} "
                 f"fallback_params={diagnostics['fallback_params']} "
                 f"cos_kfac_uniform={diagnostics['cos_kfac_uniform']:.6f}",
@@ -333,13 +342,12 @@ def _solve_kfac_linear_layer(
     weight_name: str,
     bias_name: Optional[str],
     include_bias: bool,
-    server_steps: int,
-    server_lr: float,
+    solver_steps: int,
+    cg_tol: float,
     damping: float,
-    max_grad_norm: float,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
     """
-    对一个 Linear block 求解 K-FAC Fisher 聚合结果。
+    对一个 Linear block 直接求解 K-FAC/Fisher 加权聚合结果。
 
     entries 中每个元素对应一个 client-layer：
         {
@@ -351,6 +359,13 @@ def _solve_kfac_linear_layer(
             "local_bias": Tensor or None,
             ...
         }
+
+    求解方程：
+        sum_i p_i * (B_i @ W @ A_i + damping * W)
+        =
+        sum_i p_i * (B_i @ W_i @ A_i + damping * W_i)
+
+    这里使用 CG，只需要 K-FAC matvec，不构造完整 Kronecker 矩阵。
     """
     if len(entries) == 0:
         raise ValueError(f"{weight_name} 没有有效 K-FAC entries。")
@@ -368,6 +383,9 @@ def _solve_kfac_linear_layer(
 
         A = entry["A"].to(device=device, dtype=dtype)
         B = entry["B"].to(device=device, dtype=dtype)
+
+        A = _symmetrize_square(A)
+        B = _symmetrize_square(B)
 
         local_weight = entry["local_weight"].to(device=device, dtype=dtype)
 
@@ -404,61 +422,169 @@ def _solve_kfac_linear_layer(
     if len(processed_entries) == 0 or total_count <= 0:
         raise ValueError(f"{weight_name} 没有 count > 0 的有效 K-FAC entries。")
 
-    W_aug = torch.zeros_like(processed_entries[0]["local_aug"])
+    weights = [
+        float(entry["count"]) / float(total_count)
+        for entry in processed_entries
+    ]
 
-    for entry in processed_entries:
-        weight = float(entry["count"]) / float(total_count)
-        W_aug = W_aug + weight * entry["local_aug"]
+    # count-weighted FedAvg 作为 CG 初始点，同时也是 damping 右端项里的 W_avg。
+    W_avg = torch.zeros_like(processed_entries[0]["local_aug"])
+    for weight, entry in zip(weights, processed_entries):
+        W_avg = W_avg + float(weight) * entry["local_aug"]
 
-    initial_W_aug = W_aug.detach().clone()
+    rhs = torch.zeros_like(W_avg)
+    for weight, entry in zip(weights, processed_entries):
+        rhs = rhs + float(weight) * _kfac_matvec(
+            delta=entry["local_aug"],
+            A=entry["A"],
+            B=entry["B"],
+            damping=0.0,
+        )
 
-    grad_norm_values: List[float] = []
+    if damping > 0:
+        rhs = rhs + float(damping) * W_avg
 
-    for _ in range(server_steps):
-        grad = torch.zeros_like(W_aug)
+    def matvec(x: torch.Tensor) -> torch.Tensor:
+        result = torch.zeros_like(x)
 
-        for entry in processed_entries:
-            weight = float(entry["count"]) / float(total_count)
-            delta = W_aug - entry["local_aug"]
-
-            grad = grad + weight * _kfac_matvec(
-                delta=delta,
+        for weight, entry in zip(weights, processed_entries):
+            result = result + float(weight) * _kfac_matvec(
+                delta=x,
                 A=entry["A"],
                 B=entry["B"],
-                damping=damping,
+                damping=0.0,
             )
 
-        if not torch.isfinite(grad).all():
-            raise ValueError(f"{weight_name} 的 K-FAC server gradient 出现 NaN 或 Inf。")
+        if damping > 0:
+            result = result + float(damping) * x
 
-        grad_norm = float(grad.detach().float().norm().item())
-        grad_norm_values.append(grad_norm)
+        return result
 
-        if max_grad_norm > 0 and grad_norm > max_grad_norm:
-            grad = grad * (float(max_grad_norm) / (grad_norm + 1.0e-12))
+    if solver_steps == 0:
+        W_aug = W_avg.detach().clone()
+        residual = rhs - matvec(W_aug)
+        residual_norm_values = [
+            float(residual.detach().float().norm().item())
+        ]
+    else:
+        W_aug, residual_norm_values = _conjugate_gradient_matrix(
+            matvec=matvec,
+            rhs=rhs,
+            initial=W_avg,
+            max_steps=solver_steps,
+            tol=cg_tol,
+            layer_name=weight_name,
+        )
 
-        W_aug = W_aug - float(server_lr) * grad
-
-        if not torch.isfinite(W_aug).all():
-            raise ValueError(f"{weight_name} 的 K-FAC server update 出现 NaN 或 Inf。")
+    if not torch.isfinite(W_aug).all():
+        raise ValueError(f"{weight_name} 的 K-FAC CG 解出现 NaN 或 Inf。")
 
     solved_weight, solved_bias = _split_augmented_weight(
         W_aug=W_aug,
         include_bias=include_bias,
     )
 
-    delta_norm = float((W_aug.detach().float() - initial_W_aug.detach().float()).norm().item())
+    delta_norm = float(
+        (W_aug.detach().float() - W_avg.detach().float()).norm().item()
+    )
 
     diagnostics = {
         "valid_clients": int(len(processed_entries)),
         "total_count": int(total_count),
-        "trace_A_values": [float(entry["trace_A"]) for entry in processed_entries],
-        "trace_B_values": [float(entry["trace_B"]) for entry in processed_entries],
-        "grad_norm_values": grad_norm_values,
+        "trace_A_values": [
+            float(entry["trace_A"])
+            for entry in processed_entries
+        ],
+        "trace_B_values": [
+            float(entry["trace_B"])
+            for entry in processed_entries
+        ],
+        "residual_norm_values": residual_norm_values,
         "delta_norm": float(delta_norm),
     }
 
     return solved_weight, solved_bias, diagnostics
+
+
+def _conjugate_gradient_matrix(
+    matvec: Any,
+    rhs: torch.Tensor,
+    initial: torch.Tensor,
+    max_steps: int,
+    tol: float,
+    layer_name: str,
+) -> Tuple[torch.Tensor, List[float]]:
+    """
+    用 Conjugate Gradient 解矩阵形状的线性系统。
+
+    matvec 接收和 rhs 同形状的 Tensor，返回同形状 Tensor。
+    为了避免构造完整 Kronecker 矩阵，这里直接在矩阵空间做点积和更新。
+    """
+    x = initial.detach().clone()
+
+    if not torch.isfinite(rhs).all():
+        raise ValueError(f"{layer_name} 的 K-FAC rhs 出现 NaN 或 Inf。")
+
+    r = rhs - matvec(x)
+
+    if not torch.isfinite(r).all():
+        raise ValueError(f"{layer_name} 的 K-FAC 初始残差出现 NaN 或 Inf。")
+
+    p = r.detach().clone()
+    rs_old = torch.sum(r * r)
+
+    residual_norm_values = [
+        float(torch.sqrt(torch.clamp(rs_old.detach().float(), min=0.0)).item())
+    ]
+
+    if residual_norm_values[-1] <= float(tol):
+        return x, residual_norm_values
+
+    eps = torch.tensor(
+        1.0e-30,
+        device=rhs.device,
+        dtype=rhs.dtype,
+    )
+
+    for _ in range(int(max_steps)):
+        Ap = matvec(p)
+
+        if not torch.isfinite(Ap).all():
+            raise ValueError(f"{layer_name} 的 K-FAC matvec 出现 NaN 或 Inf。")
+
+        denom = torch.sum(p * Ap)
+
+        if not torch.isfinite(denom):
+            raise ValueError(f"{layer_name} 的 K-FAC CG denom 出现 NaN 或 Inf。")
+
+        if torch.abs(denom).detach().float().item() <= 1.0e-30:
+            break
+
+        alpha = rs_old / (denom + eps)
+
+        x = x + alpha * p
+        r = r - alpha * Ap
+
+        if not torch.isfinite(x).all():
+            raise ValueError(f"{layer_name} 的 K-FAC CG 解出现 NaN 或 Inf。")
+
+        if not torch.isfinite(r).all():
+            raise ValueError(f"{layer_name} 的 K-FAC CG 残差出现 NaN 或 Inf。")
+
+        rs_new = torch.sum(r * r)
+        residual_norm = float(
+            torch.sqrt(torch.clamp(rs_new.detach().float(), min=0.0)).item()
+        )
+        residual_norm_values.append(residual_norm)
+
+        if residual_norm <= float(tol):
+            break
+
+        beta = rs_new / (rs_old + eps)
+        p = r + beta * p
+        rs_old = rs_new
+
+    return x, residual_norm_values
 
 
 def _kfac_matvec(
@@ -471,11 +597,9 @@ def _kfac_matvec(
     K-FAC 矩阵向量乘法。
 
     对 Linear 层：
-
         F vec(delta) ≈ vec(B @ delta @ A)
 
     damping 使用简单的各向同性阻尼：
-
         matvec = B @ delta @ A + damping * delta
     """
     result = B.matmul(delta).matmul(A)
@@ -486,6 +610,14 @@ def _kfac_matvec(
     return result
 
 
+def _symmetrize_square(matrix: torch.Tensor) -> torch.Tensor:
+    """对方阵做对称化，减少 K-FAC 统计里的数值非对称误差。"""
+    if matrix.dim() == 2 and matrix.size(0) == matrix.size(1):
+        return 0.5 * (matrix + matrix.transpose(0, 1))
+
+    return matrix
+
+
 def _collect_kfac_layer_names(
     client_updates: Sequence[ClientUpdate],
 ) -> List[str]:
@@ -494,6 +626,7 @@ def _collect_kfac_layer_names(
 
     for update in client_updates:
         payload = update.extra.get("expert_kfac", None)
+
         if not isinstance(payload, Mapping):
             continue
 
@@ -516,6 +649,7 @@ def _collect_valid_layer_entries(
 
     for update in client_updates:
         payload = update.extra.get("expert_kfac", None)
+
         if not isinstance(payload, Mapping):
             continue
 
@@ -523,6 +657,7 @@ def _collect_valid_layer_entries(
             continue
 
         item = payload[layer_name]
+
         if not isinstance(item, Mapping):
             continue
 
@@ -538,6 +673,7 @@ def _collect_valid_layer_entries(
         except Exception:
             if strict:
                 raise
+
             continue
 
         if entry is not None:
@@ -556,6 +692,7 @@ def _build_layer_entry(
 ) -> Optional[Dict[str, Any]]:
     """把客户端上传的单层 K-FAC payload 转成服务端可用 entry。"""
     count = int(item.get("count", 0))
+
     if count < int(min_count):
         return None
 
@@ -583,19 +720,28 @@ def _build_layer_entry(
 
     if not torch.isfinite(A).all():
         return None
+
     if not torch.isfinite(B).all():
         return None
 
     global_weight = global_state[weight_name]
-    local_weight = global_weight.detach().cpu() + update.model_delta[weight_name].detach().cpu()
+    local_weight = global_weight.detach().cpu() + update.model_delta[
+        weight_name
+    ].detach().cpu()
 
     local_bias = None
     include_bias = bool(item.get("include_bias", False))
 
     if include_bias and bias_name is not None:
-        if bias_name in target_param_set and bias_name in global_state and bias_name in update.model_delta:
+        if (
+            bias_name in target_param_set
+            and bias_name in global_state
+            and bias_name in update.model_delta
+        ):
             global_bias = global_state[bias_name]
-            local_bias = global_bias.detach().cpu() + update.model_delta[bias_name].detach().cpu()
+            local_bias = global_bias.detach().cpu() + update.model_delta[
+                bias_name
+            ].detach().cpu()
         else:
             include_bias = False
             bias_name = None
@@ -623,7 +769,7 @@ def _make_augmented_weight(
     把 Linear 的 weight 和 bias 合成 W_aug。
 
     weight: [out_features, in_features]
-    bias:   [out_features]
+    bias: [out_features]
 
     include_bias=True 时：
         W_aug = [W, b]
@@ -706,6 +852,7 @@ def _sample_weighted_param(
         if client_id not in weights:
             if strict:
                 raise KeyError(f"weights 缺少客户端 {client_id} 的权重。")
+
             continue
 
         if name not in update.model_delta:
@@ -713,6 +860,7 @@ def _sample_weighted_param(
                 raise KeyError(
                     f"客户端 {client_id} 的 model_delta 缺少参数：{name}"
                 )
+
             continue
 
         delta = update.model_delta[name].to(global_tensor.device)
@@ -805,6 +953,7 @@ def _cos_kfac_uniform(
 
         if not torch.is_tensor(global_state[name]):
             continue
+
         if not torch.is_floating_point(global_state[name]):
             continue
 
