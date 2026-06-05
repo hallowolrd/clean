@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from fl.kfac import collect_expert_kfac, summarize_expert_kfac
 from fl.types import ClientUpdate
 from utils.eval import extract_logits, unpack_batch
 from utils.state_dict_ops import (
@@ -139,6 +140,23 @@ class FLClient:
             grad_clip=grad_clip,
         )
 
+        expert_kfac = None
+        expert_kfac_summary = None
+
+        if (
+            str(_cfg_get(self.cfg, "agg.expert.method", "")).lower().strip()
+            == "fisher_kfac_expert"
+            or bool(_cfg_get(self.cfg, "kfac.collect", False))
+        ):
+            expert_kfac = collect_expert_kfac(
+                model=local_model,
+                train_loader=self.train_loader,
+                criterion=criterion,
+                device=self.device,
+                cfg=self.cfg,
+            )
+            expert_kfac_summary = summarize_expert_kfac(expert_kfac)
+
         local_state_cpu = state_dict_to(
             local_model.state_dict(),
             device="cpu",
@@ -162,6 +180,8 @@ class FLClient:
                 "optimizer": get_optimizer_type(self.cfg),
                 "local_epochs": int(local_epochs),
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
+                "expert_kfac": expert_kfac,
+                "expert_kfac_summary": expert_kfac_summary,
             },
         )
 

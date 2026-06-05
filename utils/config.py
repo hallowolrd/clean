@@ -24,6 +24,7 @@ SUPPORTED_MODELS = {
 SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
+    "fisher_kfac_expert",
 }
 
 

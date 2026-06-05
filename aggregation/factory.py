@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aggregation.base import Aggregator, get_aggregation_method
+from aggregation.fisher_kfac_expert import FisherKFACExpertAggregator
 from aggregation.sample_weighted import SampleWeightedAggregator
 from aggregation.uniform import UniformAggregator
 
@@ -43,6 +44,7 @@ def build_aggregator(
             当前支持：
                 uniform
                 sample_weighted
+                fisher_kfac_expert
 
         param_group_name:
             当前聚合器负责的参数组。
@@ -70,9 +72,18 @@ def build_aggregator(
             param_group_name=param_group_name,
         )
 
+    if method == "fisher_kfac_expert":
+        if param_group_name != "expert":
+            raise ValueError("fisher_kfac_expert 只能用于 expert 参数聚合。")
+
+        return FisherKFACExpertAggregator(
+            cfg=cfg,
+            param_group_name=param_group_name,
+        )
+
     raise ValueError(
         f"不支持的聚合方法：{method}。"
-        "当前支持：uniform, sample_weighted"
+        "当前支持：uniform, sample_weighted, fisher_kfac_expert"
     )
 
 
