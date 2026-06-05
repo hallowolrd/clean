@@ -35,7 +35,7 @@ class FisherKFACExpertAggregator(Aggregator):
     说明：
         1. 客户端上传的是 A_mean、B_mean、count。
         2. 服务端用 count 作为证据强度，内部归一化成 p_i。
-        3. 没有 K-FAC 信息的参数 fallback 到 sample_weighted。
+        3. 没有 K-FAC 信息的参数 fallback 到 默认保持上一轮参数。
         4. 这里不实现 WoLF / history filter / reliability。
     """
 
@@ -53,7 +53,8 @@ class FisherKFACExpertAggregator(Aggregator):
 
         注意：
             fisher_kfac_expert 的主聚合逻辑不走普通加权 delta。
-            这里的权重主要用于 diagnostics 和 fallback。
+            这里的权重只在 fallback=sample_weighted 时使用。
+            AggregationResult.weights 会在 aggregate() 里改成 K-FAC count 汇总权重。
         """
         return build_sample_weights(client_updates)
 
@@ -126,6 +127,8 @@ class FisherKFACExpertAggregator(Aggregator):
         fallback_params = set()
         skipped_layers: List[str] = []
         valid_client_ids = set()
+        kfac_client_counts: Dict[int, int] = {}
+        kfac_layer_weights: Dict[str, Dict[int, float]] = {}
 
         valid_layers = 0
         valid_client_layers = 0
@@ -196,6 +199,24 @@ class FisherKFACExpertAggregator(Aggregator):
             grad_norm_values.extend(layer_diag["grad_norm_values"])
             delta_norm_values.append(float(layer_diag["delta_norm"]))
 
+            layer_client_counts = {
+                int(entry["client_id"]): int(entry["count"])
+                for entry in entries
+            }
+            layer_total_count = int(sum(layer_client_counts.values()))
+
+            if layer_total_count > 0:
+                kfac_layer_weights[layer_name] = {
+                    int(client_id): float(count) / float(layer_total_count)
+                    for client_id, count in layer_client_counts.items()
+                }
+
+                for client_id, count in layer_client_counts.items():
+                    client_id = int(client_id)
+                    kfac_client_counts[client_id] = (
+                        int(kfac_client_counts.get(client_id, 0)) + int(count)
+                    )
+
         for name in target_param_names:
             if name in solved_params:
                 continue
@@ -230,6 +251,11 @@ class FisherKFACExpertAggregator(Aggregator):
 
         mean_count = float(total_count / max(valid_client_layers, 1))
 
+        kfac_weights = _normalize_kfac_client_counts(
+            client_counts=kfac_client_counts,
+            client_updates=client_updates,
+        )
+
         cos_kfac_uniform = _cos_kfac_uniform(
             global_state=global_state,
             new_state_dict=new_state_dict,
@@ -244,8 +270,13 @@ class FisherKFACExpertAggregator(Aggregator):
             "param_count": len(target_param_names),
             "weights": {
                 int(client_id): float(weight)
-                for client_id, weight in sample_weights.items()
+                for client_id, weight in kfac_weights.items()
             },
+            "kfac_client_counts": {
+                int(client_id): int(count)
+                for client_id, count in kfac_client_counts.items()
+            },
+            "kfac_layer_weights": kfac_layer_weights,
             "valid_layers": int(valid_layers),
             "valid_clients": int(len(valid_client_ids)),
             "skipped_layers": int(len(skipped_layers)),
@@ -291,7 +322,7 @@ class FisherKFACExpertAggregator(Aggregator):
 
         return AggregationResult(
             new_state_dict=new_state_dict,
-            weights=sample_weights,
+            weights=kfac_weights,
             diagnostics=diagnostics,
         )
 
@@ -705,6 +736,40 @@ def _resolve_param_names(
             raise KeyError(f"global_state 中不存在参数：{name}")
 
     return names
+
+
+def _normalize_kfac_client_counts(
+    client_counts: Mapping[int, int],
+    client_updates: Sequence[ClientUpdate],
+) -> Dict[int, float]:
+    """
+    把所有 solved K-FAC layer 的 routed count 汇总成 client 级别权重。
+
+    注意：
+        这个是 K-FAC evidence 的汇总权重，不是每一层真实使用的唯一权重。
+        每一层真实权重在 diagnostics["kfac_layer_weights"] 里。
+    """
+    result = {
+        int(update.client_id): 0.0
+        for update in client_updates
+    }
+
+    total_count = int(sum(int(count) for count in client_counts.values()))
+
+    if total_count <= 0:
+        if len(client_updates) == 0:
+            return result
+
+        uniform_weight = 1.0 / float(len(client_updates))
+        return {
+            int(update.client_id): float(uniform_weight)
+            for update in client_updates
+        }
+
+    for client_id, count in client_counts.items():
+        result[int(client_id)] = float(count) / float(total_count)
+
+    return result
 
 
 def _cos_kfac_uniform(
