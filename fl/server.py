@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import gc
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from aggregation.factory import AggregatorBundle, build_aggregators
 from fl.client import (
@@ -163,46 +165,102 @@ class FLServer:
 
         self.print_startup_summary()
 
-        for round_id in range(1, rounds + 1):
-            selected_clients = select_clients(
-                clients=self.clients,
-                frac=frac,
-                round_id=round_id,
-                seed=seed,
+        # 预估整个实验的客户端训练步数。
+        # 进度条单位：完成一个客户端本地训练。
+        total_client_steps = sum(
+            len(
+                select_clients(
+                    clients=self.clients,
+                    frac=frac,
+                    round_id=progress_round_id,
+                    seed=seed,
+                )
             )
+            for progress_round_id in range(1, rounds + 1)
+        )
 
-            client_updates = train_selected_clients(
-                clients=selected_clients,
-                global_model=self.global_model,
-                round_id=round_id,
-            )
+        progress_bar = tqdm(
+            total=total_client_steps,
+            desc="Training",
+            dynamic_ncols=True,
+            leave=True,
+            file=sys.stderr,
+        )
 
-            aggregation_info = self.aggregate_client_updates(
-                client_updates=client_updates,
-            )
+        try:
+            for round_id in range(1, rounds + 1):
+                selected_clients = select_clients(
+                    clients=self.clients,
+                    frac=frac,
+                    round_id=round_id,
+                    seed=seed,
+                )
 
-            eval_result = self.evaluate_global_model()
+                client_updates: List[ClientUpdate] = []
 
-            if eval_result.acc > self.train_state.best_acc:
-                self.train_state.best_acc = float(eval_result.acc)
-                self.train_state.best_round = int(round_id)
+                # 逐客户端训练，保证每完成一个客户端本地训练就更新一次总进度条。
+                for client in selected_clients:
+                    single_client_updates = train_selected_clients(
+                        clients=[client],
+                        global_model=self.global_model,
+                        round_id=round_id,
+                    )
 
-            self.train_state.round_id = int(round_id)
+                    client_updates.extend(single_client_updates)
 
-            round_result = self.build_round_result(
-                round_id=round_id,
-                selected_clients=selected_clients,
-                client_updates=client_updates,
-                eval_result=eval_result,
-                aggregation_info=aggregation_info,
-            )
+                    progress_bar.update(len(single_client_updates))
+                    progress_bar.set_postfix(
+                        round=f"{round_id}/{rounds}",
+                        client=int(client.client_id),
+                        best=f"{self.train_state.best_acc:.2f}%",
+                    )
 
-            self.round_results.append(round_result)
+                aggregation_info = self.aggregate_client_updates(
+                    client_updates=client_updates,
+                )
 
-            if log_every > 0 and round_id % log_every == 0:
-                self.print_round_summary(round_result)
+                eval_result = self.evaluate_global_model()
 
-            self._cleanup_after_round()
+                if eval_result.acc > self.train_state.best_acc:
+                    self.train_state.best_acc = float(eval_result.acc)
+                    self.train_state.best_round = int(round_id)
+
+                self.train_state.round_id = int(round_id)
+
+                round_result = self.build_round_result(
+                    round_id=round_id,
+                    selected_clients=selected_clients,
+                    client_updates=client_updates,
+                    eval_result=eval_result,
+                    aggregation_info=aggregation_info,
+                )
+
+                self.round_results.append(round_result)
+
+                avg_train_loss = round_result.aggregation_info.get(
+                    "avg_train_loss",
+                    None,
+                )
+                if avg_train_loss is None:
+                    avg_train_loss_text = "nan"
+                else:
+                    avg_train_loss_text = f"{avg_train_loss:.4f}"
+
+                progress_bar.set_postfix(
+                    round=f"{round_id}/{rounds}",
+                    client="done",
+                    acc=f"{eval_result.acc:.2f}%",
+                    best=f"{self.train_state.best_acc:.2f}%",
+                    loss=avg_train_loss_text,
+                )
+
+                if log_every > 0 and round_id % log_every == 0:
+                    self.print_round_summary(round_result)
+
+                self._cleanup_after_round()
+
+        finally:
+            progress_bar.close()
 
         return ServerTrainResult(
             round_results=list(self.round_results),
@@ -388,7 +446,7 @@ class FLServer:
         else:
             avg_train_acc_text = f"{avg_train_acc:.2f}%"
 
-        print(
+        tqdm.write(
             f"[Round {round_result.round_id:03d}] "
             f"train_loss={avg_train_loss_text} | "
             f"train_acc={avg_train_acc_text} | "
