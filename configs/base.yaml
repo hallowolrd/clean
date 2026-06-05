@@ -49,8 +49,8 @@ num_workers: 2
 # 模型配置
 # =========================
 
-# 模型名称：当前先支持 resnet_moe
-model: resnet_moe
+# 模型名称：当前先支持 resnet_switch_moe
+model: resnet_switch_moe
 
 # MoE expert 数量
 num_experts: 4

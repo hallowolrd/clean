@@ -18,7 +18,7 @@ SUPPORTED_DATASETS = {
 }
 
 SUPPORTED_MODELS = {
-    "resnet_moe",
+    "resnet_switch_moe",
 }
 
 SUPPORTED_AGG_METHODS = {
@@ -293,7 +293,7 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("num_workers", 2)
 
     # 模型配置
-    cfg.setdefault("model", "resnet_moe")
+    cfg.setdefault("model", "resnet_switch_moe")
     cfg.setdefault("num_experts", 4)
     cfg.setdefault("topk", 2)
 
