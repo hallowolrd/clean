@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 
 from utils.eval import extract_logits, unpack_batch
 
-
 KFACLayerPayload = Dict[str, Any]
 ExpertKFACPayload = Dict[str, KFACLayerPayload]
 
@@ -20,22 +19,21 @@ class _KFACLayerBuffer:
     单个 expert Linear 层的 K-FAC 统计缓存。
 
     对 Linear 层 z = W a + b：
-      A = E[a a^T]
-      B = E[delta delta^T]
+        A = E[a a^T]
+        B = E[delta delta^T]
 
     注意：
-      1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
-      2. include_bias=True 时，把 bias 合并到 activation 里：
-         a_aug = [a, 1]
-         W_aug = [W, b]
-      3. B 必须用每个样本/token 的 grad_output 外积后求和，
-         不能先平均 grad_output 再外积，否则会出现梯度抵消。
+        1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
+        2. include_bias=True 时，把 bias 合并到 activation 里：
+           a_aug = [a, 1]
+           W_aug = [W, b]
+        3. B 必须用每个样本/token 的 grad_output 外积后求和，
+           不能先平均 grad_output 再外积，否则会出现梯度抵消。
     """
 
     module_name: str
     module: nn.Linear
     include_bias: bool
-
     A_sum: Optional[torch.Tensor] = None
     B_sum: Optional[torch.Tensor] = None
     a_count: int = 0
@@ -51,6 +49,7 @@ class _KFACLayerBuffer:
             expected_dim=self.module.in_features,
             tensor_name=f"{self.module_name}.activation",
         )
+
         if a.numel() == 0 or a.size(0) <= 0:
             return
 
@@ -69,6 +68,7 @@ class _KFACLayerBuffer:
 
         if self.A_sum is None:
             self.A_sum = torch.zeros_like(A_batch)
+
         self.A_sum.add_(A_batch)
         self.a_count += int(a.size(0))
 
@@ -82,6 +82,7 @@ class _KFACLayerBuffer:
             expected_dim=self.module.out_features,
             tensor_name=f"{self.module_name}.grad_output",
         )
+
         if delta.numel() == 0 or delta.size(0) <= 0:
             return
 
@@ -90,6 +91,7 @@ class _KFACLayerBuffer:
 
         if self.B_sum is None:
             self.B_sum = torch.zeros_like(B_batch)
+
         self.B_sum.add_(B_batch)
         self.b_count += int(delta.size(0))
 
@@ -108,6 +110,7 @@ class _KFACLayerBuffer:
             return None
 
         count = min(int(self.a_count), int(self.b_count))
+
         if count < int(min_count):
             return None
 
@@ -116,6 +119,7 @@ class _KFACLayerBuffer:
 
         if not torch.isfinite(A_mean).all():
             return None
+
         if not torch.isfinite(B_mean).all():
             return None
 
@@ -148,7 +152,7 @@ def collect_expert_kfac(
     cfg: Any = None,
 ) -> ExpertKFACPayload:
     """
-    采集 expert 内部 Linear 层的 K-FAC 因子。
+    在本地训练完成后的 local_model 上，额外跑一遍数据来采集 expert Linear 层的 K-FAC 因子。
 
     返回格式：
         {
@@ -165,13 +169,15 @@ def collect_expert_kfac(
         }
 
     设计约束：
-      1. 只采集 module name 包含 experts. 的 nn.Linear。
-      2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
-      3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
-      4. 不修改训练逻辑，不做 optimizer.step()。
+        1. 只采集 module name 包含 experts. 的 nn.Linear。
+        2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
+        3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
+        4. 不修改训练逻辑，不做 optimizer.step()。
+        5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
     """
     if device is None:
         device = _infer_model_device(model)
+
     device = torch.device(device)
 
     include_bias = bool(_cfg_get(cfg, "kfac.include_bias", True))
@@ -179,6 +185,20 @@ def collect_expert_kfac(
     max_batches = int(_cfg_get(cfg, "kfac.max_batches", 0))
     expert_name_pattern = str(_cfg_get(cfg, "kfac.expert_name_pattern", "experts."))
     model_mode = str(_cfg_get(cfg, "kfac.model_mode", "eval")).lower().strip()
+    fisher_timing = str(
+        _cfg_get(
+            cfg,
+            "kfac.fisher_timing",
+            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
+        )
+    ).lower().strip()
+
+    if fisher_timing != "after_train":
+        raise ValueError(
+            "当前 collect_expert_kfac 只支持 kfac.fisher_timing=after_train。"
+            f"当前值：{fisher_timing}。"
+            "请在客户端本地训练完成后再单独采集 K-FAC。"
+        )
 
     if min_count <= 0:
         min_count = 1
@@ -214,6 +234,7 @@ def collect_expert_kfac(
         ) -> None:
             if len(inputs) == 0:
                 return
+
             buffers[name].add_activation(inputs[0])
 
         def backward_hook(
@@ -224,6 +245,7 @@ def collect_expert_kfac(
         ) -> None:
             if len(grad_output) == 0:
                 return
+
             buffers[name].add_grad_output(grad_output[0])
 
         handles.append(module.register_forward_hook(forward_hook))
@@ -237,7 +259,10 @@ def collect_expert_kfac(
     else:
         model.eval()
 
-    sum_criterion = _build_sum_criterion(cfg=cfg, fallback_criterion=criterion)
+    sum_criterion = _build_sum_criterion(
+        cfg=cfg,
+        fallback_criterion=criterion,
+    )
     sum_criterion.to(device)
 
     model.zero_grad(set_to_none=True)
@@ -249,6 +274,7 @@ def collect_expert_kfac(
                     break
 
                 images, targets = unpack_batch(batch)
+
                 images = images.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
 
@@ -256,6 +282,7 @@ def collect_expert_kfac(
 
                 outputs = model(images)
                 logits = extract_logits(outputs)
+
                 loss = sum_criterion(logits, targets)
 
                 if not torch.isfinite(loss):
@@ -265,7 +292,6 @@ def collect_expert_kfac(
 
                 # 只采集 Fisher，不更新参数。
                 model.zero_grad(set_to_none=True)
-
     finally:
         for handle in handles:
             handle.remove()
@@ -274,10 +300,19 @@ def collect_expert_kfac(
         model.train(was_training)
 
     payload: ExpertKFACPayload = {}
+
     for module_name, module_buffer in buffers.items():
         layer_payload = module_buffer.to_payload(min_count=min_count)
+
         if layer_payload is None:
             continue
+
+        layer_payload["fisher_timing"] = fisher_timing
+        layer_payload["collect_timing"] = fisher_timing
+        layer_payload["model_mode"] = model_mode
+        layer_payload["max_batches"] = int(max_batches)
+        layer_payload["expert_name_pattern"] = expert_name_pattern
+
         payload[module_name] = layer_payload
 
     return payload
@@ -286,6 +321,7 @@ def collect_expert_kfac(
 def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
     """
     生成轻量诊断信息，方便 client.py 或日志系统记录。
+
     不包含 A/B tensor 本体。
     """
     if not payload:
@@ -297,11 +333,28 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
             "mean_trace_B": 0.0,
             "max_trace_A": 0.0,
             "max_trace_B": 0.0,
+            "fisher_timing": "",
+            "model_mode": "",
         }
 
     counts = [int(item["count"]) for item in payload.values()]
     trace_A = [float(item["trace_A"]) for item in payload.values()]
     trace_B = [float(item["trace_B"]) for item in payload.values()]
+
+    fisher_timings = sorted(
+        {
+            str(item.get("fisher_timing", item.get("collect_timing", "")))
+            for item in payload.values()
+            if str(item.get("fisher_timing", item.get("collect_timing", ""))) != ""
+        }
+    )
+    model_modes = sorted(
+        {
+            str(item.get("model_mode", ""))
+            for item in payload.values()
+            if str(item.get("model_mode", "")) != ""
+        }
+    )
 
     return {
         "num_layers": int(len(payload)),
@@ -311,6 +364,16 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
         "mean_trace_B": float(sum(trace_B) / max(len(trace_B), 1)),
         "max_trace_A": float(max(trace_A)),
         "max_trace_B": float(max(trace_B)),
+        "fisher_timing": (
+            fisher_timings[0]
+            if len(fisher_timings) == 1
+            else ",".join(fisher_timings)
+        ),
+        "model_mode": (
+            model_modes[0]
+            if len(model_modes) == 1
+            else ",".join(model_modes)
+        ),
     }
 
 
@@ -322,8 +385,10 @@ def _is_expert_linear(
     """判断一个 module 是否是 expert 内部的 Linear 层。"""
     if not isinstance(module, nn.Linear):
         return False
+
     if expert_name_pattern not in module_name:
         return False
+
     return True
 
 
@@ -336,9 +401,9 @@ def _flatten_last_dim(
     把 Linear 的输入或 grad_output 展平成 [num_items, feature_dim]。
 
     支持：
-      [N, D]
-      [B, N, D]
-      [B, ..., D]
+        [N, D]
+        [B, N, D]
+        [B, ..., D]
     """
     if tensor is None:
         raise ValueError(f"{tensor_name} 为空。")
@@ -373,9 +438,12 @@ def _build_sum_criterion(
     label_smoothing = float(_cfg_get(cfg, "label_smooth", 0.0))
 
     if isinstance(fallback_criterion, nn.CrossEntropyLoss):
-        label_smoothing = float(getattr(fallback_criterion, "label_smoothing", label_smoothing))
+        label_smoothing = float(
+            getattr(fallback_criterion, "label_smoothing", label_smoothing)
+        )
         ignore_index = int(getattr(fallback_criterion, "ignore_index", -100))
         weight = getattr(fallback_criterion, "weight", None)
+
         return nn.CrossEntropyLoss(
             weight=weight,
             ignore_index=ignore_index,
@@ -406,23 +474,26 @@ def _cfg_get(
     兼容 dict / ConfigNode / 普通对象的读取。
 
     支持：
-      cfg.get("kfac.include_bias", True)
-      cfg["kfac"]["include_bias"]
-      cfg.kfac.include_bias
+        cfg.get("kfac.include_bias", True)
+        cfg["kfac"]["include_bias"]
+        cfg.kfac.include_bias
     """
     if cfg is None:
         return default
 
     if hasattr(cfg, "get"):
         value = cfg.get(key, None)
+
         if value is not None:
             return value
 
     current = cfg
+
     for part in key.split("."):
         if isinstance(current, dict):
             if part not in current:
                 return default
+
             current = current[part]
             continue
 

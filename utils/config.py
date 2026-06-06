@@ -179,10 +179,14 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         run_dir = Path(cfg["run_dir"])
 
     run_dir.mkdir(parents=True, exist_ok=True)
+
     return run_dir
 
 
-def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = None) -> Dict[str, Any]:
+def _load_yaml_with_include(
+    config_path: Path,
+    stack: Optional[list[Path]] = None,
+) -> Dict[str, Any]:
     """
     读取 yaml，并处理 include。
 
@@ -213,6 +217,7 @@ def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = Non
         raise ConfigError(f"配置文件顶层必须是 dict：{config_path}")
 
     cfg = dict(cfg)
+
     include = cfg.pop("include", None)
 
     if include is None:
@@ -229,6 +234,7 @@ def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = Non
 
     for include_file in include_files:
         include_path = (config_path.parent / include_file).resolve()
+
         base_cfg = _load_yaml_with_include(
             include_path,
             stack=stack + [config_path],
@@ -237,6 +243,7 @@ def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = Non
 
     # 当前配置覆盖 include 进来的配置
     merged_cfg = _deep_merge(merged_cfg, cfg)
+
     return merged_cfg
 
 
@@ -307,12 +314,35 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # 聚合配置
     cfg.setdefault("agg", {})
-
     cfg["agg"].setdefault("non_expert", {})
     cfg["agg"]["non_expert"].setdefault("method", "sample_weighted")
-
     cfg["agg"].setdefault("expert", {})
     cfg["agg"]["expert"].setdefault("method", "uniform")
+
+    # K-FAC / FedFisher expert 聚合配置
+    cfg.setdefault("kfac", {})
+    cfg["kfac"].setdefault("collect", False)
+    cfg["kfac"].setdefault("weight_mode", "sample_weighted")
+    cfg["kfac"].setdefault("solve_scope", "per_layer")
+    cfg["kfac"].setdefault("solve_mode", "cg")
+    cfg["kfac"].setdefault("server_steps", 5)
+    cfg["kfac"].setdefault("server_lr", 0.01)
+    cfg["kfac"].setdefault("adam_beta1", 0.9)
+    cfg["kfac"].setdefault("adam_beta2", 0.99)
+    cfg["kfac"].setdefault("adam_eps", 0.01)
+    cfg["kfac"].setdefault("cg_tol", 1.0e-8)
+    cfg["kfac"].setdefault("damping", 0.0)
+    cfg["kfac"].setdefault("use_damping", False)
+    cfg["kfac"].setdefault("min_count", 1)
+    cfg["kfac"].setdefault("fallback", "none")
+    cfg["kfac"].setdefault("include_bias", True)
+    cfg["kfac"].setdefault("fisher_timing", "after_train")
+    cfg["kfac"].setdefault("model_mode", "eval")
+    cfg["kfac"].setdefault("max_batches", 0)
+    cfg["kfac"].setdefault("expert_name_pattern", "experts.")
+    cfg["kfac"].setdefault("use_server_validation", False)
+    cfg["kfac"].setdefault("model_selection", "final_step")
+    cfg["kfac"].setdefault("log_detail", True)
 
     # 运行配置
     cfg.setdefault("seed", 42)
@@ -360,7 +390,6 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
         run_name = _safe_name(raw_run_name)
 
     output_dir = Path(cfg.get("output_dir", "outputs"))
-
     unique_name = bool(cfg.get("run", {}).get("unique_name", True))
     overwrite = bool(cfg.get("run", {}).get("overwrite", False))
 
@@ -379,6 +408,7 @@ def _is_auto_run_name(value: Any) -> bool:
         return True
 
     text = str(value).strip().lower()
+
     return text in {
         "",
         "auto",
@@ -404,11 +434,9 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     seed = _safe_name(cfg.get("seed", "seed"))
 
     agg_cfg = cfg.get("agg", {})
-
     non_expert_method = _safe_name(
         agg_cfg.get("non_expert", {}).get("method", "non_expert")
     )
-
     expert_method = _safe_name(
         agg_cfg.get("expert", {}).get("method", "expert")
     )
@@ -437,7 +465,6 @@ def _safe_name(value: Any) -> str:
         cuda:0 -> cuda_0
     """
     text = str(value).strip()
-
     text = text.replace(".", "p")
     text = text.replace("-", "m")
     text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
@@ -485,6 +512,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     后面新增 Fisher / history / Bayes 时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
+
     if dataset not in SUPPORTED_DATASETS:
         raise ConfigError(
             f"不支持的数据集：{dataset}。"
@@ -492,6 +520,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model = cfg.get("model")
+
     if model not in SUPPORTED_MODELS:
         raise ConfigError(
             f"不支持的模型：{model}。"
@@ -499,7 +528,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     agg_cfg = cfg.get("agg", {})
-
     non_expert_method = agg_cfg.get("non_expert", {}).get("method")
     expert_method = agg_cfg.get("expert", {}).get("method")
 
@@ -532,10 +560,12 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     frac = float(cfg.get("frac"))
+
     if not (0.0 < frac <= 1.0):
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
     alpha = float(cfg.get("alpha"))
+
     if alpha <= 0:
         raise ConfigError(f"alpha 必须大于 0，当前值：{alpha}")
 
@@ -555,6 +585,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
 
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_type = optimizer_cfg.get("type")
+
     if optimizer_type not in {"sgd", "adam", "adamw"}:
         raise ConfigError(
             f"不支持的优化器：{optimizer_type}。"
@@ -562,13 +593,162 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     lr = float(optimizer_cfg.get("lr"))
+
     if lr <= 0:
         raise ConfigError(f"optimizer.lr 必须大于 0，当前值：{lr}")
 
     weight_decay = float(optimizer_cfg.get("weight_decay"))
+
     if weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
+        )
+
+    _validate_kfac_config(cfg)
+
+
+def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
+    """检查 K-FAC / FedFisher expert 聚合配置。"""
+    kfac_cfg = cfg.get("kfac", {})
+
+    if not isinstance(kfac_cfg, Mapping):
+        raise ConfigError("kfac 必须是 dict。")
+
+    weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
+
+    if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
+        raise ConfigError(
+            f"不支持的 kfac.weight_mode：{weight_mode}。"
+            "当前支持：routed_count, sample_weighted, uniform"
+        )
+
+    solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
+
+    if solve_scope not in {"per_layer", "global_expert"}:
+        raise ConfigError(
+            f"不支持的 kfac.solve_scope：{solve_scope}。"
+            "当前支持：per_layer, global_expert"
+        )
+
+    solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
+
+    if solve_mode not in {"cg", "gd", "adam"}:
+        raise ConfigError(
+            f"不支持的 kfac.solve_mode：{solve_mode}。"
+            "当前支持：cg, gd, adam"
+        )
+
+    if solve_scope == "global_expert" and solve_mode == "cg":
+        raise ConfigError(
+            "kfac.solve_scope=global_expert 时不建议使用 solve_mode=cg。"
+            "请使用 gd 或 adam。"
+        )
+
+    if solve_scope == "per_layer" and solve_mode in {"gd", "adam"}:
+        raise ConfigError(
+            "kfac.solve_scope=per_layer 当前只支持 solve_mode=cg。"
+            "如果要使用 gd/adam，请设置 solve_scope=global_expert。"
+        )
+
+    server_steps = int(kfac_cfg.get("server_steps", 5))
+
+    if server_steps < 0:
+        raise ConfigError(
+            f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
+        )
+
+    server_lr = float(kfac_cfg.get("server_lr", 0.01))
+
+    if server_lr <= 0:
+        raise ConfigError(
+            f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
+        )
+
+    adam_beta1 = float(kfac_cfg.get("adam_beta1", 0.9))
+    adam_beta2 = float(kfac_cfg.get("adam_beta2", 0.99))
+
+    if not (0.0 <= adam_beta1 < 1.0):
+        raise ConfigError(
+            f"kfac.adam_beta1 必须在 [0, 1) 范围内，当前值：{adam_beta1}"
+        )
+
+    if not (0.0 <= adam_beta2 < 1.0):
+        raise ConfigError(
+            f"kfac.adam_beta2 必须在 [0, 1) 范围内，当前值：{adam_beta2}"
+        )
+
+    adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
+
+    if adam_eps <= 0:
+        raise ConfigError(
+            f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
+        )
+
+    cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
+
+    if cg_tol < 0:
+        raise ConfigError(
+            f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
+        )
+
+    damping = float(kfac_cfg.get("damping", 0.0))
+
+    if damping < 0:
+        raise ConfigError(
+            f"kfac.damping 不能小于 0，当前值：{damping}"
+        )
+
+    min_count = int(kfac_cfg.get("min_count", 1))
+
+    if min_count <= 0:
+        raise ConfigError(
+            f"kfac.min_count 必须大于 0，当前值：{min_count}"
+        )
+
+    max_batches = int(kfac_cfg.get("max_batches", 0))
+
+    if max_batches < 0:
+        raise ConfigError(
+            f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
+        )
+
+    fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
+
+    if fallback not in {"none", "sample_weighted"}:
+        raise ConfigError(
+            f"不支持的 kfac.fallback：{fallback}。"
+            "当前支持：none, sample_weighted"
+        )
+
+    fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
+
+    if fisher_timing != "after_train":
+        raise ConfigError(
+            f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
+        )
+
+    model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
+
+    if model_mode not in {"eval", "train"}:
+        raise ConfigError(
+            f"不支持的 kfac.model_mode：{model_mode}。"
+            "当前支持：eval, train"
+        )
+
+    model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
+
+    if model_selection != "final_step":
+        raise ConfigError(
+            "当前主实验不支持 server validation 选 best，"
+            f"kfac.model_selection 必须是 final_step，当前值：{model_selection}"
+        )
+
+    use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
+
+    if use_server_validation:
+        raise ConfigError(
+            "当前主实验不使用 server validation，"
+            "请设置 kfac.use_server_validation=false。"
         )
 
 

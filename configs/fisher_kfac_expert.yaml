@@ -6,3 +6,49 @@ agg:
 
   expert:
     method: fisher_kfac_expert
+
+kfac:
+  collect: true
+
+  # 权重来源：论文式 sample/client 权重，不再默认使用 routed count
+  # 可选：sample_weighted / uniform / routed_count
+  weight_mode: sample_weighted
+
+  # 求解范围：把所有 expert 参数作为一个 global expert vector 一起优化
+  # 可选：global_expert / per_layer
+  solve_scope: global_expert
+
+  # 求解方式：FedFisher-style 服务端优化
+  # 可选：adam / gd / cg
+  solve_mode: adam
+
+  # 主实验不使用服务器验证集选 best，只取最后一步
+  use_server_validation: false
+  model_selection: final_step
+
+  # 先用于 smoke test，确认稳定后可以改大，比如 200 / 500 / 2000
+  server_steps: 50
+  server_lr: 0.01
+
+  # Adam-like 服务端优化器参数，对齐 FedFisher 作者实践设置
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  adam_eps: 0.01
+
+  # paper-like 默认不加 damping 软正则
+  damping: 0.0
+  use_damping: false
+
+  # K-FAC 统计过滤与 fallback
+  min_count: 1
+  fallback: none
+  include_bias: true
+
+  # Fisher/K-FAC 采集时机：本地训练完成后额外统计
+  fisher_timing: after_train
+
+  # 采集 K-FAC 时模型模式
+  model_mode: eval
+
+  # 打印详细 K-FAC 诊断日志
+  log_detail: true

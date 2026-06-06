@@ -122,6 +122,7 @@ class FLClient:
         local_model.train()
 
         criterion = build_criterion(self.cfg)
+
         optimizer = build_optimizer(
             model=local_model,
             cfg=self.cfg,
@@ -142,12 +143,30 @@ class FLClient:
 
         expert_kfac = None
         expert_kfac_summary = None
+        expert_kfac_timing = None
 
-        if (
+        should_collect_expert_kfac = (
             str(_cfg_get(self.cfg, "agg.expert.method", "")).lower().strip()
             == "fisher_kfac_expert"
             or bool(_cfg_get(self.cfg, "kfac.collect", False))
-        ):
+        )
+
+        if should_collect_expert_kfac:
+            expert_kfac_timing = str(
+                _cfg_get(
+                    self.cfg,
+                    "kfac.fisher_timing",
+                    _cfg_get(self.cfg, "kfac.collect_timing", "after_train"),
+                )
+            ).lower().strip()
+
+            if expert_kfac_timing != "after_train":
+                raise ValueError(
+                    "当前 K-FAC 采集只支持 kfac.fisher_timing=after_train。"
+                    f"当前值：{expert_kfac_timing}。"
+                    "请不要在本地训练过程中混合统计 K-FAC。"
+                )
+
             expert_kfac = collect_expert_kfac(
                 model=local_model,
                 train_loader=self.train_loader,
@@ -182,12 +201,14 @@ class FLClient:
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
                 "expert_kfac": expert_kfac,
                 "expert_kfac_summary": expert_kfac_summary,
+                "expert_kfac_timing": expert_kfac_timing,
             },
         )
 
         del local_model
         del optimizer
         del criterion
+
         gc.collect()
 
         if torch.cuda.is_available():
@@ -252,6 +273,7 @@ def train_local_model(
             optimizer.step()
 
             batch_size = int(targets.size(0))
+
             total_loss += float(loss.item()) * batch_size
             total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
             total_samples += batch_size
