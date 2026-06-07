@@ -12,7 +12,6 @@ import yaml
 # 可扩展的合法取值注册区
 # =========================
 # 后续新增数据集、模型、聚合算法时，优先改这里。
-
 SUPPORTED_DATASETS = {
     "cifar10",
     "cifar100",
@@ -27,6 +26,7 @@ SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
     "fisher_kfac_expert",
+    "history_wolf_kfac_score",
 }
 
 
@@ -221,8 +221,8 @@ def _load_yaml_with_include(
         raise ConfigError(f"配置文件顶层必须是 dict：{config_path}")
 
     cfg = dict(cfg)
-    include = cfg.pop("include", None)
 
+    include = cfg.pop("include", None)
     if include is None:
         return cfg
 
@@ -346,6 +346,26 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["kfac"].setdefault("model_selection", "final_step")
     cfg["kfac"].setdefault("log_detail", True)
 
+    # History-WoLF K-FAC Score 专家聚合配置
+    # 按照项目的极致解耦风格，单独放在顶层配置块里，
+    # 不塞到 agg.expert 下面。
+    cfg.setdefault("history_wolf_kfac_score", {})
+    cfg["history_wolf_kfac_score"].setdefault("fisher_score_enabled", True)
+    cfg["history_wolf_kfac_score"].setdefault("history_filter_enabled", True)
+    cfg["history_wolf_kfac_score"].setdefault("min_active_count", 1)
+    cfg["history_wolf_kfac_score"].setdefault("min_valid_clients", 2)
+    cfg["history_wolf_kfac_score"].setdefault("fallback", "keep_global")
+    cfg["history_wolf_kfac_score"].setdefault("active_count_ref", 32)
+    cfg["history_wolf_kfac_score"].setdefault("rho", 0.95)
+    cfg["history_wolf_kfac_score"].setdefault("c_wolf", 2.5)
+    cfg["history_wolf_kfac_score"].setdefault("min_obs_scale", 0.05)
+    cfg["history_wolf_kfac_score"].setdefault("seen_ref", 5)
+    cfg["history_wolf_kfac_score"].setdefault("q_scale", 0.05)
+    cfg["history_wolf_kfac_score"].setdefault("tau_cur", 1.0)
+    cfg["history_wolf_kfac_score"].setdefault("tau_hist", 1.0)
+    cfg["history_wolf_kfac_score"].setdefault("init_P", 1.0)
+    cfg["history_wolf_kfac_score"].setdefault("eps", 1.0e-8)
+
     # 运行配置
     cfg.setdefault("seed", 42)
     cfg.setdefault("device", "auto")
@@ -372,7 +392,7 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["logging"].setdefault("progress_in_non_tty", False)
 
     # 控制台每轮短摘要。
-    # 例如：[Round 001] train_loss=... test_acc=...
+    # 例如：[Round 001] train_loss=... | test_acc=...
     cfg["logging"].setdefault("console_round_summary", True)
 
     # train.log 每轮详细摘要。
@@ -458,7 +478,6 @@ def _is_auto_run_name(value: Any) -> bool:
         return True
 
     text = str(value).strip().lower()
-
     return text in {
         "",
         "auto",
@@ -519,7 +538,6 @@ def _safe_name(value: Any) -> str:
     text = text.replace("-", "m")
     text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
     text = re.sub(r"_+", "_", text)
-
     return text.strip("_")
 
 
@@ -621,7 +639,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "momentum",
         "weight_decay",
     }
-
     for key in forbidden_top_level_optimizer_keys:
         if key in cfg:
             raise ConfigError(
@@ -631,7 +648,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
 
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_type = optimizer_cfg.get("type")
-
     if optimizer_type not in {"sgd", "adam", "adamw"}:
         raise ConfigError(
             f"不支持的优化器：{optimizer_type}。"
@@ -649,6 +665,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     _validate_kfac_config(cfg)
+    _validate_history_wolf_kfac_score_config(cfg)
 
 
 def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
@@ -778,6 +795,105 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             "当前主实验不使用 server validation，"
             "请设置 kfac.use_server_validation=false。"
+        )
+
+
+def _validate_history_wolf_kfac_score_config(cfg: Mapping[str, Any]) -> None:
+    """检查 History-WoLF K-FAC Score 专家聚合配置。"""
+    history_cfg = cfg.get("history_wolf_kfac_score", {})
+
+    if not isinstance(history_cfg, Mapping):
+        raise ConfigError("history_wolf_kfac_score 必须是 dict。")
+
+    min_active_count = int(history_cfg.get("min_active_count", 1))
+    if min_active_count < 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.min_active_count 不能小于 0，"
+            f"当前值：{min_active_count}"
+        )
+
+    min_valid_clients = int(history_cfg.get("min_valid_clients", 2))
+    if min_valid_clients <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.min_valid_clients 必须大于 0，"
+            f"当前值：{min_valid_clients}"
+        )
+
+    fallback = str(history_cfg.get("fallback", "keep_global")).lower().strip()
+    if fallback not in {"keep_global", "uniform"}:
+        raise ConfigError(
+            f"不支持的 history_wolf_kfac_score.fallback：{fallback}。"
+            "当前支持：keep_global, uniform"
+        )
+
+    active_count_ref = float(history_cfg.get("active_count_ref", 32))
+    if active_count_ref <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.active_count_ref 必须大于 0，"
+            f"当前值：{active_count_ref}"
+        )
+
+    rho = float(history_cfg.get("rho", 0.95))
+    if not (0.0 <= rho <= 1.0):
+        raise ConfigError(
+            "history_wolf_kfac_score.rho 必须在 [0, 1] 范围内，"
+            f"当前值：{rho}"
+        )
+
+    c_wolf = float(history_cfg.get("c_wolf", 2.5))
+    if c_wolf <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.c_wolf 必须大于 0，"
+            f"当前值：{c_wolf}"
+        )
+
+    min_obs_scale = float(history_cfg.get("min_obs_scale", 0.05))
+    if min_obs_scale <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.min_obs_scale 必须大于 0，"
+            f"当前值：{min_obs_scale}"
+        )
+
+    seen_ref = float(history_cfg.get("seen_ref", 5))
+    if seen_ref <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.seen_ref 必须大于 0，"
+            f"当前值：{seen_ref}"
+        )
+
+    q_scale = float(history_cfg.get("q_scale", 0.05))
+    if q_scale < 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.q_scale 不能小于 0，"
+            f"当前值：{q_scale}"
+        )
+
+    tau_cur = float(history_cfg.get("tau_cur", 1.0))
+    if tau_cur <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.tau_cur 必须大于 0，"
+            f"当前值：{tau_cur}"
+        )
+
+    tau_hist = float(history_cfg.get("tau_hist", 1.0))
+    if tau_hist <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.tau_hist 必须大于 0，"
+            f"当前值：{tau_hist}"
+        )
+
+    init_P = float(history_cfg.get("init_P", 1.0))
+    if init_P <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.init_P 必须大于 0，"
+            f"当前值：{init_P}"
+        )
+
+    eps = float(history_cfg.get("eps", 1.0e-8))
+    if eps <= 0:
+        raise ConfigError(
+            "history_wolf_kfac_score.eps 必须大于 0，"
+            f"当前值：{eps}"
         )
 
 

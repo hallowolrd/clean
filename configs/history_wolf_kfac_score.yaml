@@ -1,0 +1,119 @@
+include: base.yaml
+
+agg:
+  # 非专家参数聚合保持极致解耦，单独指定。
+  # 这里跟 fisher_kfac_expert.yaml 对齐，用 uniform，方便只观察 expert 聚合变化。
+  non_expert:
+    method: uniform
+
+  # 专家参数使用新增的 History-WoLF K-FAC Score 聚合器。
+  expert:
+    method: history_wolf_kfac_score
+
+# =========================
+# K-FAC 采集配置
+# =========================
+# 新方法需要客户端上传 expert_kfac，所以必须打开 kfac.collect。
+# 这里只负责采集 A/B/count，不使用 fisher_kfac_expert 的服务端求解器。
+kfac:
+  collect: true
+
+  # 保持和 fisher_kfac_expert.yaml 一致：本地训练后统计 K-FAC。
+  fisher_timing: after_train
+
+  # 统计 K-FAC 时使用 eval 模式，减少 dropout/bn 等随机影响。
+  model_mode: eval
+
+  # 是否把 bias 合进 K-FAC A 因子。
+  include_bias: true
+
+  # active_count / count 低于该值的 K-FAC 统计视为无效。
+  min_count: 1
+
+  # 0 表示使用完整 train_loader 统计 K-FAC。
+  # 如果训练太慢，可以临时改成 5 或 10 做 smoke test。
+  max_batches: 0
+
+  # 仅用于 K-FAC 诊断日志。
+  log_detail: true
+
+  # 下面这些字段是 kfac 默认校验会读取的字段。
+  # 新方法不使用 FedFisher solver，但保留合法默认值，避免配置校验报错。
+  weight_mode: sample_weighted
+  solve_scope: global_expert
+  solve_mode: adam
+  use_server_validation: false
+  model_selection: final_step
+  server_steps: 200
+  server_lr: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  adam_eps: 0.01
+  damping: 0.0
+  use_damping: false
+  fallback: none
+
+# =========================
+# History-WoLF K-FAC Score 配置
+# =========================
+# 注意：
+# 这些参数应该由 aggregation/history_wolf_kfac_score.py
+# 通过 cfg.get("history_wolf_kfac_score.xxx", default) 读取。
+history_wolf_kfac_score:
+  # 是否启用 K-FAC/Fisher score。
+  # true：观测值 y_i,e = log(fisher_score_i,e + eps)
+  # false：观测值固定为 0，用于消融。
+  fisher_score_enabled: true
+
+  # 是否启用 WoLF 历史滤波。
+  # true：使用历史滤波后的 log-score 生成 expert 聚合权重。
+  # false：直接使用本轮 fisher_score 做 Fisher-only 消融。
+  history_filter_enabled: true
+
+  # active_count 低于该值的 client-expert 不参与 median/MAD，
+  # 也不参与该 expert 本轮聚合。
+  min_active_count: 1
+
+  # 每个 expert 至少需要多少个有效 client 才做历史滤波聚合。
+  # 太少时 fallback，避免单个 client 把 expert 拉飞。
+  min_valid_clients: 2
+
+  # fallback 策略：
+  # keep_global：该 expert 本轮保持上一轮全局参数。
+  # uniform：对有效 client 做均匀平均。
+  fallback: keep_global
+
+  # active_count 只用于观测可信度，不乘进 fisher_score。
+  # active_count 越大，route_quality 越接近 1。
+  active_count_ref: 32
+
+  # 历史均值衰减系数。
+  # 越接近 1，越相信长期历史。
+  rho: 0.95
+
+  # WoLF-IMQ 残差阈值。
+  # residual 超过约 c_wolf 个尺度后，观测影响会明显下降。
+  c_wolf: 2.5
+
+  # 观测精度下限，防止 current_quality 太低导致数值不稳定。
+  min_obs_scale: 0.05
+
+  # 历史置信度 warmup。
+  # seen 越多，history_conf 越高。
+  seen_ref: 5
+
+  # 过程噪声比例。
+  # Q_e = q_scale * MAD_cur^2。
+  q_scale: 0.05
+
+  # 当前质量 sigmoid 温度。
+  tau_cur: 1.0
+
+  # 历史强度 sigmoid 温度。
+  tau_hist: 1.0
+
+  # client-expert 第一次出现时的初始不确定性。
+  init_P: 1.0
+
+  # 数值稳定项。
+  eps: 1.0e-8
