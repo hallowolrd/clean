@@ -57,8 +57,7 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         # ------------------------------
         # 消融开关
         # ------------------------------
-        # 注意：
-        # 当前项目采用极致解耦配置风格。
+        # 当前项目采用极致解耦配置风格：
         # history_wolf_kfac_score 的参数放在顶层 history_wolf_kfac_score.xxx，
         # 不放在 agg.expert.xxx 下面。
         self.fisher_score_enabled = _cfg_bool(
@@ -242,13 +241,35 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         per_expert_valid_clients: Dict[int, int] = {}
         per_expert_weight_stats: Dict[int, Dict[str, float]] = {}
         per_expert_state_counts: Dict[int, Dict[str, int]] = {}
+        per_expert_debug: Dict[int, Dict[str, float | int | bool]] = {}
 
         all_fisher_scores: List[float] = []
         all_active_counts: List[float] = []
         all_current_quality: List[float] = []
         all_history_quality: List[float] = []
-        all_wolf: List[float] = []
+        all_wolf_eff: List[float] = []
         all_kalman_gain: List[float] = []
+
+        # 新增：用于判断超参数是否合适的诊断量。
+        all_route_quality: List[float] = []
+        all_z_cur: List[float] = []
+        all_z_hist: List[float] = []
+        all_residual_dist: List[float] = []
+        all_wolf_raw: List[float] = []
+        all_obs_scale: List[float] = []
+        all_obs_floor_hit: List[float] = []
+        all_R_eff: List[float] = []
+        all_P_pred: List[float] = []
+        all_P_new: List[float] = []
+        all_P_shrink_ratio: List[float] = []
+        all_history_conf: List[float] = []
+        all_seen: List[float] = []
+        all_cold_start: List[float] = []
+
+        per_expert_weight_entropy: List[float] = []
+        per_expert_weight_normalized_entropy: List[float] = []
+        per_expert_weight_ess: List[float] = []
+        per_expert_top1_weight: List[float] = []
 
         for expert_id in sorted(expert_to_param_names.keys()):
             records = records_by_expert.get(expert_id, [])
@@ -262,6 +283,7 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             per_expert_fallback[expert_id] = bool(result["fallback"])
             per_expert_valid_clients[expert_id] = int(result["valid_clients"])
             per_expert_state_counts[expert_id] = dict(result["state_counts"])
+            per_expert_debug[expert_id] = dict(result["expert_debug"])
 
             weights = list(result["weights"].values())
             if weights:
@@ -281,8 +303,32 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             all_active_counts.extend(result["active_counts"])
             all_current_quality.extend(result["current_quality"])
             all_history_quality.extend(result["history_quality"])
-            all_wolf.extend(result["wolf"])
+            all_wolf_eff.extend(result["wolf_eff"])
             all_kalman_gain.extend(result["kalman_gain"])
+
+            all_route_quality.extend(result["route_quality"])
+            all_z_cur.extend(result["z_cur"])
+            all_z_hist.extend(result["z_hist"])
+            all_residual_dist.extend(result["residual_dist"])
+            all_wolf_raw.extend(result["wolf_raw"])
+            all_obs_scale.extend(result["obs_scale"])
+            all_obs_floor_hit.extend(result["obs_floor_hit"])
+            all_R_eff.extend(result["R_eff"])
+            all_P_pred.extend(result["P_pred"])
+            all_P_new.extend(result["P_new"])
+            all_P_shrink_ratio.extend(result["P_shrink_ratio"])
+            all_history_conf.extend(result["history_conf"])
+            all_seen.extend(result["seen"])
+            all_cold_start.extend(result["cold_start"])
+
+            weight_metrics = result["weight_metrics"]
+            if int(weight_metrics.get("num_weights", 0)) > 0:
+                per_expert_weight_entropy.append(float(weight_metrics["entropy"]))
+                per_expert_weight_normalized_entropy.append(
+                    float(weight_metrics["normalized_entropy"])
+                )
+                per_expert_weight_ess.append(float(weight_metrics["ess"]))
+                per_expert_top1_weight.append(float(weight_metrics["top1_weight"]))
 
         # 根据每个 expert 自己的 client weights 写回 expert 参数。
         for expert_id, expert_param_names in expert_to_param_names.items():
@@ -331,6 +377,10 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         )
         self._last_client_weights = dict(client_weights)
 
+        expert_count = max(len(expert_to_param_names), 1)
+        fallback_expert_count = int(sum(1 for v in per_expert_fallback.values() if v))
+        valid_client_values = list(per_expert_valid_clients.values())
+
         diagnostics = {
             "method": self.method_name,
             "param_group": self.param_group_name,
@@ -353,12 +403,120 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             "per_expert_state_counts": {
                 int(k): dict(v) for k, v in per_expert_state_counts.items()
             },
+            "per_expert_debug": {
+                int(k): dict(v) for k, v in per_expert_debug.items()
+            },
+
+            # ------------------------------
+            # 原有核心诊断
+            # ------------------------------
             "mean_fisher_score": _safe_mean(all_fisher_scores),
             "mean_active_count": _safe_mean(all_active_counts),
             "mean_current_quality": _safe_mean(all_current_quality),
             "mean_history_quality": _safe_mean(all_history_quality),
-            "mean_wolf": _safe_mean(all_wolf),
+            "mean_wolf": _safe_mean(all_wolf_eff),
             "mean_kalman_gain": _safe_mean(all_kalman_gain),
+
+            # ------------------------------
+            # 新增：valid / fallback 诊断
+            # ------------------------------
+            "fallback_expert_count": int(fallback_expert_count),
+            "fallback_expert_ratio": float(fallback_expert_count) / float(expert_count),
+            "mean_valid_clients": _safe_mean(valid_client_values),
+            "min_valid_clients_observed": _safe_min(valid_client_values),
+            "max_valid_clients_observed": _safe_max(valid_client_values),
+
+            # ------------------------------
+            # 新增：active_count_ref / route_quality 诊断
+            # ------------------------------
+            "active_count_min": _safe_min(all_active_counts),
+            "active_count_median": _safe_median(all_active_counts),
+            "active_count_mean": _safe_mean(all_active_counts),
+            "active_count_max": _safe_max(all_active_counts),
+            "mean_route_quality": _safe_mean(all_route_quality),
+            "min_route_quality": _safe_min(all_route_quality),
+            "max_route_quality": _safe_max(all_route_quality),
+            "frac_route_quality_lt_0_3": _safe_frac_lt(all_route_quality, 0.3),
+            "frac_route_quality_lt_0_5": _safe_frac_lt(all_route_quality, 0.5),
+            "frac_route_quality_gt_0_8": _safe_frac_gt(all_route_quality, 0.8),
+
+            # ------------------------------
+            # 新增：tau_cur / tau_hist 诊断
+            # ------------------------------
+            "z_cur_mean": _safe_mean(all_z_cur),
+            "z_cur_std": _safe_std(all_z_cur),
+            "z_cur_min": _safe_min(all_z_cur),
+            "z_cur_max": _safe_max(all_z_cur),
+            "frac_current_quality_lt_0_2": _safe_frac_lt(all_current_quality, 0.2),
+            "frac_current_quality_gt_0_8": _safe_frac_gt(all_current_quality, 0.8),
+            "z_hist_mean": _safe_mean(all_z_hist),
+            "z_hist_std": _safe_std(all_z_hist),
+            "z_hist_min": _safe_min(all_z_hist),
+            "z_hist_max": _safe_max(all_z_hist),
+            "frac_history_quality_lt_0_2": _safe_frac_lt(all_history_quality, 0.2),
+            "frac_history_quality_gt_0_8": _safe_frac_gt(all_history_quality, 0.8),
+
+            # ------------------------------
+            # 新增：c_wolf / residual / WoLF 诊断
+            # ------------------------------
+            "residual_dist_mean": _safe_mean(all_residual_dist),
+            "residual_dist_median": _safe_median(all_residual_dist),
+            "residual_dist_max": _safe_max(all_residual_dist),
+            "frac_residual_gt_c_wolf": _safe_frac_gt(all_residual_dist, self.c_wolf),
+            "frac_residual_gt_2c_wolf": _safe_frac_gt(
+                all_residual_dist,
+                2.0 * self.c_wolf,
+            ),
+            "wolf_raw_mean": _safe_mean(all_wolf_raw),
+            "wolf_raw_min": _safe_min(all_wolf_raw),
+            "wolf_raw_max": _safe_max(all_wolf_raw),
+            "wolf_eff_mean": _safe_mean(all_wolf_eff),
+            "wolf_eff_min": _safe_min(all_wolf_eff),
+            "wolf_eff_max": _safe_max(all_wolf_eff),
+            "frac_wolf_eff_lt_0_5": _safe_frac_lt(all_wolf_eff, 0.5),
+            "frac_wolf_eff_lt_0_8": _safe_frac_lt(all_wolf_eff, 0.8),
+
+            # ------------------------------
+            # 新增：min_obs_scale / R_eff 诊断
+            # ------------------------------
+            "obs_scale_mean": _safe_mean(all_obs_scale),
+            "obs_scale_min": _safe_min(all_obs_scale),
+            "obs_scale_max": _safe_max(all_obs_scale),
+            "frac_obs_scale_at_floor": _safe_mean(all_obs_floor_hit),
+            "R_eff_mean": _safe_mean(all_R_eff),
+            "R_eff_max": _safe_max(all_R_eff),
+
+            # ------------------------------
+            # 新增：q_scale / init_P / seen_ref / Kalman 诊断
+            # ------------------------------
+            "P_pred_mean": _safe_mean(all_P_pred),
+            "P_new_mean": _safe_mean(all_P_new),
+            "P_new_min": _safe_min(all_P_new),
+            "P_new_max": _safe_max(all_P_new),
+            "P_shrink_ratio_mean": _safe_mean(all_P_shrink_ratio),
+            "kalman_gain_min": _safe_min(all_kalman_gain),
+            "kalman_gain_mean": _safe_mean(all_kalman_gain),
+            "kalman_gain_max": _safe_max(all_kalman_gain),
+            "frac_K_lt_0_1": _safe_frac_lt(all_kalman_gain, 0.1),
+            "frac_K_gt_0_8": _safe_frac_gt(all_kalman_gain, 0.8),
+            "seen_mean": _safe_mean(all_seen),
+            "seen_min": _safe_min(all_seen),
+            "seen_max": _safe_max(all_seen),
+            "frac_cold_start": _safe_mean(all_cold_start),
+            "history_conf_mean": _safe_mean(all_history_conf),
+            "history_conf_min": _safe_min(all_history_conf),
+            "history_conf_max": _safe_max(all_history_conf),
+
+            # ------------------------------
+            # 新增：最终权重区分度诊断
+            # ------------------------------
+            "mean_weight_entropy": _safe_mean(per_expert_weight_entropy),
+            "mean_weight_normalized_entropy": _safe_mean(
+                per_expert_weight_normalized_entropy
+            ),
+            "mean_weight_ess": _safe_mean(per_expert_weight_ess),
+            "mean_top1_weight": _safe_mean(per_expert_top1_weight),
+
             "expert_client_weights": {
                 int(expert_id): {
                     int(client_id): float(weight)
@@ -454,18 +612,12 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         对单个 expert 计算 per-client weights，并更新历史状态。
         """
         if len(records) == 0:
-            return {
-                "weights": {},
-                "fallback": True,
-                "valid_clients": 0,
-                "state_counts": _empty_state_counts(),
-                "fisher_scores": [],
-                "active_counts": [],
-                "current_quality": [],
-                "history_quality": [],
-                "wolf": [],
-                "kalman_gain": [],
-            }
+            return self._empty_expert_result(
+                fallback=True,
+                valid_clients=0,
+                records=[],
+                weights={},
+            )
 
         # 必做修正 1：
         # 低 active_count 的 client 不参与 median/MAD，也不参与本轮 expert 聚合。
@@ -478,18 +630,12 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
 
         if len(valid_records) < int(self.min_valid_clients):
             weights = self._fallback_weights(records=records)
-            return {
-                "weights": weights,
-                "fallback": True,
-                "valid_clients": len(valid_records),
-                "state_counts": _empty_state_counts(),
-                "fisher_scores": [float(r.fisher_score) for r in records],
-                "active_counts": [float(r.active_count) for r in records],
-                "current_quality": [],
-                "history_quality": [],
-                "wolf": [],
-                "kalman_gain": [],
-            }
+            return self._empty_expert_result(
+                fallback=True,
+                valid_clients=len(valid_records),
+                records=records,
+                weights=weights,
+            )
 
         y_by_client: Dict[int, float] = {}
         for record in valid_records:
@@ -531,17 +677,50 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
                 for client_id, y_value in y_by_client.items()
             }
             weights = _softmax_dict(logits)
+            weight_metrics = _compute_weight_metrics(weights)
+
+            active_counts = [float(r.active_count) for r in valid_records]
+            fisher_scores = [float(r.fisher_score) for r in valid_records]
+
+            expert_debug = {
+                "valid_clients": int(len(valid_records)),
+                "fallback": False,
+                "active_count_median": _safe_median(active_counts),
+                "active_count_mean": _safe_mean(active_counts),
+                "fisher_score_mean": _safe_mean(fisher_scores),
+                "weight_entropy": float(weight_metrics["entropy"]),
+                "weight_normalized_entropy": float(weight_metrics["normalized_entropy"]),
+                "weight_ess": float(weight_metrics["ess"]),
+                "top1_weight": float(weight_metrics["top1_weight"]),
+            }
+
             return {
                 "weights": weights,
                 "fallback": False,
                 "valid_clients": len(valid_records),
                 "state_counts": _empty_state_counts(),
-                "fisher_scores": [float(r.fisher_score) for r in valid_records],
-                "active_counts": [float(r.active_count) for r in valid_records],
+                "fisher_scores": fisher_scores,
+                "active_counts": active_counts,
                 "current_quality": [],
                 "history_quality": [],
-                "wolf": [],
+                "wolf_eff": [],
                 "kalman_gain": [],
+                "route_quality": [],
+                "z_cur": [],
+                "z_hist": [],
+                "residual_dist": [],
+                "wolf_raw": [],
+                "obs_scale": [],
+                "obs_floor_hit": [],
+                "R_eff": [],
+                "P_pred": [],
+                "P_new": [],
+                "P_shrink_ratio": [],
+                "history_conf": [],
+                "seen": [],
+                "cold_start": [],
+                "weight_metrics": weight_metrics,
+                "expert_debug": expert_debug,
             }
 
         final_logits: Dict[int, float] = {}
@@ -551,8 +730,23 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         active_counts: List[float] = []
         current_quality_values: List[float] = []
         history_quality_values: List[float] = []
-        wolf_values: List[float] = []
+        wolf_eff_values: List[float] = []
         kalman_gain_values: List[float] = []
+
+        route_quality_values: List[float] = []
+        z_cur_values: List[float] = []
+        z_hist_values: List[float] = []
+        residual_dist_values: List[float] = []
+        wolf_raw_values: List[float] = []
+        obs_scale_values: List[float] = []
+        obs_floor_hit_values: List[float] = []
+        R_eff_values: List[float] = []
+        P_pred_values: List[float] = []
+        P_new_values: List[float] = []
+        P_shrink_ratio_values: List[float] = []
+        history_conf_values: List[float] = []
+        seen_values: List[float] = []
+        cold_start_values: List[float] = []
 
         for record in valid_records:
             client_id = int(record.client_id)
@@ -588,7 +782,7 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             # 历史质量：历史强度 + seen/P 置信度。
             if seen <= 0:
                 history_quality = 0.0
-                history_conf_old = 0.0
+                z_hist = 0.0
             else:
                 z_hist = (mu - med_hist) / (mad_hist + self.eps)
                 history_strength = _sigmoid(z_hist / max(self.tau_hist, self.eps))
@@ -597,6 +791,7 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
                 ) * (R_e / (P + R_e + self.eps))
                 history_quality = history_strength * history_conf_old
                 history_quality = _clamp(history_quality, 0.0, 1.0)
+                z_hist_values.append(float(z_hist))
 
             # 历史预测：长期历史向本轮低基准轻微衰减，避免历史永久霸占权重。
             mu_pred = self.rho * mu + (1.0 - self.rho) * base_e
@@ -608,15 +803,16 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
                 math.sqrt(P_pred) + mad_cur + self.eps
             )
 
-            wolf = 1.0 / math.sqrt(
+            wolf_raw = 1.0 / math.sqrt(
                 1.0 + (residual_dist / max(self.c_wolf, self.eps)) ** 2
             )
-            wolf = _clamp(wolf, 0.0, 1.0)
+            wolf_raw = _clamp(wolf_raw, 0.0, 1.0)
 
             # 历史不好时，不让历史压制本轮。
-            wolf_eff = (1.0 - history_quality) + history_quality * wolf
+            wolf_eff = (1.0 - history_quality) + history_quality * wolf_raw
             wolf_eff = _clamp(wolf_eff, 0.0, 1.0)
 
+            obs_floor_hit = 1.0 if current_quality < self.min_obs_scale else 0.0
             obs_scale = max(current_quality, self.min_obs_scale) * (wolf_eff**2)
             obs_scale = max(obs_scale, self.eps)
             R_eff = R_e / obs_scale
@@ -626,6 +822,7 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
 
             mu_new = mu_pred + K * (y - mu_pred)
             P_new = max((1.0 - K) * P_pred, self.eps)
+            P_shrink_ratio = P_new / max(P_pred, self.eps)
 
             current_good = bool(current_quality >= 0.5)
             history_good = bool(history_quality >= 0.5)
@@ -661,10 +858,47 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             active_counts.append(float(record.active_count))
             current_quality_values.append(float(current_quality))
             history_quality_values.append(float(history_quality))
-            wolf_values.append(float(wolf_eff))
+            wolf_eff_values.append(float(wolf_eff))
             kalman_gain_values.append(float(K))
 
+            route_quality_values.append(float(route_quality))
+            z_cur_values.append(float(z_cur))
+            residual_dist_values.append(float(residual_dist))
+            wolf_raw_values.append(float(wolf_raw))
+            obs_scale_values.append(float(obs_scale))
+            obs_floor_hit_values.append(float(obs_floor_hit))
+            R_eff_values.append(float(R_eff))
+            P_pred_values.append(float(P_pred))
+            P_new_values.append(float(P_new))
+            P_shrink_ratio_values.append(float(P_shrink_ratio))
+            history_conf_values.append(float(history_conf_new))
+            seen_values.append(float(seen_new))
+            cold_start_values.append(1.0 if seen_new <= 1 else 0.0)
+
         weights = _softmax_dict(final_logits)
+        weight_metrics = _compute_weight_metrics(weights)
+
+        expert_debug = {
+            "valid_clients": int(len(valid_records)),
+            "fallback": False,
+            "active_count_median": _safe_median(active_counts),
+            "active_count_mean": _safe_mean(active_counts),
+            "fisher_score_mean": _safe_mean(fisher_scores),
+            "route_quality_mean": _safe_mean(route_quality_values),
+            "current_quality_mean": _safe_mean(current_quality_values),
+            "history_quality_mean": _safe_mean(history_quality_values),
+            "residual_dist_mean": _safe_mean(residual_dist_values),
+            "wolf_raw_mean": _safe_mean(wolf_raw_values),
+            "wolf_eff_mean": _safe_mean(wolf_eff_values),
+            "obs_scale_mean": _safe_mean(obs_scale_values),
+            "kalman_gain_mean": _safe_mean(kalman_gain_values),
+            "P_new_mean": _safe_mean(P_new_values),
+            "history_conf_mean": _safe_mean(history_conf_values),
+            "weight_entropy": float(weight_metrics["entropy"]),
+            "weight_normalized_entropy": float(weight_metrics["normalized_entropy"]),
+            "weight_ess": float(weight_metrics["ess"]),
+            "top1_weight": float(weight_metrics["top1_weight"]),
+        }
 
         return {
             "weights": weights,
@@ -675,8 +909,79 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
             "active_counts": active_counts,
             "current_quality": current_quality_values,
             "history_quality": history_quality_values,
-            "wolf": wolf_values,
+            "wolf_eff": wolf_eff_values,
             "kalman_gain": kalman_gain_values,
+            "route_quality": route_quality_values,
+            "z_cur": z_cur_values,
+            "z_hist": z_hist_values,
+            "residual_dist": residual_dist_values,
+            "wolf_raw": wolf_raw_values,
+            "obs_scale": obs_scale_values,
+            "obs_floor_hit": obs_floor_hit_values,
+            "R_eff": R_eff_values,
+            "P_pred": P_pred_values,
+            "P_new": P_new_values,
+            "P_shrink_ratio": P_shrink_ratio_values,
+            "history_conf": history_conf_values,
+            "seen": seen_values,
+            "cold_start": cold_start_values,
+            "weight_metrics": weight_metrics,
+            "expert_debug": expert_debug,
+        }
+
+    def _empty_expert_result(
+        self,
+        fallback: bool,
+        valid_clients: int,
+        records: Sequence[_ClientExpertRecord],
+        weights: Mapping[int, float],
+    ) -> Dict[str, Any]:
+        """
+        构造空 expert 结果，避免 fallback / 无记录时遗漏诊断字段。
+        """
+        active_counts = [float(r.active_count) for r in records]
+        fisher_scores = [float(r.fisher_score) for r in records]
+        weight_metrics = _compute_weight_metrics(weights)
+
+        expert_debug = {
+            "valid_clients": int(valid_clients),
+            "fallback": bool(fallback),
+            "active_count_median": _safe_median(active_counts),
+            "active_count_mean": _safe_mean(active_counts),
+            "fisher_score_mean": _safe_mean(fisher_scores),
+            "weight_entropy": float(weight_metrics["entropy"]),
+            "weight_normalized_entropy": float(weight_metrics["normalized_entropy"]),
+            "weight_ess": float(weight_metrics["ess"]),
+            "top1_weight": float(weight_metrics["top1_weight"]),
+        }
+
+        return {
+            "weights": dict(weights),
+            "fallback": bool(fallback),
+            "valid_clients": int(valid_clients),
+            "state_counts": _empty_state_counts(),
+            "fisher_scores": fisher_scores,
+            "active_counts": active_counts,
+            "current_quality": [],
+            "history_quality": [],
+            "wolf_eff": [],
+            "kalman_gain": [],
+            "route_quality": [],
+            "z_cur": [],
+            "z_hist": [],
+            "residual_dist": [],
+            "wolf_raw": [],
+            "obs_scale": [],
+            "obs_floor_hit": [],
+            "R_eff": [],
+            "P_pred": [],
+            "P_new": [],
+            "P_shrink_ratio": [],
+            "history_conf": [],
+            "seen": [],
+            "cold_start": [],
+            "weight_metrics": weight_metrics,
+            "expert_debug": expert_debug,
         }
 
     def _fallback_weights(
@@ -983,6 +1288,55 @@ def _average_per_expert_weights(
     return normalize_weights(averaged)
 
 
+def _compute_weight_metrics(weights: Mapping[int, float]) -> Dict[str, float | int]:
+    """
+    计算 expert 内 client 权重的区分度。
+
+    ESS = 1 / sum_i w_i^2
+    - ESS 接近 client 数量：权重接近均匀；
+    - ESS 接近 1：单个 client 基本支配该 expert。
+    """
+    clean_weights = [
+        float(weight)
+        for weight in weights.values()
+        if math.isfinite(float(weight)) and float(weight) > 0.0
+    ]
+
+    if len(clean_weights) == 0:
+        return {
+            "num_weights": 0,
+            "entropy": 0.0,
+            "normalized_entropy": 0.0,
+            "ess": 0.0,
+            "top1_weight": 0.0,
+        }
+
+    total = sum(clean_weights)
+    if total <= 0.0:
+        return {
+            "num_weights": len(clean_weights),
+            "entropy": 0.0,
+            "normalized_entropy": 0.0,
+            "ess": 0.0,
+            "top1_weight": 0.0,
+        }
+
+    normalized = [weight / total for weight in clean_weights]
+    entropy = -sum(weight * math.log(weight + 1.0e-12) for weight in normalized)
+    max_entropy = math.log(float(len(normalized))) if len(normalized) > 1 else 1.0
+    normalized_entropy = entropy / max(max_entropy, 1.0e-12)
+    ess = 1.0 / max(sum(weight * weight for weight in normalized), 1.0e-12)
+    top1_weight = max(normalized)
+
+    return {
+        "num_weights": int(len(normalized)),
+        "entropy": float(entropy),
+        "normalized_entropy": float(normalized_entropy),
+        "ess": float(ess),
+        "top1_weight": float(top1_weight),
+    }
+
+
 def _softmax_dict(logits: Mapping[int, float]) -> Dict[int, float]:
     """
     稳定版 softmax，避免 exp(mu) 数值爆炸。
@@ -1050,6 +1404,61 @@ def _mad(values: Sequence[float], center: Optional[float] = None) -> float:
     return _median(deviations)
 
 
+def _safe_mean(values: Sequence[float]) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    return float(sum(clean_values) / len(clean_values))
+
+
+def _safe_median(values: Sequence[float]) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    return _median(clean_values)
+
+
+def _safe_min(values: Sequence[float]) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    return float(min(clean_values))
+
+
+def _safe_max(values: Sequence[float]) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    return float(max(clean_values))
+
+
+def _safe_std(values: Sequence[float]) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) <= 1:
+        return 0.0
+
+    mean_value = sum(clean_values) / float(len(clean_values))
+    var_value = sum((v - mean_value) ** 2 for v in clean_values)
+    var_value /= float(len(clean_values))
+    return float(math.sqrt(max(var_value, 0.0)))
+
+
+def _safe_frac_lt(values: Sequence[float], threshold: float) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    count = sum(1 for value in clean_values if value < float(threshold))
+    return float(count) / float(len(clean_values))
+
+
+def _safe_frac_gt(values: Sequence[float], threshold: float) -> float:
+    clean_values = [float(v) for v in values if math.isfinite(float(v))]
+    if len(clean_values) == 0:
+        return 0.0
+    count = sum(1 for value in clean_values if value > float(threshold))
+    return float(count) / float(len(clean_values))
+
+
 def _sigmoid(x: float) -> float:
     """
     数值稳定 sigmoid。
@@ -1064,13 +1473,6 @@ def _sigmoid(x: float) -> float:
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
     return float(max(float(min_value), min(float(max_value), float(value))))
-
-
-def _safe_mean(values: Sequence[float]) -> float:
-    clean_values = [float(v) for v in values if math.isfinite(float(v))]
-    if len(clean_values) == 0:
-        return 0.0
-    return float(sum(clean_values) / len(clean_values))
 
 
 def _empty_state_counts() -> Dict[str, int]:

@@ -53,16 +53,11 @@ class ServerTrainResult:
     best_round: int
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        转成普通 dict，方便后续保存日志。
-        """
+        """转成普通 dict，方便后续保存日志。"""
         return {
             "best_acc": float(self.best_acc),
             "best_round": int(self.best_round),
-            "round_results": [
-                item.to_dict()
-                for item in self.round_results
-            ],
+            "round_results": [item.to_dict() for item in self.round_results],
             "train_state": self.train_state.to_dict(),
         }
 
@@ -104,7 +99,6 @@ class FLServer:
             self.global_model = build_model(cfg)
         else:
             self.global_model = global_model
-
         self.global_model.to("cpu")
 
         self.clients = build_clients(
@@ -113,7 +107,6 @@ class FLServer:
             device=self.device,
         )
         self.test_loader = test_loader
-
         self.aggregators = build_aggregators(cfg)
 
         self.param_groups = build_param_groups(
@@ -128,7 +121,6 @@ class FLServer:
             best_round=0,
             extra={},
         )
-
         self.round_results: List[RoundResult] = []
 
         self._validate_server_state()
@@ -208,9 +200,7 @@ class FLServer:
         # utils/logging.py 里也建议对 stderr 做 tqdm 过滤，
         # 这里和 TeeStream 过滤是双保险。
         progress_file = getattr(sys, "__stderr__", sys.stderr)
-        progress_is_tty = bool(
-            getattr(progress_file, "isatty", lambda: False)()
-        )
+        progress_is_tty = bool(getattr(progress_file, "isatty", lambda: False)())
         progress_enabled = bool(progress_bar_enabled) and (
             progress_is_tty or bool(progress_in_non_tty)
         )
@@ -243,7 +233,6 @@ class FLServer:
                         global_model=self.global_model,
                         round_id=round_id,
                     )
-
                     client_updates.extend(single_client_updates)
 
                     if not progress_bar.disable:
@@ -281,7 +270,6 @@ class FLServer:
                     eval_result=eval_result,
                     aggregation_info=aggregation_info,
                 )
-
                 self.round_results.append(round_result)
 
                 avg_train_loss = round_result.aggregation_info.get(
@@ -322,7 +310,6 @@ class FLServer:
                         progress_bar.refresh()
 
                 self._cleanup_after_round()
-
         finally:
             progress_bar.close()
 
@@ -373,7 +360,6 @@ class FLServer:
         )
 
         new_state_dict = expert_result.new_state_dict
-
         check_finite_state_dict(new_state_dict)
 
         self.global_model.load_state_dict(
@@ -397,15 +383,12 @@ class FLServer:
         不参与参数聚合。
         """
         self.global_model.to(self.device)
-
         result = evaluate(
             model=self.global_model,
             data_loader=self.test_loader,
             device=self.device,
         )
-
         self.global_model.to("cpu")
-
         return result
 
     def build_round_result(
@@ -416,13 +399,8 @@ class FLServer:
         eval_result: EvalResult,
         aggregation_info: Dict[str, Any],
     ) -> RoundResult:
-        """
-        构建单轮训练结果摘要。
-        """
-        selected_client_ids = [
-            int(client.client_id)
-            for client in selected_clients
-        ]
+        """构建单轮训练结果摘要。"""
+        selected_client_ids = [int(client.client_id) for client in selected_clients]
 
         avg_train_loss = average_client_metric(
             client_updates=list(client_updates),
@@ -444,8 +422,8 @@ class FLServer:
         # 保存每个客户端的轻量诊断信息。
         # 注意：这里不保存 model_delta，也不保存 expert_kfac 原始矩阵，
         # 避免 summary.json / train.log 过大。
-        full_aggregation_info["client_diagnostics"] = (
-            self._build_client_diagnostics(client_updates)
+        full_aggregation_info["client_diagnostics"] = self._build_client_diagnostics(
+            client_updates
         )
 
         return RoundResult(
@@ -461,7 +439,6 @@ class FLServer:
     def print_startup_summary(self) -> None:
         """
         打印训练开始前的摘要信息。
-
         这部分同时进入控制台和 train.log。
         """
         model_summary = summarize_model(self.global_model)
@@ -539,7 +516,6 @@ class FLServer:
         写入每轮详细日志。
 
         这部分只写 train.log，不打印到控制台。
-
         当前记录：
         1. 本轮整体 train/test 指标
         2. 本轮选择的客户端
@@ -548,7 +524,6 @@ class FLServer:
         5. 每个客户端样本数、本地 train_loss/train_acc、expert_usage
         """
         logging_cfg = _cfg_get(self.cfg, "logging", {})
-
         log_round_clients = _cfg_get_bool(
             logging_cfg,
             "log_round_clients",
@@ -633,7 +608,6 @@ class FLServer:
 
         for update in client_updates:
             extra = dict(update.extra or {})
-
             diagnostics[int(update.client_id)] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
@@ -661,13 +635,17 @@ class FLServer:
             "compact_uniform_weights",
             True,
         )
+        log_history_wolf_kfac_detail = _cfg_get_bool(
+            logging_cfg,
+            "log_history_wolf_kfac_detail",
+            True,
+        )
 
         for group_name in ("non_expert", "expert"):
             agg_info = self._extract_aggregation_info(
                 round_result=round_result,
                 group_name=group_name,
             )
-
             if agg_info is None:
                 continue
 
@@ -679,13 +657,108 @@ class FLServer:
             else:
                 weights_text = "hidden"
 
+            method = str(agg_info.get("method", "unknown"))
+
             self._write_log_only(
                 f"[Agg][{group_name}] "
                 f"round={round_result.round_id} "
-                f"method={agg_info.get('method', 'unknown')} "
+                f"method={method} "
                 f"clients={agg_info.get('num_clients', 'unknown')} "
                 f"params={agg_info.get('param_count', 'unknown')} "
                 f"weights={weights_text}"
+            )
+
+            # History-WoLF K-FAC Score 的关键诊断量比较多，单独展开成几行。
+            # 这样不用去翻完整 diagnostics dict，也能直接判断超参数是否偏大/偏小。
+            if (
+                group_name == "expert"
+                and method == "history_wolf_kfac_score"
+                and log_history_wolf_kfac_detail
+            ):
+                self._write_history_wolf_kfac_diagnostics_to_log(
+                    round_id=round_result.round_id,
+                    agg_info=agg_info,
+                )
+
+    def _write_history_wolf_kfac_diagnostics_to_log(
+        self,
+        round_id: int,
+        agg_info: Mapping[str, Any],
+    ) -> None:
+        """
+        写入 History-WoLF K-FAC Score 的核心诊断值。
+
+        这些值主要用来判断以下超参数是否设置合理：
+        - min_active_count / min_valid_clients / fallback
+        - active_count_ref
+        - tau_cur / tau_hist
+        - c_wolf
+        - min_obs_scale
+        - q_scale / init_P / seen_ref
+        - 最终 expert 内 client 权重是否过于均匀或过于尖锐
+        """
+        diagnostics = agg_info.get("diagnostics", {})
+        if not isinstance(diagnostics, Mapping):
+            return
+
+        prefix = f"[AggDiag][history_wolf_kfac_score] round={int(round_id)}"
+
+        # valid / fallback / active_count_ref / route_quality
+        self._write_log_only(
+            f"{prefix} "
+            f"fallback={self._fmt_diag(diagnostics, 'fallback_expert_count', '.0f')} "
+            f"fallback_ratio={self._fmt_diag(diagnostics, 'fallback_expert_ratio', '.3f')} "
+            f"valid_mean={self._fmt_diag(diagnostics, 'mean_valid_clients', '.2f')} "
+            f"valid_min={self._fmt_diag(diagnostics, 'min_valid_clients_observed', '.0f')} "
+            f"active_med={self._fmt_diag(diagnostics, 'active_count_median', '.2f')} "
+            f"active_mean={self._fmt_diag(diagnostics, 'active_count_mean', '.2f')} "
+            f"route_q={self._fmt_diag(diagnostics, 'mean_route_quality', '.3f')} "
+            f"route_lt_0.5={self._fmt_diag(diagnostics, 'frac_route_quality_lt_0_5', '.3f')}"
+        )
+
+        # tau_cur / tau_hist / c_wolf
+        self._write_log_only(
+            f"{prefix} "
+            f"cur_q={self._fmt_diag(diagnostics, 'mean_current_quality', '.3f')} "
+            f"cur_lt_0.2={self._fmt_diag(diagnostics, 'frac_current_quality_lt_0_2', '.3f')} "
+            f"hist_q={self._fmt_diag(diagnostics, 'mean_history_quality', '.3f')} "
+            f"hist_lt_0.2={self._fmt_diag(diagnostics, 'frac_history_quality_lt_0_2', '.3f')} "
+            f"resid_mean={self._fmt_diag(diagnostics, 'residual_dist_mean', '.3f')} "
+            f"resid_med={self._fmt_diag(diagnostics, 'residual_dist_median', '.3f')} "
+            f"resid_gt_c={self._fmt_diag(diagnostics, 'frac_residual_gt_c_wolf', '.3f')} "
+            f"wolf_raw={self._fmt_diag(diagnostics, 'wolf_raw_mean', '.3f')} "
+            f"wolf_eff={self._fmt_diag(diagnostics, 'wolf_eff_mean', '.3f')} "
+            f"wolf_eff_lt_0.5={self._fmt_diag(diagnostics, 'frac_wolf_eff_lt_0_5', '.3f')}"
+        )
+
+        # min_obs_scale / Kalman / P / history_conf / 最终权重
+        self._write_log_only(
+            f"{prefix} "
+            f"obs_scale={self._fmt_diag(diagnostics, 'obs_scale_mean', '.4f')} "
+            f"obs_floor={self._fmt_diag(diagnostics, 'frac_obs_scale_at_floor', '.3f')} "
+            f"K={self._fmt_diag(diagnostics, 'kalman_gain_mean', '.3f')} "
+            f"K_lt_0.1={self._fmt_diag(diagnostics, 'frac_K_lt_0_1', '.3f')} "
+            f"K_gt_0.8={self._fmt_diag(diagnostics, 'frac_K_gt_0_8', '.3f')} "
+            f"P_new={self._fmt_diag(diagnostics, 'P_new_mean', '.4g')} "
+            f"P_shrink={self._fmt_diag(diagnostics, 'P_shrink_ratio_mean', '.3f')} "
+            f"seen={self._fmt_diag(diagnostics, 'seen_mean', '.2f')} "
+            f"cold={self._fmt_diag(diagnostics, 'frac_cold_start', '.3f')} "
+            f"hist_conf={self._fmt_diag(diagnostics, 'history_conf_mean', '.3f')} "
+            f"ess={self._fmt_diag(diagnostics, 'mean_weight_ess', '.2f')} "
+            f"top1={self._fmt_diag(diagnostics, 'mean_top1_weight', '.3f')} "
+            f"entropy={self._fmt_diag(diagnostics, 'mean_weight_normalized_entropy', '.3f')}"
+        )
+
+        # 每个 expert 的精简诊断。
+        # 只打印一行，避免 train.log 被 per-client 中间量刷屏。
+        per_expert_debug_text = self._format_history_wolf_per_expert_debug(
+            diagnostics.get("per_expert_debug", None)
+        )
+        if per_expert_debug_text != "none":
+            self._write_log_only(
+                f"[AggDiagExpert][history_wolf_kfac_score] "
+                f"round={int(round_id)} "
+                f"{per_expert_debug_text}"
             )
 
     def _write_client_table_to_log(
@@ -706,7 +779,6 @@ class FLServer:
             "client_diagnostics",
             {},
         )
-
         if not isinstance(client_diagnostics, Mapping):
             return
 
@@ -721,10 +793,8 @@ class FLServer:
 
         non_expert_weights = {}
         expert_weights = {}
-
         if non_expert_info is not None:
             non_expert_weights = non_expert_info.get("weights", {}) or {}
-
         if expert_info is not None:
             expert_weights = expert_info.get("weights", {}) or {}
 
@@ -787,22 +857,21 @@ class FLServer:
         提取某个参数组的聚合信息。
 
         当前 AggregationResult.summary() 常见结构：
-            {
-                "weights": {...},
-                "diagnostics": {
-                    "method": "uniform",
-                    "param_group": "expert",
-                    "num_clients": 10,
-                    "param_count": 16,
-                    ...
-                }
+        {
+            "weights": {...},
+            "diagnostics": {
+                "method": "uniform",
+                "param_group": "expert",
+                "num_clients": 10,
+                "param_count": 16,
+                ...
             }
+        }
 
         这个函数会把外层 weights 和内层 diagnostics 合并成一个扁平 dict，
         方便日志打印。
         """
         summary = round_result.aggregation_info.get(group_name, None)
-
         if summary is None:
             return None
 
@@ -912,7 +981,6 @@ class FLServer:
     ) -> str:
         """
         格式化日志里的指标。
-
         value 为 None 时写 nan。
         """
         if value is None:
@@ -927,9 +995,7 @@ class FLServer:
     def _format_weight_value(value: Any) -> str:
         """
         格式化单个客户端权重。
-
-        例如：
-            0.10000000000000002 -> 0.1000
+        例如：0.10000000000000002 -> 0.1000
         """
         if value is None:
             return "nan"
@@ -964,20 +1030,15 @@ class FLServer:
             return "{}"
 
         numeric_items = []
-
         for key, value in weights.items():
             try:
                 client_id = int(key)
                 weight_value = float(value)
             except (TypeError, ValueError):
                 return self._compact_log_value(weights)
-
             numeric_items.append((client_id, weight_value))
 
-        numeric_items = sorted(
-            numeric_items,
-            key=lambda item: item[0],
-        )
+        numeric_items = sorted(numeric_items, key=lambda item: item[0])
 
         if compact_uniform and self._is_uniform_weight_items(numeric_items):
             return f"uniform(each={numeric_items[0][1]:.4f})"
@@ -986,7 +1047,6 @@ class FLServer:
             f"{client_id}:{weight_value:.4f}"
             for client_id, weight_value in numeric_items
         )
-
         return "{" + body + "}"
 
     @staticmethod
@@ -997,32 +1057,24 @@ class FLServer:
     ) -> bool:
         """
         判断权重是否近似均匀。
-
         用于把一长串 0.10000000000000002 压缩成 uniform(each=0.1000)。
         """
         if len(items) == 0:
             return False
 
         first_value = float(items[0][1])
-
         for _, value in items:
             if abs(float(value) - first_value) > atol:
                 return False
-
         return True
 
     @staticmethod
     def _format_client_ids(client_ids: Sequence[int]) -> str:
         """
         格式化客户端 id 列表。
-
-        输出：
-            [0,4,9,6]
+        输出：[0,4,9,6]
         """
-        body = ",".join(
-            str(int(client_id))
-            for client_id in client_ids
-        )
+        body = ",".join(str(int(client_id)) for client_id in client_ids)
         return "[" + body + "]"
 
     @staticmethod
@@ -1030,9 +1082,7 @@ class FLServer:
         client_diagnostics: Mapping[Any, Any],
         client_id: int,
     ) -> Optional[Mapping[str, Any]]:
-        """
-        兼容 int key / str key 两种客户端诊断字典。
-        """
+        """兼容 int key / str key 两种客户端诊断字典。"""
         if client_id in client_diagnostics:
             item = client_diagnostics[client_id]
             if isinstance(item, Mapping):
@@ -1053,10 +1103,7 @@ class FLServer:
     ) -> Optional[Any]:
         """
         从权重字典中读取某个客户端的权重。
-
-        兼容：
-            weights[0]
-            weights["0"]
+        兼容：weights[0] / weights["0"]
         """
         if not isinstance(weights, Mapping):
             return None
@@ -1078,13 +1125,7 @@ class FLServer:
         格式化客户端 expert usage。
 
         输出示例：
-            expert_active=4/4 expert_total=9600 expert_counts={0:2400,1:2381,2:2410,3:2409} expert_frac={0:0.250,1:0.248,2:0.251,3:0.251}
-
-        如果没有采集：
-            expert_usage=none
-
-        如果模型不支持：
-            expert_usage=unsupported(reason=...)
+        expert_active=4/4 expert_total=9600 expert_counts={0:2400,1:2381,2:2410,3:2409} expert_frac={0:0.250,1:0.248,2:0.251,3:0.251}
         """
         if expert_usage is None:
             return "expert_usage=none"
@@ -1106,7 +1147,6 @@ class FLServer:
         )
         active_experts = expert_usage.get("active_experts", "unknown")
         total_activations = expert_usage.get("total_activations", "unknown")
-
         expert_counts = expert_usage.get("expert_counts", None)
         expert_fraction = expert_usage.get("expert_fraction", None)
         dead_experts = expert_usage.get("dead_experts", [])
@@ -1129,31 +1169,20 @@ class FLServer:
     def _format_int_mapping(value: Any) -> str:
         """
         格式化 int 映射。
-
-        输出：
-            {0:120,1:130}
+        输出：{0:120,1:130}
         """
         if not isinstance(value, Mapping):
             return "none"
 
         items = []
-
         for key, item_value in value.items():
             try:
                 items.append((int(key), int(item_value)))
             except (TypeError, ValueError):
                 return repr(value)
 
-        items = sorted(
-            items,
-            key=lambda item: item[0],
-        )
-
-        body = ",".join(
-            f"{key}:{item_value}"
-            for key, item_value in items
-        )
-
+        items = sorted(items, key=lambda item: item[0])
+        body = ",".join(f"{key}:{item_value}" for key, item_value in items)
         return "{" + body + "}"
 
     @staticmethod
@@ -1164,32 +1193,120 @@ class FLServer:
     ) -> str:
         """
         格式化 float 映射。
-
-        输出：
-            {0:0.250,1:0.248}
+        输出：{0:0.250,1:0.248}
         """
         if not isinstance(value, Mapping):
             return "none"
 
         items = []
-
         for key, item_value in value.items():
             try:
                 items.append((int(key), float(item_value)))
             except (TypeError, ValueError):
                 return repr(value)
 
-        items = sorted(
-            items,
-            key=lambda item: item[0],
-        )
-
+        items = sorted(items, key=lambda item: item[0])
         body = ",".join(
             f"{key}:{item_value:.{precision}f}"
             for key, item_value in items
         )
-
         return "{" + body + "}"
+
+    @staticmethod
+    def _fmt_diag(
+        diagnostics: Mapping[str, Any],
+        key: str,
+        fmt: str,
+        default: Any = "nan",
+    ) -> str:
+        """
+        格式化 diagnostics 里的单个数值。
+
+        这个函数只用于日志，不参与算法逻辑。
+        """
+        value = diagnostics.get(key, default)
+        try:
+            return f"{float(value):{fmt}}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _format_history_wolf_per_expert_debug(self, value: Any) -> str:
+        """
+        压缩打印每个 expert 的关键诊断。
+
+        输出示例：
+        experts={0:(valid=10,fb=0,rq=0.82,K=0.31,ess=6.7,top1=0.22),...}
+        """
+        if not isinstance(value, Mapping) or len(value) == 0:
+            return "none"
+
+        items = []
+        for expert_id, item in value.items():
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                expert_idx = int(expert_id)
+            except (TypeError, ValueError):
+                continue
+
+            valid = item.get("valid_clients", "?")
+            fallback = 1 if bool(item.get("fallback", False)) else 0
+            route_q = self._format_mapping_float_value(
+                item,
+                "route_quality_mean",
+                precision=3,
+            )
+            kalman_gain = self._format_mapping_float_value(
+                item,
+                "kalman_gain_mean",
+                precision=3,
+            )
+            wolf_eff = self._format_mapping_float_value(
+                item,
+                "wolf_eff_mean",
+                precision=3,
+            )
+            ess = self._format_mapping_float_value(
+                item,
+                "weight_ess",
+                precision=2,
+            )
+            top1 = self._format_mapping_float_value(
+                item,
+                "top1_weight",
+                precision=3,
+            )
+
+            items.append(
+                (
+                    expert_idx,
+                    f"{expert_idx}:(valid={valid},fb={fallback},"
+                    f"rq={route_q},wolf={wolf_eff},K={kalman_gain},"
+                    f"ess={ess},top1={top1})",
+                )
+            )
+
+        if len(items) == 0:
+            return "none"
+
+        items = sorted(items, key=lambda pair: pair[0])
+        return "experts={" + ",".join(text for _, text in items) + "}"
+
+    @staticmethod
+    def _format_mapping_float_value(
+        value: Mapping[str, Any],
+        key: str,
+        *,
+        precision: int,
+    ) -> str:
+        """从 mapping 里取一个 float，并按指定精度格式化。"""
+        raw_value = value.get(key, None)
+        if raw_value is None:
+            return "nan"
+        try:
+            return f"{float(raw_value):.{precision}f}"
+        except (TypeError, ValueError):
+            return str(raw_value)
 
     @staticmethod
     def _compact_log_value(
@@ -1197,19 +1314,14 @@ class FLServer:
         *,
         max_chars: int = 1200,
     ) -> str:
-        """
-        把日志字段压成一行，避免 train.log 被超长对象刷屏。
-        """
+        """把日志字段压成一行，避免 train.log 被超长对象刷屏。"""
         text = repr(value)
         if len(text) <= max_chars:
             return text
-
-        return text[:max_chars] + "...<truncated>"
+        return text[:max_chars] + "..."
 
     def _validate_server_state(self) -> None:
-        """
-        检查服务端初始化状态是否合法。
-        """
+        """检查服务端初始化状态是否合法。"""
         if len(self.clients) == 0:
             raise ValueError("服务端没有任何客户端。")
 
@@ -1227,11 +1339,8 @@ class FLServer:
 
     @staticmethod
     def _cleanup_after_round() -> None:
-        """
-        每轮结束后清理显存和 Python 垃圾对象。
-        """
+        """每轮结束后清理显存和 Python 垃圾对象。"""
         gc.collect()
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1242,11 +1351,7 @@ def build_server(
     test_loader: DataLoader,
     device: torch.device | str,
 ) -> FLServer:
-    """
-    构建 FLServer。
-
-    train.py 后面可以直接调用这个函数。
-    """
+    """构建 FLServer。train.py 后面可以直接调用这个函数。"""
     return FLServer(
         cfg=cfg,
         client_loaders=client_loaders,
@@ -1270,22 +1375,18 @@ def resolve_device(cfg: Any) -> torch.device:
     if device_name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
-
         return torch.device("cpu")
 
     if device_name == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("配置 device=cuda，但当前环境 CUDA 不可用。")
-
         return torch.device("cuda")
 
     if device_name == "mps":
         if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
             raise RuntimeError("配置 device=mps，但当前环境 MPS 不可用。")
-
         return torch.device("mps")
 
     if device_name == "cpu":
@@ -1305,15 +1406,11 @@ def _cfg_get(
     """
     兼容 dict / ConfigNode / 普通对象的读取。
 
-    dict 或 ConfigNode:
-        cfg.get(key, default)
-
-    普通对象:
-        getattr(cfg, key, default)
+    dict 或 ConfigNode: cfg.get(key, default)
+    普通对象: getattr(cfg, key, default)
     """
     if hasattr(cfg, "get"):
         return cfg.get(key, default)
-
     return getattr(cfg, key, default)
 
 
