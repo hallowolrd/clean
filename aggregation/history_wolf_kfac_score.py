@@ -57,60 +57,64 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
         # ------------------------------
         # 消融开关
         # ------------------------------
+        # 注意：
+        # 当前项目采用极致解耦配置风格。
+        # history_wolf_kfac_score 的参数放在顶层 history_wolf_kfac_score.xxx，
+        # 不放在 agg.expert.xxx 下面。
         self.fisher_score_enabled = _cfg_bool(
-            cfg, "agg.expert.fisher_score_enabled", True
+            cfg, "history_wolf_kfac_score.fisher_score_enabled", True
         )
         self.history_filter_enabled = _cfg_bool(
-            cfg, "agg.expert.history_filter_enabled", True
+            cfg, "history_wolf_kfac_score.history_filter_enabled", True
         )
 
         # ------------------------------
         # 历史滤波超参数
         # ------------------------------
         self.min_active_count = int(
-            _cfg_get(cfg, "agg.expert.history_filter_min_active_count", 1)
+            _cfg_get(cfg, "history_wolf_kfac_score.min_active_count", 1)
         )
         self.min_valid_clients = int(
-            _cfg_get(cfg, "agg.expert.history_filter_min_valid_clients", 2)
+            _cfg_get(cfg, "history_wolf_kfac_score.min_valid_clients", 2)
         )
         self.fallback = str(
-            _cfg_get(cfg, "agg.expert.history_filter_fallback", "keep_global")
+            _cfg_get(cfg, "history_wolf_kfac_score.fallback", "keep_global")
         ).lower().strip()
 
         self.active_count_ref = float(
-            _cfg_get(cfg, "agg.expert.history_filter_active_count_ref", 32.0)
+            _cfg_get(cfg, "history_wolf_kfac_score.active_count_ref", 32.0)
         )
-        self.rho = float(_cfg_get(cfg, "agg.expert.history_filter_rho", 0.95))
+        self.rho = float(_cfg_get(cfg, "history_wolf_kfac_score.rho", 0.95))
         self.c_wolf = float(
-            _cfg_get(cfg, "agg.expert.history_filter_c_wolf", 2.5)
+            _cfg_get(cfg, "history_wolf_kfac_score.c_wolf", 2.5)
         )
         self.min_obs_scale = float(
-            _cfg_get(cfg, "agg.expert.history_filter_min_obs_scale", 0.05)
+            _cfg_get(cfg, "history_wolf_kfac_score.min_obs_scale", 0.05)
         )
         self.seen_ref = float(
-            _cfg_get(cfg, "agg.expert.history_filter_seen_ref", 5.0)
+            _cfg_get(cfg, "history_wolf_kfac_score.seen_ref", 5.0)
         )
         self.q_scale = float(
-            _cfg_get(cfg, "agg.expert.history_filter_q_scale", 0.05)
+            _cfg_get(cfg, "history_wolf_kfac_score.q_scale", 0.05)
         )
         self.tau_cur = float(
-            _cfg_get(cfg, "agg.expert.history_filter_tau_cur", 1.0)
+            _cfg_get(cfg, "history_wolf_kfac_score.tau_cur", 1.0)
         )
         self.tau_hist = float(
-            _cfg_get(cfg, "agg.expert.history_filter_tau_hist", 1.0)
+            _cfg_get(cfg, "history_wolf_kfac_score.tau_hist", 1.0)
         )
         self.init_P = float(
-            _cfg_get(cfg, "agg.expert.history_filter_init_P", 1.0)
+            _cfg_get(cfg, "history_wolf_kfac_score.init_P", 1.0)
         )
-        self.eps = float(_cfg_get(cfg, "agg.expert.history_filter_eps", 1.0e-8))
+        self.eps = float(_cfg_get(cfg, "history_wolf_kfac_score.eps", 1.0e-8))
 
         if self.min_active_count < 0:
-            raise ValueError("history_filter_min_active_count 不能小于 0。")
+            raise ValueError("history_wolf_kfac_score.min_active_count 不能小于 0。")
         if self.min_valid_clients <= 0:
-            raise ValueError("history_filter_min_valid_clients 必须大于 0。")
+            raise ValueError("history_wolf_kfac_score.min_valid_clients 必须大于 0。")
         if self.fallback not in {"keep_global", "uniform"}:
             raise ValueError(
-                "history_filter_fallback 只支持 keep_global / uniform，"
+                "history_wolf_kfac_score.fallback 只支持 keep_global / uniform，"
                 f"当前值：{self.fallback}"
             )
 
@@ -576,7 +580,9 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
                 float(record.active_count)
                 / (float(record.active_count) + self.active_count_ref + self.eps)
             )
-            current_quality = route_quality * _sigmoid(z_cur / max(self.tau_cur, self.eps))
+            current_quality = route_quality * _sigmoid(
+                z_cur / max(self.tau_cur, self.eps)
+            )
             current_quality = _clamp(current_quality, 0.0, 1.0)
 
             # 历史质量：历史强度 + seen/P 置信度。
@@ -647,7 +653,9 @@ class HistoryWoLFKFACScoreExpertAggregator(Aggregator):
 
             # 稳定 softmax 前的 logit。
             # 这里不用先 exp，避免 filtered_score 数值爆炸。
-            final_logits[client_id] = float(mu_new + math.log(history_conf_new + self.eps))
+            final_logits[client_id] = float(
+                mu_new + math.log(history_conf_new + self.eps)
+            )
 
             fisher_scores.append(float(record.fisher_score))
             active_counts.append(float(record.active_count))
@@ -810,15 +818,16 @@ def _extract_mean_diag_from_kfac_payload(
     """
     提取 K-FAC 因子的平均对角量 trace(F) / dim。
 
-    优先使用 trace_A / trace_B；
-    如果没有 trace 字段，则尝试从 A/B tensor 计算。
+    注意：
+    如果 payload 里已经有 A/B tensor，那么 tensor.size(0) 就是真实维度。
+    对 A 因子来说，include_bias=True 时，fl/kfac.py 通常已经把 bias 维度拼进 A 里。
+    所以只有在没有 tensor、只能靠 in_features 推断维度时，才额外 +1。
     """
     trace_value = payload.get(trace_name, None)
+    factor = payload.get(factor_name, None)
 
-    if trace_value is None and factor_name in payload:
-        factor = payload.get(factor_name, None)
-        if torch.is_tensor(factor) and factor.dim() >= 2:
-            trace_value = float(torch.trace(factor.detach().float()).item())
+    if trace_value is None and torch.is_tensor(factor) and factor.dim() >= 2:
+        trace_value = float(torch.trace(factor.detach().float()).item())
 
     if trace_value is None:
         return eps
@@ -828,9 +837,11 @@ def _extract_mean_diag_from_kfac_payload(
         return eps
 
     dim = None
-    factor = payload.get(factor_name, None)
+    dim_from_tensor = False
+
     if torch.is_tensor(factor) and factor.dim() >= 2:
         dim = int(factor.size(0))
+        dim_from_tensor = True
 
     if dim is None:
         for key in dim_keys:
@@ -841,7 +852,9 @@ def _extract_mean_diag_from_kfac_payload(
     if dim is None or dim <= 0:
         dim = 1
 
-    if include_bias:
+    # 只有靠 in_features 推断 A 维度时才补 bias。
+    # 如果 A tensor 已经存在，它的维度通常已经包含 bias，不能重复 +1。
+    if include_bias and not dim_from_tensor:
         dim += 1
 
     return float(trace_float) / float(max(dim, 1))
@@ -1087,9 +1100,9 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     兼容 dict / ConfigNode / 普通对象的读取。
 
     支持：
-    - cfg.get("agg.expert.method", default)
-    - cfg["agg"]["expert"]["method"]
-    - cfg.agg.expert.method
+    - cfg.get("history_wolf_kfac_score.rho", default)
+    - cfg["history_wolf_kfac_score"]["rho"]
+    - cfg.history_wolf_kfac_score.rho
     """
     if cfg is None:
         return default
