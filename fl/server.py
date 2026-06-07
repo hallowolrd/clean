@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import gc
 import sys
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from aggregation.factory import AggregatorBundle, build_aggregators
+from aggregation.factory import build_aggregators
 from fl.client import (
     FLClient,
     build_clients,
@@ -26,7 +26,6 @@ from fl.types import (
 )
 from models.build import build_model, summarize_model
 from models.param_groups import (
-    ParamGroups,
     build_param_groups,
     summarize_param_groups,
 )
@@ -442,6 +441,13 @@ class FLServer:
         full_aggregation_info["avg_train_loss"] = avg_train_loss
         full_aggregation_info["avg_train_acc"] = avg_train_acc
 
+        # 保存每个客户端的轻量诊断信息。
+        # 注意：这里不保存 model_delta，也不保存 expert_kfac 原始矩阵，
+        # 避免 summary.json / train.log 过大。
+        full_aggregation_info["client_diagnostics"] = (
+            self._build_client_diagnostics(client_updates)
+        )
+
         return RoundResult(
             round_id=int(round_id),
             selected_clients=selected_client_ids,
@@ -533,15 +539,24 @@ class FLServer:
         写入每轮详细日志。
 
         这部分只写 train.log，不打印到控制台。
-        目的：
-        1. 控制台保持干净，只看每轮核心指标。
-        2. train.log 保留更完整的信息，方便复盘。
-        3. 不写 tqdm 进度条。
+
+        当前记录：
+        1. 本轮整体 train/test 指标
+        2. 本轮选择的客户端
+        3. non_expert / expert 分别用的聚合方法
+        4. non_expert / expert 每个客户端的聚合权重
+        5. 每个客户端样本数、本地 train_loss/train_acc、expert_usage
         """
         logging_cfg = _cfg_get(self.cfg, "logging", {})
-        log_client_metrics = _cfg_get_bool(
+
+        log_round_clients = _cfg_get_bool(
             logging_cfg,
-            "log_client_metrics",
+            "log_round_clients",
+            True,
+        )
+        log_client_table = _cfg_get_bool(
+            logging_cfg,
+            "log_client_table",
             True,
         )
         log_agg_weights = _cfg_get_bool(
@@ -570,12 +585,6 @@ class FLServer:
         )
 
         self._write_log_only(
-            f"[RoundClients] "
-            f"round={round_result.round_id} "
-            f"selected_clients={round_result.selected_clients}"
-        )
-
-        self._write_log_only(
             f"[RoundMetrics] "
             f"round={round_result.round_id} "
             f"train_loss={avg_train_loss_text} "
@@ -585,32 +594,54 @@ class FLServer:
             f"best_acc={round_result.best_acc:.2f}%"
         )
 
-        if log_client_metrics:
-            self._write_client_metrics_to_log(round_result)
+        if log_round_clients:
+            self._write_log_only(
+                f"[Clients] "
+                f"round={round_result.round_id} "
+                f"ids={self._format_client_ids(round_result.selected_clients)}"
+            )
 
+        # 聚合器摘要：方法、客户端数、参数数量、权重。
         self._write_aggregation_info_to_log(
             round_result=round_result,
             log_agg_weights=log_agg_weights,
         )
 
-    def _write_client_metrics_to_log(
+        # 每个客户端一行诊断信息：样本数、训练指标、聚合权重、expert usage。
+        if log_client_table:
+            self._write_client_table_to_log(round_result)
+
+    def _build_client_diagnostics(
         self,
-        round_result: RoundResult,
-    ) -> None:
+        client_updates: Sequence[ClientUpdate],
+    ) -> Dict[int, Dict[str, Any]]:
         """
-        写入每个客户端的训练指标。
+        从 ClientUpdate 中提取轻量客户端诊断信息。
 
-        collect_client_metrics() 的具体字段由 fl/types.py 决定，
-        这里不强行假设字段名，避免和已有结构冲突。
+        保留：
+        1. num_samples
+        2. metrics: train_loss / train_acc / num_batches
+        3. expert_usage: 每个 expert 的激活次数与比例
+
+        不保留：
+        1. model_delta
+        2. expert_kfac 原始矩阵
+
+        这样日志和 summary.json 不会被大对象撑爆。
         """
-        client_metrics = getattr(round_result, "client_metrics", [])
+        diagnostics: Dict[int, Dict[str, Any]] = {}
 
-        for item in client_metrics:
-            self._write_log_only(
-                f"[ClientMetrics] "
-                f"round={round_result.round_id} "
-                f"{self._compact_log_value(item)}"
-            )
+        for update in client_updates:
+            extra = dict(update.extra or {})
+
+            diagnostics[int(update.client_id)] = {
+                "num_samples": int(update.num_samples),
+                "metrics": dict(update.metrics or {}),
+                "expert_usage": extra.get("expert_usage", None),
+                "expert_kfac_summary": extra.get("expert_kfac_summary", None),
+            }
+
+        return diagnostics
 
     def _write_aggregation_info_to_log(
         self,
@@ -618,83 +649,233 @@ class FLServer:
         log_agg_weights: bool,
     ) -> None:
         """
-        写入聚合器摘要信息。
+        写入 non_expert / expert 聚合摘要。
 
-        如果聚合器 summary 里包含 weights / client_weights，
-        则在 log_agg_weights=true 时额外打印权重。
+        输出示例：
+        [Agg][non_expert] round=1 method=uniform clients=10 params=121 weights=uniform(each=0.1000)
+        [Agg][expert] round=1 method=fisher_kfac_expert clients=10 params=16 weights={0:0.0812,1:0.1033,...}
         """
+        logging_cfg = _cfg_get(self.cfg, "logging", {})
+        compact_uniform_weights = _cfg_get_bool(
+            logging_cfg,
+            "compact_uniform_weights",
+            True,
+        )
+
         for group_name in ("non_expert", "expert"):
-            summary = round_result.aggregation_info.get(group_name, None)
-            if summary is None:
+            agg_info = self._extract_aggregation_info(
+                round_result=round_result,
+                group_name=group_name,
+            )
+
+            if agg_info is None:
                 continue
 
-            if not isinstance(summary, dict):
+            if log_agg_weights:
+                weights_text = self._format_weights(
+                    agg_info.get("weights", None),
+                    compact_uniform=compact_uniform_weights,
+                )
+            else:
+                weights_text = "hidden"
+
+            self._write_log_only(
+                f"[Agg][{group_name}] "
+                f"round={round_result.round_id} "
+                f"method={agg_info.get('method', 'unknown')} "
+                f"clients={agg_info.get('num_clients', 'unknown')} "
+                f"params={agg_info.get('param_count', 'unknown')} "
+                f"weights={weights_text}"
+            )
+
+    def _write_client_table_to_log(
+        self,
+        round_result: RoundResult,
+    ) -> None:
+        """
+        写入每个客户端的一行诊断信息。
+
+        每行包含：
+        1. 客户端样本数
+        2. 客户端本地 train_loss / train_acc
+        3. non_expert 聚合权重
+        4. expert 聚合权重
+        5. expert_usage
+        """
+        client_diagnostics = round_result.aggregation_info.get(
+            "client_diagnostics",
+            {},
+        )
+
+        if not isinstance(client_diagnostics, Mapping):
+            return
+
+        non_expert_info = self._extract_aggregation_info(
+            round_result=round_result,
+            group_name="non_expert",
+        )
+        expert_info = self._extract_aggregation_info(
+            round_result=round_result,
+            group_name="expert",
+        )
+
+        non_expert_weights = {}
+        expert_weights = {}
+
+        if non_expert_info is not None:
+            non_expert_weights = non_expert_info.get("weights", {}) or {}
+
+        if expert_info is not None:
+            expert_weights = expert_info.get("weights", {}) or {}
+
+        for client_id in round_result.selected_clients:
+            client_id = int(client_id)
+            item = self._get_client_diagnostic(
+                client_diagnostics,
+                client_id,
+            )
+
+            if item is None:
                 self._write_log_only(
-                    f"[AggSummary][{group_name}] "
+                    f"[Client][{client_id}] "
                     f"round={round_result.round_id} "
-                    f"summary={self._compact_log_value(summary)}"
+                    f"missing_diagnostics=true"
                 )
                 continue
 
-            method = summary.get(
-                "method",
-                summary.get(
-                    "method_name",
-                    summary.get("aggregator", "unknown"),
-                ),
+            metrics = item.get("metrics", {}) or {}
+            num_samples = item.get("num_samples", "unknown")
+
+            train_loss = self._format_metric(
+                metrics.get("train_loss", None),
+                fmt=".4f",
             )
-            num_clients = summary.get(
+            train_acc = self._format_metric(
+                metrics.get("train_acc", None),
+                fmt=".2f",
+                suffix="%",
+            )
+
+            non_expert_weight = self._format_weight_value(
+                self._get_weight_for_client(non_expert_weights, client_id)
+            )
+            expert_weight = self._format_weight_value(
+                self._get_weight_for_client(expert_weights, client_id)
+            )
+
+            expert_usage_text = self._format_expert_usage(
+                item.get("expert_usage", None)
+            )
+
+            self._write_log_only(
+                f"[Client][{client_id}] "
+                f"round={round_result.round_id} "
+                f"samples={num_samples} "
+                f"train_loss={train_loss} "
+                f"train_acc={train_acc} "
+                f"non_expert_w={non_expert_weight} "
+                f"expert_w={expert_weight} "
+                f"{expert_usage_text}"
+            )
+
+    def _extract_aggregation_info(
+        self,
+        round_result: RoundResult,
+        group_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        提取某个参数组的聚合信息。
+
+        当前 AggregationResult.summary() 常见结构：
+            {
+                "weights": {...},
+                "diagnostics": {
+                    "method": "uniform",
+                    "param_group": "expert",
+                    "num_clients": 10,
+                    "param_count": 16,
+                    ...
+                }
+            }
+
+        这个函数会把外层 weights 和内层 diagnostics 合并成一个扁平 dict，
+        方便日志打印。
+        """
+        summary = round_result.aggregation_info.get(group_name, None)
+
+        if summary is None:
+            return None
+
+        if not isinstance(summary, Mapping):
+            return {
+                "method": "unknown",
+                "param_group": group_name,
+                "num_clients": "unknown",
+                "param_count": "unknown",
+                "weights": None,
+                "raw_summary": summary,
+            }
+
+        diagnostics = summary.get("diagnostics", {})
+        if not isinstance(diagnostics, Mapping):
+            diagnostics = {}
+
+        method = diagnostics.get(
+            "method",
+            summary.get(
+                "method",
+                summary.get("method_name", summary.get("aggregator", "unknown")),
+            ),
+        )
+        param_group = diagnostics.get(
+            "param_group",
+            summary.get("param_group", group_name),
+        )
+        num_clients = diagnostics.get(
+            "num_clients",
+            summary.get(
                 "num_clients",
                 summary.get(
                     "effective_clients",
                     summary.get("num_effective_clients", "unknown"),
                 ),
-            )
+            ),
+        )
+        param_count = diagnostics.get(
+            "param_count",
+            summary.get("param_count", "unknown"),
+        )
 
-            self._write_log_only(
-                f"[AggSummary][{group_name}] "
-                f"round={round_result.round_id} "
-                f"method={method} "
-                f"num_clients={num_clients}"
-            )
+        weights = None
+        for weight_key in (
+            "weights",
+            "client_weights",
+            "sample_weights",
+            "effective_weights",
+        ):
+            if weight_key in summary:
+                weights = summary[weight_key]
+                break
 
-            weights = None
+        if weights is None:
             for weight_key in (
                 "weights",
                 "client_weights",
                 "sample_weights",
                 "effective_weights",
             ):
-                if weight_key in summary:
-                    weights = summary[weight_key]
+                if weight_key in diagnostics:
+                    weights = diagnostics[weight_key]
                     break
 
-            if log_agg_weights and weights is not None:
-                self._write_log_only(
-                    f"[AggWeights][{group_name}] "
-                    f"round={round_result.round_id} "
-                    f"weights={self._compact_log_value(weights)}"
-                )
-
-            # 额外字段也写入日志，但避免重复打印权重类字段。
-            ignored_keys = {
-                "weights",
-                "client_weights",
-                "sample_weights",
-                "effective_weights",
-            }
-            extra_summary = {
-                key: value
-                for key, value in summary.items()
-                if key not in ignored_keys
-            }
-
-            if extra_summary:
-                self._write_log_only(
-                    f"[AggDetail][{group_name}] "
-                    f"round={round_result.round_id} "
-                    f"summary={self._compact_log_value(extra_summary)}"
-                )
+        return {
+            "method": method,
+            "param_group": param_group,
+            "num_clients": num_clients,
+            "param_count": param_count,
+            "weights": weights,
+            "diagnostics": dict(diagnostics),
+        }
 
     def _write_log_only(self, message: str) -> None:
         """
@@ -741,6 +922,274 @@ class FLServer:
             return f"{float(value):{fmt}}{suffix}"
         except (TypeError, ValueError):
             return str(value)
+
+    @staticmethod
+    def _format_weight_value(value: Any) -> str:
+        """
+        格式化单个客户端权重。
+
+        例如：
+            0.10000000000000002 -> 0.1000
+        """
+        if value is None:
+            return "nan"
+
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _format_weights(
+        self,
+        weights: Any,
+        *,
+        compact_uniform: bool,
+    ) -> str:
+        """
+        格式化聚合权重。
+
+        uniform 权重默认压缩成：
+            uniform(each=0.1000)
+
+        非 uniform 权重打印成：
+            {0:0.1234,1:0.0987,...}
+        """
+        if weights is None:
+            return "none"
+
+        if not isinstance(weights, Mapping):
+            return self._compact_log_value(weights)
+
+        if len(weights) == 0:
+            return "{}"
+
+        numeric_items = []
+
+        for key, value in weights.items():
+            try:
+                client_id = int(key)
+                weight_value = float(value)
+            except (TypeError, ValueError):
+                return self._compact_log_value(weights)
+
+            numeric_items.append((client_id, weight_value))
+
+        numeric_items = sorted(
+            numeric_items,
+            key=lambda item: item[0],
+        )
+
+        if compact_uniform and self._is_uniform_weight_items(numeric_items):
+            return f"uniform(each={numeric_items[0][1]:.4f})"
+
+        body = ",".join(
+            f"{client_id}:{weight_value:.4f}"
+            for client_id, weight_value in numeric_items
+        )
+
+        return "{" + body + "}"
+
+    @staticmethod
+    def _is_uniform_weight_items(
+        items: Sequence[tuple[int, float]],
+        *,
+        atol: float = 1.0e-10,
+    ) -> bool:
+        """
+        判断权重是否近似均匀。
+
+        用于把一长串 0.10000000000000002 压缩成 uniform(each=0.1000)。
+        """
+        if len(items) == 0:
+            return False
+
+        first_value = float(items[0][1])
+
+        for _, value in items:
+            if abs(float(value) - first_value) > atol:
+                return False
+
+        return True
+
+    @staticmethod
+    def _format_client_ids(client_ids: Sequence[int]) -> str:
+        """
+        格式化客户端 id 列表。
+
+        输出：
+            [0,4,9,6]
+        """
+        body = ",".join(
+            str(int(client_id))
+            for client_id in client_ids
+        )
+        return "[" + body + "]"
+
+    @staticmethod
+    def _get_client_diagnostic(
+        client_diagnostics: Mapping[Any, Any],
+        client_id: int,
+    ) -> Optional[Mapping[str, Any]]:
+        """
+        兼容 int key / str key 两种客户端诊断字典。
+        """
+        if client_id in client_diagnostics:
+            item = client_diagnostics[client_id]
+            if isinstance(item, Mapping):
+                return item
+
+        str_client_id = str(client_id)
+        if str_client_id in client_diagnostics:
+            item = client_diagnostics[str_client_id]
+            if isinstance(item, Mapping):
+                return item
+
+        return None
+
+    @staticmethod
+    def _get_weight_for_client(
+        weights: Any,
+        client_id: int,
+    ) -> Optional[Any]:
+        """
+        从权重字典中读取某个客户端的权重。
+
+        兼容：
+            weights[0]
+            weights["0"]
+        """
+        if not isinstance(weights, Mapping):
+            return None
+
+        if client_id in weights:
+            return weights[client_id]
+
+        str_client_id = str(client_id)
+        if str_client_id in weights:
+            return weights[str_client_id]
+
+        return None
+
+    def _format_expert_usage(
+        self,
+        expert_usage: Any,
+    ) -> str:
+        """
+        格式化客户端 expert usage。
+
+        输出示例：
+            expert_active=4/4 expert_total=9600 expert_counts={0:2400,1:2381,2:2410,3:2409} expert_frac={0:0.250,1:0.248,2:0.251,3:0.251}
+
+        如果没有采集：
+            expert_usage=none
+
+        如果模型不支持：
+            expert_usage=unsupported(reason=...)
+        """
+        if expert_usage is None:
+            return "expert_usage=none"
+
+        if not isinstance(expert_usage, Mapping):
+            return f"expert_usage={self._compact_log_value(expert_usage)}"
+
+        supported = bool(expert_usage.get("supported", True))
+        if not supported:
+            reason = expert_usage.get("reason", "unknown")
+            return (
+                "expert_usage=unsupported"
+                f"(reason={self._compact_log_value(reason, max_chars=160)})"
+            )
+
+        num_experts = expert_usage.get(
+            "num_experts",
+            _cfg_get(self.cfg, "num_experts", "unknown"),
+        )
+        active_experts = expert_usage.get("active_experts", "unknown")
+        total_activations = expert_usage.get("total_activations", "unknown")
+
+        expert_counts = expert_usage.get("expert_counts", None)
+        expert_fraction = expert_usage.get("expert_fraction", None)
+        dead_experts = expert_usage.get("dead_experts", [])
+
+        counts_text = self._format_int_mapping(expert_counts)
+        fraction_text = self._format_float_mapping(
+            expert_fraction,
+            precision=3,
+        )
+
+        return (
+            f"expert_active={active_experts}/{num_experts} "
+            f"expert_total={total_activations} "
+            f"expert_counts={counts_text} "
+            f"expert_frac={fraction_text} "
+            f"dead={self._format_client_ids(dead_experts)}"
+        )
+
+    @staticmethod
+    def _format_int_mapping(value: Any) -> str:
+        """
+        格式化 int 映射。
+
+        输出：
+            {0:120,1:130}
+        """
+        if not isinstance(value, Mapping):
+            return "none"
+
+        items = []
+
+        for key, item_value in value.items():
+            try:
+                items.append((int(key), int(item_value)))
+            except (TypeError, ValueError):
+                return repr(value)
+
+        items = sorted(
+            items,
+            key=lambda item: item[0],
+        )
+
+        body = ",".join(
+            f"{key}:{item_value}"
+            for key, item_value in items
+        )
+
+        return "{" + body + "}"
+
+    @staticmethod
+    def _format_float_mapping(
+        value: Any,
+        *,
+        precision: int,
+    ) -> str:
+        """
+        格式化 float 映射。
+
+        输出：
+            {0:0.250,1:0.248}
+        """
+        if not isinstance(value, Mapping):
+            return "none"
+
+        items = []
+
+        for key, item_value in value.items():
+            try:
+                items.append((int(key), float(item_value)))
+            except (TypeError, ValueError):
+                return repr(value)
+
+        items = sorted(
+            items,
+            key=lambda item: item[0],
+        )
+
+        body = ",".join(
+            f"{key}:{item_value:.{precision}f}"
+            for key, item_value in items
+        )
+
+        return "{" + body + "}"
 
     @staticmethod
     def _compact_log_value(
@@ -856,8 +1305,11 @@ def _cfg_get(
     """
     兼容 dict / ConfigNode / 普通对象的读取。
 
-    dict 或 ConfigNode: cfg.get(key, default)
-    普通对象: getattr(cfg, key, default)
+    dict 或 ConfigNode:
+        cfg.get(key, default)
+
+    普通对象:
+        getattr(cfg, key, default)
     """
     if hasattr(cfg, "get"):
         return cfg.get(key, default)

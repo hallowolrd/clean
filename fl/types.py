@@ -15,6 +15,7 @@ class ClientUpdate:
     客户端每一轮训练后上传给服务端的结果。
 
     这个结构是 client 和 server 之间的统一接口。
+
     后面无论是 FedAvg、ExpertFedAvg、Fisher、history filter、Bayes，
     都尽量往这个结构里扩展，而不是让 client.py 和 server.py 互相强耦合。
     """
@@ -30,22 +31,24 @@ class ClientUpdate:
 
     # 本地模型相对全局模型的参数变化量
     # 公式：
-    #   model_delta = local_model - global_model
+    # model_delta = local_model - global_model
     model_delta: TensorDict
 
     # 客户端本地训练指标
     # 例如：
-    #   train_loss
-    #   train_acc
+    # train_loss
+    # train_acc
     metrics: Dict[str, float] = field(default_factory=dict)
 
     # 预留扩展字段
     # 后面可以放：
-    #   expert_usage
-    #   fisher_diag
-    #   sgld_mean
-    #   sgld_var
-    #   router_stats
+    # expert_usage
+    # fisher_diag
+    # expert_kfac
+    # expert_kfac_summary
+    # sgld_mean
+    # sgld_var
+    # router_stats
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
@@ -53,12 +56,12 @@ class ClientUpdate:
         返回适合写日志的轻量摘要。
 
         注意：
-            不包含 model_delta，因为 tensor 太大，不适合直接写入日志。
+        不包含 model_delta，因为 tensor 太大，不适合直接写入日志。
         """
         return {
-            "client_id": self.client_id,
-            "round_id": self.round_id,
-            "num_samples": self.num_samples,
+            "client_id": int(self.client_id),
+            "round_id": int(self.round_id),
+            "num_samples": int(self.num_samples),
             "metrics": dict(self.metrics),
             "extra_keys": sorted(self.extra.keys()),
         }
@@ -78,15 +81,16 @@ class AggregationResult:
 
     # 每个客户端的最终聚合权重
     # 例如：
-    #   {0: 0.1, 1: 0.2, 2: 0.7}
+    # {0: 0.1, 1: 0.2, 2: 0.7}
     weights: Dict[int, float]
 
     # 聚合诊断信息
     # 例如：
-    #   method
-    #   num_clients
-    #   total_samples
-    #   param_group
+    # method
+    # num_clients
+    # total_samples
+    # param_group
+    # param_count
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
@@ -94,7 +98,7 @@ class AggregationResult:
         返回适合写日志的轻量摘要。
 
         注意：
-            不包含 new_state_dict，因为模型参数太大。
+        不包含 new_state_dict，因为模型参数太大。
         """
         return {
             "weights": dict(self.weights),
@@ -136,7 +140,7 @@ class RoundResult:
         转成普通 dict，方便写 json / csv。
         """
         return {
-            "round_id": self.round_id,
+            "round_id": int(self.round_id),
             "selected_clients": list(self.selected_clients),
             "test_loss": float(self.test_loss),
             "test_acc": float(self.test_acc),
@@ -166,9 +170,9 @@ class TrainState:
 
     # 额外状态
     # 后面可以放：
-    #   history filter state
-    #   bayes prior state
-    #   fisher running state
+    # history filter state
+    # bayes prior state
+    # fisher running state
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -176,9 +180,9 @@ class TrainState:
         转成普通 dict，方便保存 checkpoint。
         """
         return {
-            "round_id": self.round_id,
-            "best_acc": self.best_acc,
-            "best_round": self.best_round,
+            "round_id": int(self.round_id),
+            "best_acc": float(self.best_acc),
+            "best_round": int(self.best_round),
             "extra": self.extra,
         }
 
@@ -193,17 +197,14 @@ def average_client_metric(
     统计客户端指标平均值。
 
     参数：
-        client_updates:
-            本轮客户端上传结果。
+        client_updates: 本轮客户端上传结果。
+        metric_name: 指标名，例如 train_loss / train_acc。
+        weighted: 是否按客户端样本数加权。
+        default: 如果没有任何客户端包含该指标，则返回 default。
 
-        metric_name:
-            指标名，例如 train_loss / train_acc。
-
-        weighted:
-            是否按客户端样本数加权。
-
-        default:
-            如果没有任何客户端包含该指标，则返回 default。
+    注意：
+        weighted=True 时，返回的是按 num_samples 加权平均，
+        不是客户端等权平均。
     """
     values = []
 
@@ -213,6 +214,7 @@ def average_client_metric(
 
         value = float(update.metrics[metric_name])
         weight = int(update.num_samples) if weighted else 1
+
         values.append((value, weight))
 
     if len(values) == 0:
@@ -230,20 +232,87 @@ def collect_client_metrics(
     client_updates: List[ClientUpdate],
 ) -> Dict[int, Dict[str, float]]:
     """
-    把客户端指标整理成 dict。
+    把客户端训练指标整理成 dict。
 
     输出格式：
         {
             client_id: {
                 "train_loss": ...,
-                "train_acc": ...
+                "train_acc": ...,
+                "num_batches": ...
             }
         }
+
+    注意：
+        这里只收集 metrics，不包含 num_samples / expert_usage。
+        如果需要更完整的诊断信息，请使用 collect_client_diagnostics()。
     """
     return {
-        update.client_id: dict(update.metrics)
+        int(update.client_id): dict(update.metrics)
         for update in client_updates
     }
+
+
+def collect_client_diagnostics(
+    client_updates: List[ClientUpdate],
+) -> Dict[int, Dict[str, Any]]:
+    """
+    把客户端上传结果整理成轻量诊断信息。
+
+    这个函数主要给 server.py 写日志用。
+
+    输出格式：
+        {
+            client_id: {
+                "client_id": 0,
+                "round_id": 1,
+                "num_samples": 5000,
+                "metrics": {
+                    "train_loss": ...,
+                    "train_acc": ...
+                },
+                "expert_usage": {
+                    "expert_counts": ...,
+                    "expert_fraction": ...
+                },
+                "expert_kfac_summary": ...
+            }
+        }
+
+    注意：
+        这里不会保存 model_delta，也不会保存 expert_kfac 原始矩阵。
+        原因是这些对象太大，不适合写进 summary.json 或 train.log。
+    """
+    diagnostics: Dict[int, Dict[str, Any]] = {}
+
+    for update in client_updates:
+        extra = dict(update.extra or {})
+
+        diagnostics[int(update.client_id)] = {
+            "client_id": int(update.client_id),
+            "round_id": int(update.round_id),
+            "num_samples": int(update.num_samples),
+            "metrics": dict(update.metrics or {}),
+
+            # expert_usage 是 client.py 额外采集的路由诊断信息。
+            # 例如每个 expert 被激活多少次、占比是多少。
+            "expert_usage": extra.get("expert_usage", None),
+
+            # 只保存 K-FAC 摘要，不保存原始 K-FAC 矩阵。
+            # 原始 expert_kfac 通常很大，不适合进日志。
+            "expert_kfac_summary": extra.get("expert_kfac_summary", None),
+
+            # 一些轻量训练配置也放进来，方便后续排查日志。
+            "optimizer": extra.get("optimizer", None),
+            "local_epochs": extra.get("local_epochs", None),
+            "grad_clip": extra.get("grad_clip", None),
+            "expert_kfac_timing": extra.get("expert_kfac_timing", None),
+
+            # 保留 extra_keys，方便确认客户端到底上传了哪些扩展字段。
+            "extra_keys": sorted(extra.keys()),
+        }
+
+    return diagnostics
 
 
 def get_update_client_id(update: ClientUpdate | Mapping[str, Any]) -> int:

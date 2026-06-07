@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -25,17 +25,10 @@ class ClientTrainStats:
     """
     客户端本地训练统计结果。
 
-    avg_loss:
-        本地训练平均 loss。
-
-    train_acc:
-        本地训练准确率，百分比形式。
-
-    num_samples:
-        本地训练样本数。
-
-    num_batches:
-        本地训练 batch 数。
+    avg_loss: 本地训练平均 loss。
+    train_acc: 本地训练准确率，百分比形式。
+    num_samples: 本地训练样本数。
+    num_batches: 本地训练 batch 数。
     """
 
     avg_loss: float
@@ -59,16 +52,16 @@ class FLClient:
     联邦学习客户端。
 
     职责：
-        1. 接收 server 下发的 global_model
-        2. 在自己的 train_loader 上本地训练
-        3. 计算 local_model 相对 global_model 的参数变化量
-        4. 返回 ClientUpdate
+    1. 接收 server 下发的 global_model
+    2. 在自己的 train_loader 上本地训练
+    3. 计算 local_model 相对 global_model 的参数变化量
+    4. 返回 ClientUpdate
 
     不负责：
-        1. 选择客户端
-        2. 聚合参数
-        3. 测试集评估
-        4. 保存 checkpoint
+    1. 选择客户端
+    2. 聚合参数
+    3. 测试集评估
+    4. 保存 checkpoint
     """
 
     def __init__(
@@ -102,15 +95,11 @@ class FLClient:
         执行本地训练，并返回客户端更新。
 
         参数：
-            global_model:
-                server 当前轮下发的全局模型。
-
-            round_id:
-                当前联邦训练轮数。
+            global_model: server 当前轮下发的全局模型。
+            round_id: 当前联邦训练轮数。
 
         返回：
-            ClientUpdate:
-                包含 model_delta、num_samples、metrics 等信息。
+            ClientUpdate: 包含 model_delta、num_samples、metrics、extra 等信息。
         """
         global_state_cpu = state_dict_to(
             global_model.state_dict(),
@@ -122,7 +111,6 @@ class FLClient:
         local_model.train()
 
         criterion = build_criterion(self.cfg)
-
         optimizer = build_optimizer(
             model=local_model,
             cfg=self.cfg,
@@ -140,6 +128,26 @@ class FLClient:
             local_epochs=local_epochs,
             grad_clip=grad_clip,
         )
+
+        # ------------------------------------------------------------
+        # 可选：采集当前客户端本地模型的 expert usage。
+        #
+        # 统计含义：
+        #   本地训练结束后，local_model 在该客户端自己的 train_loader 上，
+        #   每个 expert 被 top-k router 选中了多少次。
+        #
+        # 注意：
+        #   topk=2 时，一个样本会贡献 2 次 expert 激活。
+        #   所以 expert_counts 的总和通常约等于 num_samples * topk。
+        # ------------------------------------------------------------
+        expert_usage = None
+        if bool(_cfg_get(self.cfg, "logging.collect_expert_usage", False)):
+            expert_usage = collect_expert_usage(
+                model=local_model,
+                train_loader=self.train_loader,
+                device=self.device,
+                cfg=self.cfg,
+            )
 
         expert_kfac = None
         expert_kfac_summary = None
@@ -199,6 +207,7 @@ class FLClient:
                 "optimizer": get_optimizer_type(self.cfg),
                 "local_epochs": int(local_epochs),
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
+                "expert_usage": expert_usage,
                 "expert_kfac": expert_kfac,
                 "expert_kfac_summary": expert_kfac_summary,
                 "expert_kfac_timing": expert_kfac_timing,
@@ -232,12 +241,12 @@ def train_local_model(
     这里的训练 loss 只有 CrossEntropyLoss。
 
     明确不加入：
-        1. aux_loss
-        2. router balance
-        3. entropy regularization
-        4. expert diversity
-        5. router consistency
-        6. proximal loss
+    1. aux_loss
+    2. router balance
+    3. entropy regularization
+    4. expert diversity
+    5. router consistency
+    6. proximal loss
     """
     if local_epochs <= 0:
         raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
@@ -260,8 +269,8 @@ def train_local_model(
 
             outputs = model(images)
             logits = extract_logits(outputs)
-
             loss = criterion(logits, targets)
+
             loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
@@ -293,6 +302,213 @@ def train_local_model(
     )
 
 
+@torch.inference_mode()
+def collect_expert_usage(
+    model: nn.Module,
+    train_loader: DataLoader,
+    device: torch.device,
+    cfg: Any,
+) -> Dict[str, Any]:
+    """
+    统计一个客户端本地模型的 expert 使用情况。
+
+    统计时机：
+        本地训练结束后。
+
+    统计数据：
+        当前客户端自己的 train_loader。
+
+    输出字段：
+        num_samples:
+            实际用于统计的样本数。
+        num_batches:
+            实际用于统计的 batch 数。
+        num_experts:
+            expert 总数。
+        topk:
+            每个样本激活的 expert 数。
+        total_activations:
+            expert 总激活次数。
+            通常约等于 num_samples * topk。
+        expert_counts:
+            每个 expert 被选中的次数。
+        expert_fraction:
+            每个 expert 被选中的比例。
+        active_experts:
+            至少被选中过一次的 expert 数。
+        dead_experts:
+            本次统计中完全没有被选中的 expert id。
+        supported:
+            当前模型是否支持 return_router_info=True。
+
+    注意：
+        这个函数只做前向统计，不更新模型参数。
+    """
+    max_batches = int(_cfg_get(cfg, "logging.expert_usage_max_batches", 0))
+    num_experts = int(_cfg_get(cfg, "num_experts", 0))
+    topk = int(_cfg_get(cfg, "topk", 1))
+
+    if num_experts <= 0:
+        return {
+            "supported": False,
+            "reason": "num_experts <= 0",
+        }
+
+    old_training = bool(model.training)
+    model.eval()
+
+    expert_counts = torch.zeros(
+        num_experts,
+        dtype=torch.float64,
+        device="cpu",
+    )
+
+    total_samples = 0
+    total_batches = 0
+    supported = True
+    unsupported_reason = ""
+
+    try:
+        for batch_index, batch in enumerate(train_loader):
+            if max_batches > 0 and batch_index >= max_batches:
+                break
+
+            images, targets = unpack_batch(batch)
+            images = images.to(device, non_blocking=True)
+
+            try:
+                outputs = model(
+                    images,
+                    return_router_info=True,
+                )
+            except TypeError as exc:
+                supported = False
+                unsupported_reason = (
+                    "model does not support return_router_info=True: "
+                    f"{exc}"
+                )
+                break
+
+            router_info = extract_router_info(outputs)
+
+            if router_info is None:
+                supported = False
+                unsupported_reason = "model output does not contain router_info"
+                break
+
+            batch_expert_counts = router_info.get("expert_counts", None)
+
+            if batch_expert_counts is None:
+                supported = False
+                unsupported_reason = "router_info does not contain expert_counts"
+                break
+
+            batch_expert_counts = batch_expert_counts.detach().to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+
+            if batch_expert_counts.numel() != num_experts:
+                supported = False
+                unsupported_reason = (
+                    "expert_counts length mismatch: "
+                    f"expected={num_experts}, actual={batch_expert_counts.numel()}"
+                )
+                break
+
+            expert_counts += batch_expert_counts.reshape(-1)
+
+            total_samples += int(images.size(0))
+            total_batches += 1
+
+    finally:
+        if old_training:
+            model.train()
+        else:
+            model.eval()
+
+    if not supported:
+        return {
+            "supported": False,
+            "reason": unsupported_reason,
+        }
+
+    total_activations = float(expert_counts.sum().item())
+
+    if total_activations > 0:
+        expert_fraction_tensor = expert_counts / total_activations
+    else:
+        expert_fraction_tensor = torch.zeros_like(expert_counts)
+
+    expert_counts_dict = {
+        int(expert_id): int(expert_counts[expert_id].item())
+        for expert_id in range(num_experts)
+    }
+
+    expert_fraction_dict = {
+        int(expert_id): float(expert_fraction_tensor[expert_id].item())
+        for expert_id in range(num_experts)
+    }
+
+    dead_experts = [
+        int(expert_id)
+        for expert_id, count in expert_counts_dict.items()
+        if count <= 0
+    ]
+
+    active_experts = int(num_experts - len(dead_experts))
+
+    return {
+        "supported": True,
+        "num_samples": int(total_samples),
+        "num_batches": int(total_batches),
+        "max_batches": int(max_batches),
+        "num_experts": int(num_experts),
+        "topk": int(topk),
+        "total_activations": int(total_activations),
+        "expert_counts": expert_counts_dict,
+        "expert_fraction": expert_fraction_dict,
+        "active_experts": int(active_experts),
+        "dead_experts": dead_experts,
+    }
+
+
+def extract_router_info(outputs: Any) -> Optional[Mapping[str, Any]]:
+    """
+    从模型输出中提取 router_info。
+
+    兼容几种常见输出：
+    1. dataclass / object:
+        outputs.router_info
+    2. dict:
+        outputs["router_info"]
+    3. tuple/list:
+        outputs[1] 是 router_info
+
+    当前 resnet_sparse_moe_head 在 return_router_info=True 时，
+    返回对象里包含 .router_info。
+    """
+    if hasattr(outputs, "router_info"):
+        router_info = outputs.router_info
+        if isinstance(router_info, Mapping):
+            return router_info
+        return None
+
+    if isinstance(outputs, Mapping):
+        router_info = outputs.get("router_info", None)
+        if isinstance(router_info, Mapping):
+            return router_info
+        return None
+
+    if isinstance(outputs, (tuple, list)) and len(outputs) >= 2:
+        router_info = outputs[1]
+        if isinstance(router_info, Mapping):
+            return router_info
+        return None
+
+    return None
+
+
 def build_criterion(cfg: Any) -> nn.Module:
     """
     构建本地训练 loss 函数。
@@ -314,12 +530,11 @@ def build_optimizer(
     根据 cfg.optimizer 构建优化器。
 
     当前支持：
-        sgd
-        adam
-        adamw
+    sgd
+    adam
+    adamw
     """
     optimizer_type = get_optimizer_type(cfg)
-
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
 
     lr = float(_cfg_get(optimizer_cfg, "lr", 0.01))
@@ -395,14 +610,9 @@ def build_clients(
     根据客户端 DataLoader 列表创建 FLClient 列表。
 
     参数：
-        cfg:
-            全局配置。
-
-        client_loaders:
-            每个客户端对应一个 DataLoader。
-
-        device:
-            本地训练使用的设备。
+        cfg: 全局配置。
+        client_loaders: 每个客户端对应一个 DataLoader。
+        device: 本地训练使用的设备。
     """
     clients: List[FLClient] = []
 
@@ -485,11 +695,13 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     读取梯度裁剪配置。
 
     支持两种写法：
-        optimizer:
-          grad_clip: 5.0
+
+    optimizer:
+      grad_clip: 5.0
 
     或者：
-        grad_clip: 5.0
+
+    grad_clip: 5.0
 
     如果没有配置，则返回 None。
     """

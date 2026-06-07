@@ -243,7 +243,7 @@ def _load_yaml_with_include(
         )
         merged_cfg = _deep_merge(merged_cfg, base_cfg)
 
-    # 当前配置覆盖 include 进来的配置
+    # 当前配置覆盖 include 进来的配置。
     merged_cfg = _deep_merge(merged_cfg, cfg)
 
     return merged_cfg
@@ -376,15 +376,40 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["logging"].setdefault("console_round_summary", True)
 
     # train.log 每轮详细摘要。
-    # 例如：RoundClients / RoundMetrics / ClientMetrics / AggSummary / AggWeights。
+    # 例如：RoundMetrics / Clients / Agg / Client。
     cfg["logging"].setdefault("file_round_detail", True)
 
-    # 是否在 train.log 记录每个客户端的训练指标。
+    # 是否记录本轮选择了哪些客户端。
+    # 输出示例：
+    # [Clients] round=1 ids=[0,4,9,6,7,3,2,8,1,5]
+    cfg["logging"].setdefault("log_round_clients", True)
+
+    # 是否在 train.log 中打印每个客户端一行诊断信息。
+    # 输出内容包括样本数、训练指标、聚合权重、expert usage。
+    cfg["logging"].setdefault("log_client_table", True)
+
+    # 是否记录客户端训练指标。
+    # 当前 server.py 的客户端表会默认包含 train_loss / train_acc。
+    # 这个开关先保留，后续如果想拆分更细日志可以继续用。
     cfg["logging"].setdefault("log_client_metrics", True)
 
-    # 是否在 train.log 记录聚合权重。
-    # 后面你要观察每轮专家权重，这个建议默认打开。
+    # 是否在 train.log 记录每个客户端的聚合权重。
+    # 对诊断 expert 聚合很重要，建议默认打开。
     cfg["logging"].setdefault("log_agg_weights", True)
+
+    # 如果所有客户端权重近似相等，压缩显示为：
+    # weights=uniform(each=0.1000)
+    # 避免日志里出现一长串 0.10000000000000002。
+    cfg["logging"].setdefault("compact_uniform_weights", True)
+
+    # 是否在客户端本地训练结束后，额外统计 expert 使用情况。
+    # 统计结果会进入 ClientUpdate.extra["expert_usage"]。
+    cfg["logging"].setdefault("collect_expert_usage", True)
+
+    # expert usage 最多统计多少个 batch。
+    # 0 表示使用完整客户端 train_loader 统计，更准但更慢。
+    # 如果觉得慢，可以在实验配置里改成 5 或 10。
+    cfg["logging"].setdefault("expert_usage_max_batches", 0)
 
     # checkpoint 配置
     cfg.setdefault("checkpoint", {})
@@ -525,7 +550,7 @@ def _infer_num_classes(dataset: str) -> int:
     if dataset == "cifar100":
         return 100
 
-    # 对未知数据集先返回 10，真正合法性检查在 _validate_config 里做
+    # 对未知数据集先返回 10，真正合法性检查在 _validate_config 里做。
     return 10
 
 

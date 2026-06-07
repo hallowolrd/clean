@@ -49,13 +49,13 @@ num_workers: 2
 # 模型配置
 # =========================
 
-# 模型名称：当前先支持 resnet_switch_moe、resnet_sparse_moe_head
+# 模型名称：当前支持 resnet_switch_moe / resnet_sparse_moe_head
 model: resnet_sparse_moe_head
 
 # MoE expert 数量
 num_experts: 4
 
-# 每次路由激活的 expert 数量
+# 每个样本路由激活的 expert 数量
 topk: 2
 
 
@@ -71,6 +71,7 @@ optimizer:
   lr: 0.0005
 
   # SGD momentum
+  # 当前 optimizer.type=adam 时这个字段不会被 Adam 使用
   momentum: 0.0
 
   # 权重衰减
@@ -142,19 +143,45 @@ logging:
   progress_in_non_tty: false
 
   # 是否在控制台打印每轮短摘要
-  # 例如：[Round 001] train_loss=... test_acc=...
+  # 示例：
+  # [Round 001] train_loss=... | train_acc=... | test_acc=...
   console_round_summary: true
 
   # 是否在 train.log 写入每轮详细日志
-  # 包括 RoundClients / RoundMetrics / ClientMetrics / AggSummary / AggWeights
+  # 包括 RoundMetrics / Clients / Agg / Client 这些诊断信息
   file_round_detail: true
 
-  # 是否在 train.log 记录每个客户端的训练指标
+  # 是否记录本轮选择了哪些客户端
+  # 示例：
+  # [Clients] round=1 ids=[0,4,9,6,7,3,2,8,1,5]
+  log_round_clients: true
+
+  # 是否在 train.log 中打印每个客户端一行诊断信息
+  # 内容包括：
+  # samples / train_loss / train_acc / non_expert_w / expert_w / expert_usage
+  log_client_table: true
+
+  # 是否记录客户端训练指标
+  # 当前客户端表会使用 train_loss / train_acc / num_batches
   log_client_metrics: true
 
-  # 是否在 train.log 记录聚合权重
-  # 后面观察每轮专家权重时建议保持 true
+  # 是否记录每个客户端的聚合权重
+  # 对诊断 expert 聚合是否真的产生差异很重要
   log_agg_weights: true
+
+  # 如果所有客户端权重近似相等，压缩显示为：
+  # weights=uniform(each=0.1000)
+  # 避免日志出现一长串 0.10000000000000002
+  compact_uniform_weights: true
+
+  # 是否在客户端本地训练结束后统计 expert 使用情况
+  # 统计结果会写入 ClientUpdate.extra["expert_usage"]
+  collect_expert_usage: true
+
+  # expert usage 最多统计多少个 batch
+  # 0 表示使用完整客户端 train_loader 统计，最准确但会更慢
+  # 如果觉得慢，可以改成 5 或 10
+  expert_usage_max_batches: 0
 
 
 # =========================
