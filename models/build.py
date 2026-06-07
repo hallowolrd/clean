@@ -9,6 +9,10 @@ from models.resnet_switch_moe import (
     ResNetSwitchMoE,
     build_resnet_switch_moe_from_cfg,
 )
+from models.resnet_sparse_moe_head import (
+    ResNetSparseMoEHead,
+    build_resnet_sparse_moe_head_from_cfg,
+)
 
 
 ModelBuilder = Callable[[Any], nn.Module]
@@ -16,6 +20,7 @@ ModelBuilder = Callable[[Any], nn.Module]
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
     "resnet_switch_moe": build_resnet_switch_moe_from_cfg,
+    "resnet_sparse_moe_head": build_resnet_sparse_moe_head_from_cfg,
 }
 
 
@@ -25,9 +30,11 @@ def build_model(cfg: Any) -> nn.Module:
 
     配置示例：
         model: resnet_switch_moe
+        model: resnet_sparse_moe_head
 
     当前支持：
         resnet_switch_moe
+        resnet_sparse_moe_head
 
     后续扩展其他模型时，只需要：
         1. 新增模型文件
@@ -44,7 +51,6 @@ def build_model(cfg: Any) -> nn.Module:
         )
 
     model = MODEL_BUILDERS[model_name](cfg)
-
     return model
 
 
@@ -62,7 +68,6 @@ def get_model_name(cfg: Any) -> str:
         raise ValueError("配置中缺少 model 字段。")
 
     model_name = str(model_name).lower().strip()
-
     if not model_name:
         raise ValueError("配置中的 model 字段不能为空。")
 
@@ -93,7 +98,6 @@ def count_parameters(
     for param in model.parameters():
         if trainable_only and not param.requires_grad:
             continue
-
         total += int(param.numel())
 
     return total

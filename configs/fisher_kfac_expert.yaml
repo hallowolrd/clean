@@ -27,7 +27,7 @@ kfac:
   model_selection: final_step
 
   # 先用于 smoke test，确认稳定后可以改大，比如 200 / 500 / 2000
-  server_steps: 50
+  server_steps: 200
   server_lr: 0.01
 
   # Adam-like 服务端优化器参数，对齐 FedFisher 作者实践设置
