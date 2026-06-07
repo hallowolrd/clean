@@ -12,6 +12,7 @@ import yaml
 # 可扩展的合法取值注册区
 # =========================
 # 后续新增数据集、模型、聚合算法时，优先改这里。
+
 SUPPORTED_DATASETS = {
     "cifar10",
     "cifar100",
@@ -124,12 +125,12 @@ def load_config(config_path: str | Path) -> ConfigNode:
     读取配置文件，并返回 ConfigNode。
 
     主要流程：
-        1. 读取 yaml
-        2. 处理 include
-        3. 合并默认值
-        4. 自动生成 run_name / run_dir
-        5. 做基础合法性检查
-        6. 转成 ConfigNode
+    1. 读取 yaml
+    2. 处理 include
+    3. 合并默认值
+    4. 自动生成 run_name / run_dir
+    5. 做基础合法性检查
+    6. 转成 ConfigNode
     """
     config_path = Path(config_path).expanduser().resolve()
 
@@ -141,7 +142,10 @@ def load_config(config_path: str | Path) -> ConfigNode:
     return ConfigNode(raw_cfg)
 
 
-def save_config(cfg: ConfigNode | Mapping[str, Any], output_path: str | Path) -> None:
+def save_config(
+    cfg: ConfigNode | Mapping[str, Any],
+    output_path: str | Path,
+) -> None:
     """
     保存最终配置。
 
@@ -170,8 +174,8 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
     创建实验输出目录，并返回 Path。
 
     注意：
-        load_config 只负责生成 run_dir 字段；
-        真正创建目录放在这里，避免读取配置时产生太多副作用。
+    load_config 只负责生成 run_dir 字段；
+    真正创建目录放在这里，避免读取配置时产生太多副作用。
     """
     if isinstance(cfg, ConfigNode):
         run_dir = Path(cfg.run_dir)
@@ -179,7 +183,6 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         run_dir = Path(cfg["run_dir"])
 
     run_dir.mkdir(parents=True, exist_ok=True)
-
     return run_dir
 
 
@@ -217,7 +220,6 @@ def _load_yaml_with_include(
         raise ConfigError(f"配置文件顶层必须是 dict：{config_path}")
 
     cfg = dict(cfg)
-
     include = cfg.pop("include", None)
 
     if include is None:
@@ -234,7 +236,6 @@ def _load_yaml_with_include(
 
     for include_file in include_files:
         include_path = (config_path.parent / include_file).resolve()
-
         base_cfg = _load_yaml_with_include(
             include_path,
             stack=stack + [config_path],
@@ -255,9 +256,9 @@ def _deep_merge(
     递归合并配置。
 
     规则：
-        1. override 里的普通字段覆盖 base
-        2. override 里的 dict 会递归覆盖 base 里的 dict
-        3. list 不做递归合并，直接整体覆盖
+    1. override 里的普通字段覆盖 base
+    2. override 里的 dict 会递归覆盖 base 里的 dict
+    3. list 不做递归合并，直接整体覆盖
     """
     result = copy.deepcopy(dict(base))
 
@@ -361,6 +362,29 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["logging"].setdefault("save_config", True)
     cfg["logging"].setdefault("save_results_csv", True)
 
+    # 控制台是否显示 tqdm 进度条。
+    # 进度条只用于人看，不应该写入 train.log。
+    cfg["logging"].setdefault("progress_bar", True)
+
+    # 默认只在交互式终端显示进度条。
+    # 如果用 nohup / 重定向跑实验，建议保持 False，避免输出混乱。
+    cfg["logging"].setdefault("progress_in_non_tty", False)
+
+    # 控制台每轮短摘要。
+    # 例如：[Round 001] train_loss=... test_acc=...
+    cfg["logging"].setdefault("console_round_summary", True)
+
+    # train.log 每轮详细摘要。
+    # 例如：RoundClients / RoundMetrics / ClientMetrics / AggSummary / AggWeights。
+    cfg["logging"].setdefault("file_round_detail", True)
+
+    # 是否在 train.log 记录每个客户端的训练指标。
+    cfg["logging"].setdefault("log_client_metrics", True)
+
+    # 是否在 train.log 记录聚合权重。
+    # 后面你要观察每轮专家权重，这个建议默认打开。
+    cfg["logging"].setdefault("log_agg_weights", True)
+
     # checkpoint 配置
     cfg.setdefault("checkpoint", {})
     cfg["checkpoint"].setdefault("enabled", True)
@@ -375,9 +399,9 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     生成 run_name 和 run_dir。
 
     规则：
-        1. run_name 缺失 / 为空 / auto / null 时，自动根据实验设置生成
-        2. 如果输出目录已存在，默认自动追加 _v2 / _v3
-        3. 如果 run.overwrite=True，则允许使用已有目录，不自动追加版本号
+    1. run_name 缺失 / 为空 / auto / null 时，自动根据实验设置生成
+    2. 如果输出目录已存在，默认自动追加 _v2 / _v3
+    3. 如果 run.overwrite=True，则允许使用已有目录，不自动追加版本号
     """
     cfg = copy.deepcopy(cfg)
 
@@ -512,7 +536,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     后面新增 Fisher / history / Bayes 时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
-
     if dataset not in SUPPORTED_DATASETS:
         raise ConfigError(
             f"不支持的数据集：{dataset}。"
@@ -520,7 +543,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model = cfg.get("model")
-
     if model not in SUPPORTED_MODELS:
         raise ConfigError(
             f"不支持的模型：{model}。"
@@ -560,12 +582,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     frac = float(cfg.get("frac"))
-
     if not (0.0 < frac <= 1.0):
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
     alpha = float(cfg.get("alpha"))
-
     if alpha <= 0:
         raise ConfigError(f"alpha 必须大于 0，当前值：{alpha}")
 
@@ -593,12 +613,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     lr = float(optimizer_cfg.get("lr"))
-
     if lr <= 0:
         raise ConfigError(f"optimizer.lr 必须大于 0，当前值：{lr}")
 
     weight_decay = float(optimizer_cfg.get("weight_decay"))
-
     if weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
@@ -615,7 +633,6 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError("kfac 必须是 dict。")
 
     weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
-
     if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
         raise ConfigError(
             f"不支持的 kfac.weight_mode：{weight_mode}。"
@@ -623,7 +640,6 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
-
     if solve_scope not in {"per_layer", "global_expert"}:
         raise ConfigError(
             f"不支持的 kfac.solve_scope：{solve_scope}。"
@@ -631,7 +647,6 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
-
     if solve_mode not in {"cg", "gd", "adam"}:
         raise ConfigError(
             f"不支持的 kfac.solve_mode：{solve_mode}。"
@@ -651,14 +666,12 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     server_steps = int(kfac_cfg.get("server_steps", 5))
-
     if server_steps < 0:
         raise ConfigError(
             f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
         )
 
     server_lr = float(kfac_cfg.get("server_lr", 0.01))
-
     if server_lr <= 0:
         raise ConfigError(
             f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
@@ -678,42 +691,36 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
-
     if adam_eps <= 0:
         raise ConfigError(
             f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
         )
 
     cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
-
     if cg_tol < 0:
         raise ConfigError(
             f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
         )
 
     damping = float(kfac_cfg.get("damping", 0.0))
-
     if damping < 0:
         raise ConfigError(
             f"kfac.damping 不能小于 0，当前值：{damping}"
         )
 
     min_count = int(kfac_cfg.get("min_count", 1))
-
     if min_count <= 0:
         raise ConfigError(
             f"kfac.min_count 必须大于 0，当前值：{min_count}"
         )
 
     max_batches = int(kfac_cfg.get("max_batches", 0))
-
     if max_batches < 0:
         raise ConfigError(
             f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
         )
 
     fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
-
     if fallback not in {"none", "sample_weighted"}:
         raise ConfigError(
             f"不支持的 kfac.fallback：{fallback}。"
@@ -721,14 +728,12 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
-
     if fisher_timing != "after_train":
         raise ConfigError(
             f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
         )
 
     model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
-
     if model_mode not in {"eval", "train"}:
         raise ConfigError(
             f"不支持的 kfac.model_mode：{model_mode}。"
@@ -736,7 +741,6 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
-
     if model_selection != "final_step":
         raise ConfigError(
             "当前主实验不支持 server validation 选 best，"
@@ -744,7 +748,6 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
-
     if use_server_validation:
         raise ConfigError(
             "当前主实验不使用 server validation，"

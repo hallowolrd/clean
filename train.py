@@ -42,11 +42,15 @@ def main() -> int:
     训练入口。
 
     这里负责：
-        1. 读取配置
-        2. 设置随机种子
-        3. 创建输出目录
-        4. 打开 train.log 双写
-        5. 调用 run_training() 执行实际训练
+    1. 读取配置
+    2. 设置随机种子
+    3. 创建输出目录
+    4. 打开 train.log 双写
+    5. 调用 run_training() 执行实际训练
+
+    日志说明：
+    - 普通 print / 报错信息会写入控制台和 train.log。
+    - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
     """
     args = parse_args()
 
@@ -60,7 +64,13 @@ def main() -> int:
     run_dir = Path(ensure_run_dir(cfg))
     log_path = run_dir / "train.log"
 
-    with tee_output_to_file(log_path):
+    # 开启 stderr 进度条过滤。
+    # 这样 tqdm 的动态刷新不会污染 train.log，
+    # 但普通 stderr 报错和 traceback 仍然会写入 train.log。
+    with tee_output_to_file(
+        log_path,
+        filter_stderr_progress=True,
+    ):
         try:
             return run_training(
                 args=args,
@@ -85,17 +95,20 @@ def run_training(
     实际训练流程。
 
     这个函数会被 main() 包在 tee_output_to_file() 里面，
-    所以这里所有 print 和报错都会同时写入控制台和 train.log。
+    所以这里的普通 print 和报错会同时写入控制台和 train.log。
+
+    注意：
+    tqdm 进度条由 utils/logging.py 过滤，不写入 train.log。
 
     总流程：
-        1. 保存配置
-        2. 解析设备
-        3. 加载数据集
-        4. 划分客户端数据
-        5. 创建 DataLoader
-        6. 创建 FLServer
-        7. 执行联邦训练
-        8. 保存结果
+    1. 保存配置
+    2. 解析设备
+    3. 加载数据集
+    4. 划分客户端数据
+    5. 创建 DataLoader
+    6. 创建 FLServer
+    7. 执行联邦训练
+    8. 保存结果
     """
     if bool(cfg.get("logging.save_config", True)):
         save_config(
@@ -181,8 +194,8 @@ def save_partition_summary(
     保存数据划分摘要。
 
     注意：
-        不保存完整 client_indices。
-        这里只保存每个客户端样本数、类别分布等轻量信息。
+    不保存完整 client_indices。
+    这里只保存每个客户端样本数、类别分布等轻量信息。
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,11 +219,8 @@ def save_train_outputs(
     保存训练输出。
 
     输出文件：
-        summary.json:
-            完整训练摘要。
-
-        results.csv:
-            每轮核心指标，方便直接画图或导入 Excel。
+    summary.json: 完整训练摘要。
+    results.csv: 每轮核心指标，方便直接画图或导入 Excel。
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,13 +250,13 @@ def save_round_results_csv(
     保存每轮训练结果到 CSV。
 
     CSV 只保存最常用的核心指标：
-        round_id
-        selected_clients
-        avg_train_loss
-        avg_train_acc
-        test_loss
-        test_acc
-        best_acc
+    round_id
+    selected_clients
+    avg_train_loss
+    avg_train_acc
+    test_loss
+    test_acc
+    best_acc
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -297,11 +307,11 @@ def make_json_safe(obj: Any) -> Any:
     把对象转换成 JSON 可保存格式。
 
     主要处理：
-        torch.Tensor
-        torch.device
-        Path
-        dict
-        list / tuple
+    torch.Tensor
+    torch.device
+    Path
+    dict
+    list / tuple
     """
     if isinstance(obj, torch.Tensor):
         if obj.numel() == 1:

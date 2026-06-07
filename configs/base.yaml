@@ -133,6 +133,29 @@ logging:
   # 是否保存 results.csv
   save_results_csv: true
 
+  # 是否在控制台显示 tqdm 动态进度条
+  # 注意：进度条只用于控制台观察，不应该写入 train.log
+  progress_bar: true
+
+  # 是否允许在非交互终端显示进度条
+  # 例如 nohup、重定向输出、后台运行时一般建议保持 false
+  progress_in_non_tty: false
+
+  # 是否在控制台打印每轮短摘要
+  # 例如：[Round 001] train_loss=... test_acc=...
+  console_round_summary: true
+
+  # 是否在 train.log 写入每轮详细日志
+  # 包括 RoundClients / RoundMetrics / ClientMetrics / AggSummary / AggWeights
+  file_round_detail: true
+
+  # 是否在 train.log 记录每个客户端的训练指标
+  log_client_metrics: true
+
+  # 是否在 train.log 记录聚合权重
+  # 后面观察每轮专家权重时建议保持 true
+  log_agg_weights: true
+
 
 # =========================
 # checkpoint 配置
