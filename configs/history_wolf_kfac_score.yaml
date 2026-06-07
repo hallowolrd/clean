@@ -21,8 +21,13 @@ kfac:
   # 保持和 fisher_kfac_expert.yaml 一致：本地训练后统计 K-FAC。
   fisher_timing: after_train
 
-  # 统计 K-FAC 时使用 eval 模式，减少 dropout/bn 等随机影响。
+  # 采集 K-FAC 时使用 eval 模式。
+  # 注意：model_mode=eval 只控制模型行为，不会关闭 Dataset 里的随机数据增强。
   model_mode: eval
+
+  # K-FAC/Fisher 采集时临时关闭训练集随机增强。
+  # 本地训练仍然保留数据增强；这里只让 Fisher 统计更稳定、更贴近 FedFisher 作者的做法。
+  disable_augmentation_for_collect: true
 
   # 是否把 bias 合进 K-FAC A 因子。
   include_bias: true
@@ -57,7 +62,7 @@ kfac:
 # History-WoLF K-FAC Score 配置
 # =========================
 # 注意：
-# 这些参数应该由 aggregation/history_wolf_kfac_score.py
+# 这些参数由 aggregation/history_wolf_kfac_score.py
 # 通过 cfg.get("history_wolf_kfac_score.xxx", default) 读取。
 history_wolf_kfac_score:
   # 是否启用 K-FAC/Fisher score。

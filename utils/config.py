@@ -340,6 +340,12 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["kfac"].setdefault("include_bias", True)
     cfg["kfac"].setdefault("fisher_timing", "after_train")
     cfg["kfac"].setdefault("model_mode", "eval")
+
+    # 是否在 K-FAC/Fisher 采集时临时关闭训练集随机增强。
+    # 默认 False，避免影响已有 fisher_kfac_expert 实验；
+    # 新的 history_wolf_kfac_score 实验配置里可以显式设为 true。
+    cfg["kfac"].setdefault("disable_augmentation_for_collect", False)
+
     cfg["kfac"].setdefault("max_batches", 0)
     cfg["kfac"].setdefault("expert_name_pattern", "experts.")
     cfg["kfac"].setdefault("use_server_validation", False)

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from data.datasets import build_train_transform
 from utils.eval import extract_logits, unpack_batch
+
 
 KFACLayerPayload = Dict[str, Any]
 ExpertKFACPayload = Dict[str, KFACLayerPayload]
@@ -19,16 +21,17 @@ class _KFACLayerBuffer:
     单个 expert Linear 层的 K-FAC 统计缓存。
 
     对 Linear 层 z = W a + b：
+
         A = E[a a^T]
         B = E[delta delta^T]
 
     注意：
-        1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
-        2. include_bias=True 时，把 bias 合并到 activation 里：
+    1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
+    2. include_bias=True 时，把 bias 合并到 activation 里：
            a_aug = [a, 1]
            W_aug = [W, b]
-        3. B 必须用每个样本/token 的 grad_output 外积后求和，
-           不能先平均 grad_output 再外积，否则会出现梯度抵消。
+    3. B 必须用每个样本/token 的 grad_output 外积后求和，
+       不能先平均 grad_output 再外积，否则会出现梯度抵消。
     """
 
     module_name: str
@@ -49,7 +52,6 @@ class _KFACLayerBuffer:
             expected_dim=self.module.in_features,
             tensor_name=f"{self.module_name}.activation",
         )
-
         if a.numel() == 0 or a.size(0) <= 0:
             return
 
@@ -82,7 +84,6 @@ class _KFACLayerBuffer:
             expected_dim=self.module.out_features,
             tensor_name=f"{self.module_name}.grad_output",
         )
-
         if delta.numel() == 0 or delta.size(0) <= 0:
             return
 
@@ -105,12 +106,10 @@ class _KFACLayerBuffer:
         """
         if self.A_sum is None or self.B_sum is None:
             return None
-
         if self.a_count <= 0 or self.b_count <= 0:
             return None
 
         count = min(int(self.a_count), int(self.b_count))
-
         if count < int(min_count):
             return None
 
@@ -119,7 +118,6 @@ class _KFACLayerBuffer:
 
         if not torch.isfinite(A_mean).all():
             return None
-
         if not torch.isfinite(B_mean).all():
             return None
 
@@ -155,25 +153,27 @@ def collect_expert_kfac(
     在本地训练完成后的 local_model 上，额外跑一遍数据来采集 expert Linear 层的 K-FAC 因子。
 
     返回格式：
-        {
-            "switch_layers.0.switch_ffn.experts.2.0": {
-                "module_name": ...,
-                "weight_name": "...weight",
-                "bias_name": "...bias",
-                "A": Tensor[in_dim(+1), in_dim(+1)],
-                "B": Tensor[out_dim, out_dim],
-                "count": int,
-                ...
-            },
+    {
+        "switch_layers.0.switch_ffn.experts.2.0": {
+            "module_name": ...,
+            "weight_name": "...weight",
+            "bias_name": "...bias",
+            "A": Tensor[in_dim(+1), in_dim(+1)],
+            "B": Tensor[out_dim, out_dim],
+            "count": int,
             ...
-        }
+        },
+        ...
+    }
 
     设计约束：
-        1. 只采集 module name 包含 experts. 的 nn.Linear。
-        2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
-        3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
-        4. 不修改训练逻辑，不做 optimizer.step()。
-        5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
+    1. 只采集 module name 包含 experts. 的 nn.Linear。
+    2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
+    3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
+    4. 不修改训练逻辑，不做 optimizer.step()。
+    5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
+    6. 如果 kfac.disable_augmentation_for_collect=true，则 K-FAC 采集时临时关闭训练集随机增强。
+       注意：model_mode=eval 只能控制模型模式，不能关闭 Dataset transform 里的 RandomCrop/Flip。
     """
     if device is None:
         device = _infer_model_device(model)
@@ -185,6 +185,12 @@ def collect_expert_kfac(
     max_batches = int(_cfg_get(cfg, "kfac.max_batches", 0))
     expert_name_pattern = str(_cfg_get(cfg, "kfac.expert_name_pattern", "experts."))
     model_mode = str(_cfg_get(cfg, "kfac.model_mode", "eval")).lower().strip()
+    disable_augmentation_for_collect = _cfg_bool(
+        cfg,
+        "kfac.disable_augmentation_for_collect",
+        False,
+    )
+
     fisher_timing = str(
         _cfg_get(
             cfg,
@@ -234,7 +240,6 @@ def collect_expert_kfac(
         ) -> None:
             if len(inputs) == 0:
                 return
-
             buffers[name].add_activation(inputs[0])
 
         def backward_hook(
@@ -245,7 +250,6 @@ def collect_expert_kfac(
         ) -> None:
             if len(grad_output) == 0:
                 return
-
             buffers[name].add_grad_output(grad_output[0])
 
         handles.append(module.register_forward_hook(forward_hook))
@@ -265,16 +269,21 @@ def collect_expert_kfac(
     )
     sum_criterion.to(device)
 
+    kfac_loader, restore_data_transform, augmentation_disabled = _prepare_kfac_loader(
+        train_loader=train_loader,
+        cfg=cfg,
+        disable_augmentation_for_collect=disable_augmentation_for_collect,
+    )
+
     model.zero_grad(set_to_none=True)
 
     try:
         with torch.enable_grad():
-            for batch_idx, batch in enumerate(train_loader):
+            for batch_idx, batch in enumerate(kfac_loader):
                 if max_batches > 0 and batch_idx >= max_batches:
                     break
 
                 images, targets = unpack_batch(batch)
-
                 images = images.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
 
@@ -282,7 +291,6 @@ def collect_expert_kfac(
 
                 outputs = model(images)
                 logits = extract_logits(outputs)
-
                 loss = sum_criterion(logits, targets)
 
                 if not torch.isfinite(loss):
@@ -290,11 +298,13 @@ def collect_expert_kfac(
 
                 loss.backward()
 
-                # 只采集 Fisher，不更新参数。
+                # 只采集 Fisher/K-FAC，不更新参数。
                 model.zero_grad(set_to_none=True)
     finally:
         for handle in handles:
             handle.remove()
+
+        restore_data_transform()
 
         model.zero_grad(set_to_none=True)
         model.train(was_training)
@@ -303,7 +313,6 @@ def collect_expert_kfac(
 
     for module_name, module_buffer in buffers.items():
         layer_payload = module_buffer.to_payload(min_count=min_count)
-
         if layer_payload is None:
             continue
 
@@ -312,6 +321,12 @@ def collect_expert_kfac(
         layer_payload["model_mode"] = model_mode
         layer_payload["max_batches"] = int(max_batches)
         layer_payload["expert_name_pattern"] = expert_name_pattern
+
+        # 记录这次 K-FAC 采集是否尝试关闭随机增强，方便日志诊断。
+        layer_payload["disable_augmentation_for_collect"] = bool(
+            disable_augmentation_for_collect
+        )
+        layer_payload["augmentation_disabled"] = bool(augmentation_disabled)
 
         payload[module_name] = layer_payload
 
@@ -335,6 +350,8 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
             "max_trace_B": 0.0,
             "fisher_timing": "",
             "model_mode": "",
+            "disable_augmentation_for_collect": False,
+            "augmentation_disabled": False,
         }
 
     counts = [int(item["count"]) for item in payload.values()]
@@ -356,6 +373,15 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
         }
     )
 
+    disable_aug_values = [
+        bool(item.get("disable_augmentation_for_collect", False))
+        for item in payload.values()
+    ]
+    aug_disabled_values = [
+        bool(item.get("augmentation_disabled", False))
+        for item in payload.values()
+    ]
+
     return {
         "num_layers": int(len(payload)),
         "total_count": int(sum(counts)),
@@ -365,16 +391,138 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
         "max_trace_A": float(max(trace_A)),
         "max_trace_B": float(max(trace_B)),
         "fisher_timing": (
-            fisher_timings[0]
-            if len(fisher_timings) == 1
-            else ",".join(fisher_timings)
+            fisher_timings[0] if len(fisher_timings) == 1 else ",".join(fisher_timings)
         ),
         "model_mode": (
-            model_modes[0]
-            if len(model_modes) == 1
-            else ",".join(model_modes)
+            model_modes[0] if len(model_modes) == 1 else ",".join(model_modes)
         ),
+        "disable_augmentation_for_collect": bool(any(disable_aug_values)),
+        "augmentation_disabled": bool(any(aug_disabled_values)),
     }
+
+
+def _prepare_kfac_loader(
+    train_loader: DataLoader,
+    cfg: Any,
+    disable_augmentation_for_collect: bool,
+) -> Tuple[DataLoader, Any, bool]:
+    """
+    准备 K-FAC 采集用 DataLoader。
+
+    为什么不直接用 model.eval()：
+    - model.eval() 只会关闭 Dropout / BN 的训练行为；
+    - Dataset transform 里的 RandomCrop / RandomHorizontalFlip 仍然会执行。
+
+    为什么这里新建一个 num_workers=0 的 DataLoader：
+    - 当前项目训练 DataLoader 可能使用 persistent_workers；
+    - 训练阶段的 worker 进程里已经拷贝了带随机增强的 dataset；
+    - 直接修改主进程 dataset.transform 不一定能影响已有 worker；
+    - 新建 num_workers=0 的 loader 可以确保这次 K-FAC 采集使用主进程中的 clean transform。
+    """
+    if not disable_augmentation_for_collect:
+        return train_loader, _noop, False
+
+    dataset_name = str(_cfg_get(cfg, "dataset", "")).lower().strip()
+    if dataset_name == "":
+        return train_loader, _noop, False
+
+    clean_transform = build_train_transform(
+        dataset_name=dataset_name,
+        use_augmentation=False,
+    )
+
+    restore_transform, patched = _temporarily_replace_dataset_transform(
+        dataset=train_loader.dataset,
+        new_transform=clean_transform,
+    )
+
+    if not patched:
+        return train_loader, restore_transform, False
+
+    # K-FAC 采集不需要 shuffle。关闭 shuffle 能减少额外随机性。
+    kfac_loader = DataLoader(
+        train_loader.dataset,
+        batch_size=getattr(train_loader, "batch_size", None),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=bool(getattr(train_loader, "pin_memory", False)),
+        drop_last=bool(getattr(train_loader, "drop_last", False)),
+        collate_fn=getattr(train_loader, "collate_fn", None),
+    )
+
+    return kfac_loader, restore_transform, True
+
+
+def _temporarily_replace_dataset_transform(
+    dataset: Any,
+    new_transform: Any,
+) -> Tuple[Any, bool]:
+    """
+    临时替换 dataset.transform。
+
+    支持常见结构：
+    - CIFAR10 / CIFAR100 dataset 本身有 transform
+    - torch.utils.data.Subset 包着原始 dataset
+    - 多层 Subset 嵌套
+
+    返回：
+        restore_fn: 调用后恢复原 transform
+        patched: 是否真的替换成功
+    """
+    transform_datasets = []
+    _collect_datasets_with_transform(
+        dataset=dataset,
+        output=transform_datasets,
+        visited=set(),
+    )
+
+    if len(transform_datasets) == 0:
+        return _noop, False
+
+    old_transforms = []
+    for item in transform_datasets:
+        old_transforms.append((item, getattr(item, "transform")))
+        setattr(item, "transform", new_transform)
+
+    def restore() -> None:
+        for item, old_transform in old_transforms:
+            setattr(item, "transform", old_transform)
+
+    return restore, True
+
+
+def _collect_datasets_with_transform(
+    dataset: Any,
+    output: list[Any],
+    visited: set[int],
+) -> None:
+    """
+    递归找到带 transform 属性的底层 dataset。
+    """
+    if dataset is None:
+        return
+
+    dataset_id = id(dataset)
+    if dataset_id in visited:
+        return
+    visited.add(dataset_id)
+
+    if hasattr(dataset, "transform"):
+        output.append(dataset)
+
+    # torch.utils.data.Subset 常见字段是 dataset。
+    child_dataset = getattr(dataset, "dataset", None)
+    if child_dataset is not None:
+        _collect_datasets_with_transform(
+            dataset=child_dataset,
+            output=output,
+            visited=visited,
+        )
+
+
+def _noop() -> None:
+    """空恢复函数，用于不需要恢复 transform 的情况。"""
+    return None
 
 
 def _is_expert_linear(
@@ -483,17 +631,14 @@ def _cfg_get(
 
     if hasattr(cfg, "get"):
         value = cfg.get(key, None)
-
         if value is not None:
             return value
 
     current = cfg
-
     for part in key.split("."):
         if isinstance(current, dict):
             if part not in current:
                 return default
-
             current = current[part]
             continue
 
@@ -504,3 +649,23 @@ def _cfg_get(
         return default
 
     return current
+
+
+def _cfg_bool(
+    cfg: Any,
+    key: str,
+    default: bool,
+) -> bool:
+    """读取 bool 配置，兼容 true/false 字符串。"""
+    value = _cfg_get(cfg, key, default)
+
+    if isinstance(value, bool):
+        return bool(value)
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        return value.lower().strip() in {"1", "true", "yes", "y", "on"}
+
+    return bool(value)
