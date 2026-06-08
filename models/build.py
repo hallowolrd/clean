@@ -9,13 +9,19 @@ from models.resnet_switch_moe import (
     ResNetSwitchMoE,
     build_resnet_switch_moe_from_cfg,
 )
+from models.resnet_sparse_moe_head import build_resnet_sparse_moe_head_from_cfg
 
 
 ModelBuilder = Callable[[Any], nn.Module]
 
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
+    # 原有模型：ResNet tokenizer + Switch Transformer MoE。
     "resnet_switch_moe": build_resnet_switch_moe_from_cfg,
+
+    # 新增模型：ResNet backbone + Sparse MoE Head。
+    # 只在这里注册模型入口，不把训练、数据划分、聚合逻辑耦合进来。
+    "resnet_sparse_moe_head": build_resnet_sparse_moe_head_from_cfg,
 }
 
 
@@ -25,9 +31,11 @@ def build_model(cfg: Any) -> nn.Module:
 
     配置示例：
         model: resnet_switch_moe
+        model: resnet_sparse_moe_head
 
     当前支持：
-        resnet_switch_moe
+        - resnet_switch_moe
+        - resnet_sparse_moe_head
 
     后续扩展其他模型时，只需要：
         1. 新增模型文件
@@ -44,7 +52,6 @@ def build_model(cfg: Any) -> nn.Module:
         )
 
     model = MODEL_BUILDERS[model_name](cfg)
-
     return model
 
 
@@ -93,7 +100,6 @@ def count_parameters(
     for param in model.parameters():
         if trainable_only and not param.requires_grad:
             continue
-
         total += int(param.numel())
 
     return total
