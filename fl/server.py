@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -206,6 +207,11 @@ class FLServer:
             if log_every > 0 and round_id % log_every == 0:
                 self.print_round_summary(round_result)
 
+            # Fisher-only 诊断打印由 expert_fisher.diagnostics_print 控制。
+            # 这里仅负责读取聚合器已经生成的 diagnostics 并打印摘要，
+            # 不在 server 里计算 Fisher 细节，保持解耦。
+            self.print_fisher_diagnostics(round_result)
+
             self._cleanup_after_round()
 
         return ServerTrainResult(
@@ -345,6 +351,9 @@ class FLServer:
 
         expert_fisher_cfg = _cfg_get(self.cfg, "expert_fisher", {})
         expert_fisher_enabled = bool(_cfg_get(expert_fisher_cfg, "enabled", False))
+        diagnostics_print = bool(
+            _cfg_get(expert_fisher_cfg, "diagnostics_print", False)
+        )
 
         print()
         print("=" * 80)
@@ -365,6 +374,7 @@ class FLServer:
             f"expert={self.aggregators.expert.method_name}"
         )
         print(f"[Server] expert_fisher.enabled: {expert_fisher_enabled}")
+        print(f"[Server] expert_fisher.diagnostics_print: {diagnostics_print}")
         print(f"[Server] param_groups: {self.param_groups.summary()}")
         print(f"[Server] param_numel: {param_summary['floating_numel']}")
         print("=" * 80)
@@ -404,6 +414,119 @@ class FLServer:
             f"test_acc={round_result.test_acc:.2f}% | "
             f"best_acc={round_result.best_acc:.2f}%"
         )
+
+    def print_fisher_diagnostics(
+        self,
+        round_result: RoundResult,
+    ) -> None:
+        """
+        打印 fisher_only 的紧凑诊断日志。
+
+        打印开关在 yaml 中控制：
+
+        expert_fisher:
+          diagnostics_print: true
+          diagnostics_print_every: 1
+          diagnostics_print_experts: false
+          diagnostics_prefix: "[FisherDiag]"
+
+        注意：
+            这里只打印 diagnostics 中已经存在的摘要字段。
+            Fisher score / 权重 / 相关性等计算仍然放在 aggregation/fisher_only.py。
+        """
+        expert_fisher_cfg = _cfg_get(self.cfg, "expert_fisher", {})
+
+        diagnostics_print = bool(
+            _cfg_get(expert_fisher_cfg, "diagnostics_print", False)
+        )
+        if not diagnostics_print:
+            return
+
+        print_every = int(
+            _cfg_get(expert_fisher_cfg, "diagnostics_print_every", 1)
+        )
+        print_every = max(print_every, 1)
+
+        if int(round_result.round_id) % print_every != 0:
+            return
+
+        expert_summary = round_result.aggregation_info.get("expert", {})
+        if not isinstance(expert_summary, dict):
+            return
+
+        diagnostics = expert_summary.get("diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            return
+
+        # 只打印 fisher_only 的诊断，避免 uniform / sample_weighted 时误打。
+        if diagnostics.get("method", None) != "fisher_only":
+            return
+
+        if not bool(diagnostics.get("fisher_diag_enabled", False)):
+            return
+
+        prefix = str(
+            _cfg_get(expert_fisher_cfg, "diagnostics_prefix", "[FisherDiag]")
+        )
+
+        num_experts = _safe_int(diagnostics.get("num_experts", 0))
+        num_fallback_experts = _safe_int(
+            diagnostics.get("num_fallback_experts", 0)
+        )
+
+        print(
+            f"{prefix}[Round {round_result.round_id:03d}] "
+            f"experts={num_experts} | "
+            f"fallback={num_fallback_experts}/{num_experts} | "
+            f"fallback_ratio={_fmt_float(diagnostics.get('fallback_ratio', 0.0), 3)} | "
+            f"valid={_fmt_float(diagnostics.get('mean_valid_clients', 0.0), 2)} | "
+            f"eff_clients={_fmt_float(diagnostics.get('mean_effective_clients', 0.0), 2)} | "
+            f"entropy_norm={_fmt_float(diagnostics.get('mean_weight_entropy_norm', 0.0), 3)} | "
+            f"w_max={_fmt_float(diagnostics.get('mean_weight_max', 0.0), 3)} | "
+            f"score_cv={_fmt_float(diagnostics.get('mean_score_cv', 0.0), 3)} | "
+            f"active_cv={_fmt_float(diagnostics.get('mean_active_count_cv', 0.0), 3)} | "
+            f"fisher_cv={_fmt_float(diagnostics.get('mean_fisher_strength_cv', 0.0), 3)} | "
+            f"corr_w_active={_fmt_float(diagnostics.get('mean_weight_active_corr', 0.0), 3)} | "
+            f"corr_w_fisher={_fmt_float(diagnostics.get('mean_weight_fisher_corr', 0.0), 3)}"
+        )
+
+        print_experts = bool(
+            _cfg_get(expert_fisher_cfg, "diagnostics_print_experts", False)
+        )
+        if not print_experts:
+            return
+
+        expert_diagnostics = diagnostics.get("expert_diagnostics", {})
+        if not isinstance(expert_diagnostics, dict):
+            return
+
+        for expert_id, expert_diag in _sorted_expert_diagnostics(
+            expert_diagnostics
+        ):
+            if not isinstance(expert_diag, dict):
+                continue
+
+            fallback = bool(expert_diag.get("fallback", False))
+            top_client = expert_diag.get("top_client", None)
+            top_client_text = "none" if top_client is None else str(top_client)
+
+            print(
+                f"{prefix}[Round {round_result.round_id:03d}][Expert {expert_id}] "
+                f"valid={_safe_int(expert_diag.get('valid_clients', 0))} | "
+                f"fallback={str(fallback).lower()} | "
+                f"eff={_fmt_float(expert_diag.get('effective_clients', 0.0), 2)} | "
+                f"entropy_norm={_fmt_float(expert_diag.get('weight_entropy_norm', 0.0), 3)} | "
+                f"w_max={_fmt_float(expert_diag.get('weight_max', 0.0), 3)} | "
+                f"top_client={top_client_text} | "
+                f"top1_gap={_fmt_float(expert_diag.get('top1_gap', 0.0), 3)} | "
+                f"score_cv={_fmt_float(expert_diag.get('score_cv', 0.0), 3)} | "
+                f"active_cv={_fmt_float(expert_diag.get('active_count_cv', 0.0), 3)} | "
+                f"fisher_cv={_fmt_float(expert_diag.get('fisher_strength_cv', 0.0), 3)} | "
+                f"corr_w_active={_fmt_float(expert_diag.get('weight_active_corr', 0.0), 3)} | "
+                f"corr_w_fisher={_fmt_float(expert_diag.get('weight_fisher_corr', 0.0), 3)} | "
+                f"zero_score={_safe_int(expert_diag.get('zero_score_clients', 0))} | "
+                f"zero_active={_safe_int(expert_diag.get('zero_active_clients', 0))}"
+            )
 
     def _validate_server_state(self) -> None:
         """
@@ -501,6 +624,60 @@ def resolve_device(cfg: Any) -> torch.device:
         f"不支持的 device：{device_name}。"
         "当前支持：auto, cpu, cuda, mps"
     )
+
+
+def _sorted_expert_diagnostics(
+    expert_diagnostics: Dict[Any, Any],
+) -> List[tuple[int, Any]]:
+    """
+    按 expert_id 对 expert diagnostics 排序。
+
+    兼容 int key 和 str key。
+    """
+    result: List[tuple[int, Any]] = []
+
+    for raw_expert_id, expert_diag in expert_diagnostics.items():
+        try:
+            expert_id = int(raw_expert_id)
+        except (TypeError, ValueError):
+            continue
+
+        result.append((expert_id, expert_diag))
+
+    return sorted(result, key=lambda item: item[0])
+
+
+def _fmt_float(
+    value: Any,
+    digits: int = 3,
+) -> str:
+    """
+    把日志中的 float 格式化成固定小数位。
+
+    NaN / Inf / 非数值统一显示为 nan。
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+
+    if not math.isfinite(value):
+        return "nan"
+
+    return f"{value:.{digits}f}"
+
+
+def _safe_int(
+    value: Any,
+    default: int = 0,
+) -> int:
+    """
+    安全转 int。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _cfg_get(

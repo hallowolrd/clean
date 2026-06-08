@@ -155,7 +155,7 @@ class FisherOnlyExpertAggregator(Aggregator):
             raise ValueError(
                 "fisher_only 没有收到任何 expert 参数名。"
                 "请确认 param_names 是否来自 self.param_groups.expert，"
-                "以及模型参数名是否包含 experts.<id>。"
+                "以及模型参数名是否包含 experts.。"
             )
 
         if base_state is None:
@@ -251,6 +251,32 @@ class FisherOnlyExpertAggregator(Aggregator):
     def eps(self) -> float:
         """数值稳定项。"""
         return float(_cfg_get(self.expert_fisher_cfg, "eps", 1.0e-8))
+
+    @property
+    def diagnostics_enabled(self) -> bool:
+        """
+        是否生成 fisher_only 诊断字段。
+
+        注意：
+            这个开关只控制 diagnostics 内容是否展开。
+            是否打印到控制台 / train.log 由 server.py 中的 diagnostics_print 控制。
+        """
+        return bool(_cfg_get(self.expert_fisher_cfg, "diagnostics_enabled", True))
+
+    @property
+    def diagnostics_include_records(self) -> bool:
+        """
+        是否在 summary.json 里保存完整 client-expert records 和 expert_weights。
+
+        第一版建议 false，避免日志和 summary.json 太大。
+        """
+        return bool(
+            _cfg_get(
+                self.expert_fisher_cfg,
+                "diagnostics_include_records",
+                False,
+            )
+        )
 
     def _build_expert_records(
         self,
@@ -383,12 +409,33 @@ class FisherOnlyExpertAggregator(Aggregator):
         """
         构建 fisher_only 聚合诊断信息。
 
-        这些信息主要用于确认：
-            1. 每个 expert 有多少有效客户端。
-            2. 哪些 expert 触发 keep_global。
-            3. 每个 expert 的权重是否过尖锐。
-            4. Fisher score 是否正常。
+        第一版诊断目标：
+            1. 看 Fisher evidence 是否有效。
+            2. 看权重是不是接近 uniform。
+            3. 看权重是不是被 active_count 支配。
+            4. 看是否有 expert 因有效客户端不足而 keep_global。
         """
+        num_experts = int(len(expert_record_map))
+        num_fallback_experts = int(
+            sum(1 for value in expert_fallback_map.values() if value)
+        )
+
+        if not self.diagnostics_enabled:
+            return {
+                "method": self.method_name,
+                "param_group": self.param_group_name,
+                "fisher_diag_enabled": False,
+                "num_clients": int(len(client_updates)),
+                "param_count": int(len(param_names)),
+                "num_experts": num_experts,
+                "num_fallback_experts": num_fallback_experts,
+                "fallback_ratio": _safe_divide(
+                    num_fallback_experts,
+                    max(num_experts, 1),
+                ),
+            }
+
+        include_records = self.diagnostics_include_records
         expert_diagnostics: Dict[int, Dict[str, Any]] = {}
 
         for expert_id in sorted(expert_record_map.keys()):
@@ -398,32 +445,81 @@ class FisherOnlyExpertAggregator(Aggregator):
 
             scores = [float(record["score"]) for record in records]
             logits = [float(record["logit"]) for record in records]
-            active_counts = [int(record["active_count"]) for record in records]
+            active_counts = [float(record["active_count"]) for record in records]
+            mean_As = [float(record["mean_A"]) for record in records]
+            mean_Bs = [float(record["mean_B"]) for record in records]
+            fisher_strengths = [
+                float(record["fisher_strength"])
+                for record in records
+            ]
+
+            record_weights = [
+                float(weights.get(int(record["client_id"]), 0.0))
+                for record in records
+            ]
 
             top_client = None
             if len(weights) > 0:
                 top_client = max(weights.items(), key=lambda item: item[1])[0]
 
-            expert_diagnostics[int(expert_id)] = {
+            status_counts = self._count_expert_payload_status(
+                expert_id=expert_id,
+                client_updates=client_updates,
+            )
+
+            weight_entropy = _weight_entropy(weights)
+            weight_entropy_norm = _weight_entropy_norm(weights)
+            effective_clients = _effective_clients(weights)
+            top1_weight, top2_weight, top1_gap = _top_weight_stats(weights)
+
+            expert_diag: Dict[str, Any] = {
                 "fallback": fallback,
                 "fallback_reason": (
                     "valid_clients_lt_min_valid_clients" if fallback else None
                 ),
                 "valid_clients": int(len(records)),
+                "invalid_clients": int(status_counts["invalid_clients"]),
+                "missing_payload_clients": int(status_counts["missing_payload_clients"]),
+                "zero_score_clients": int(status_counts["zero_score_clients"]),
+                "zero_active_clients": int(status_counts["zero_active_clients"]),
+                "nan_score_clients": int(status_counts["nan_score_clients"]),
                 "min_valid_clients": int(self.min_valid_clients),
                 "min_active_count": int(self.min_active_count),
                 "top_client": int(top_client) if top_client is not None else None,
-                "weight_entropy": _weight_entropy(weights),
+                "weight_entropy": float(weight_entropy),
+                "weight_entropy_norm": float(weight_entropy_norm),
+                "effective_clients": float(effective_clients),
                 "weight_min": min(weights.values()) if len(weights) > 0 else 0.0,
                 "weight_max": max(weights.values()) if len(weights) > 0 else 0.0,
-                "weights": {
-                    int(client_id): float(weight)
-                    for client_id, weight in weights.items()
-                },
+                "top1_weight": float(top1_weight),
+                "top2_weight": float(top2_weight),
+                "top1_gap": float(top1_gap),
                 "score_stats": _stat_dict(scores),
                 "logit_stats": _stat_dict(logits),
                 "active_count_stats": _stat_dict(active_counts),
-                "records": [
+                "mean_A_stats": _stat_dict(mean_As),
+                "mean_B_stats": _stat_dict(mean_Bs),
+                "fisher_strength_stats": _stat_dict(fisher_strengths),
+                "score_cv": _coefficient_of_variation(scores),
+                "active_count_cv": _coefficient_of_variation(active_counts),
+                "fisher_strength_cv": _coefficient_of_variation(fisher_strengths),
+                "score_active_corr": _pearson_corr(scores, active_counts),
+                "score_fisher_corr": _pearson_corr(scores, fisher_strengths),
+                "weight_active_corr": _pearson_corr(record_weights, active_counts),
+                "weight_fisher_corr": _pearson_corr(
+                    record_weights,
+                    fisher_strengths,
+                ),
+            }
+
+            if include_records:
+                # 详细 records 第一版默认不保存。
+                # 需要排查单个 client-expert 时，再在 yaml 中打开。
+                expert_diag["weights"] = {
+                    int(client_id): float(weight)
+                    for client_id, weight in weights.items()
+                }
+                expert_diag["records"] = [
                     {
                         "client_id": int(record["client_id"]),
                         "active_count": int(record["active_count"]),
@@ -432,40 +528,160 @@ class FisherOnlyExpertAggregator(Aggregator):
                         "fisher_strength": float(record["fisher_strength"]),
                         "score": float(record["score"]),
                         "logit": float(record["logit"]),
+                        "weight": float(weights.get(int(record["client_id"]), 0.0)),
                     }
                     for record in records
-                ],
-            }
+                ]
 
-        return {
+            expert_diagnostics[int(expert_id)] = expert_diag
+
+        all_expert_diags = list(expert_diagnostics.values())
+        non_fallback_diags = [
+            diag
+            for diag in all_expert_diags
+            if not bool(diag.get("fallback", False))
+        ]
+
+        diagnostics: Dict[str, Any] = {
             "method": self.method_name,
             "param_group": self.param_group_name,
+            "fisher_diag_enabled": True,
+            "diagnostics_include_records": bool(include_records),
             "num_clients": int(len(client_updates)),
             "param_count": int(len(param_names)),
-            "num_experts": int(len(expert_record_map)),
-            "num_fallback_experts": int(
-                sum(1 for value in expert_fallback_map.values() if value)
-            ),
+            "num_experts": num_experts,
+            "num_fallback_experts": num_fallback_experts,
+            "fallback_ratio": _safe_divide(num_fallback_experts, max(num_experts, 1)),
             "fallback_experts": [
                 int(expert_id)
                 for expert_id, fallback in sorted(expert_fallback_map.items())
                 if fallback
             ],
+            "mean_valid_clients": _mean_clean(
+                [diag.get("valid_clients", 0.0) for diag in all_expert_diags]
+            ),
+            "mean_weight_entropy_norm": _mean_clean(
+                [
+                    diag.get("weight_entropy_norm", 0.0)
+                    for diag in non_fallback_diags
+                ]
+            ),
+            "mean_effective_clients": _mean_clean(
+                [
+                    diag.get("effective_clients", 0.0)
+                    for diag in non_fallback_diags
+                ]
+            ),
+            "mean_weight_max": _mean_clean(
+                [
+                    diag.get("weight_max", 0.0)
+                    for diag in non_fallback_diags
+                ]
+            ),
+            "mean_score_cv": _mean_clean(
+                [diag.get("score_cv", 0.0) for diag in all_expert_diags]
+            ),
+            "mean_active_count_cv": _mean_clean(
+                [diag.get("active_count_cv", 0.0) for diag in all_expert_diags]
+            ),
+            "mean_fisher_strength_cv": _mean_clean(
+                [
+                    diag.get("fisher_strength_cv", 0.0)
+                    for diag in all_expert_diags
+                ]
+            ),
+            "mean_weight_active_corr": _mean_clean(
+                [
+                    diag.get("weight_active_corr", 0.0)
+                    for diag in non_fallback_diags
+                ]
+            ),
+            "mean_weight_fisher_corr": _mean_clean(
+                [
+                    diag.get("weight_fisher_corr", 0.0)
+                    for diag in non_fallback_diags
+                ]
+            ),
+            "expert_diagnostics": expert_diagnostics,
+        }
+
+        if include_records:
             # AggregationResult.weights 只能是一套 client 权重。
-            # fisher_only 的真实权重在 expert_diagnostics[expert_id]["weights"] 里。
-            # 这里的 weights 是跨 non-fallback expert 的平均值，仅用于总览诊断。
-            "weights": {
+            # fisher_only 的真实权重在 expert_weights 里。
+            # 这里默认不保存，防止 summary.json 太大。
+            diagnostics["weights"] = {
                 int(client_id): float(weight)
                 for client_id, weight in avg_weights.items()
-            },
-            "expert_weights": {
+            }
+            diagnostics["expert_weights"] = {
                 int(expert_id): {
                     int(client_id): float(weight)
                     for client_id, weight in weights.items()
                 }
                 for expert_id, weights in expert_weight_map.items()
-            },
-            "expert_diagnostics": expert_diagnostics,
+            }
+
+        return diagnostics
+
+    def _count_expert_payload_status(
+        self,
+        expert_id: int,
+        client_updates: Sequence[ClientUpdate],
+    ) -> Dict[str, int]:
+        """
+        统计单个 expert 的原始 payload 状态。
+
+        注意：
+            _build_expert_records() 只保留有效 records。
+            这个函数用于统计被过滤掉的原因，比如 active_count=0 或 score=0。
+        """
+        missing_payload_clients = 0
+        zero_score_clients = 0
+        zero_active_clients = 0
+        nan_score_clients = 0
+        invalid_clients = 0
+
+        for update in client_updates:
+            payload = _get_single_expert_payload(
+                update=update,
+                expert_id=expert_id,
+                strict=False,
+            )
+
+            if payload is None:
+                missing_payload_clients += 1
+                invalid_clients += 1
+                continue
+
+            active_count = _safe_int(payload.get("active_count", 0), default=0)
+            score = _extract_score(payload)
+
+            is_nan_score = not math.isfinite(score)
+            is_zero_score = score <= 0.0
+            is_zero_active = active_count <= 0
+
+            if is_nan_score:
+                nan_score_clients += 1
+
+            if is_zero_score:
+                zero_score_clients += 1
+
+            if is_zero_active:
+                zero_active_clients += 1
+
+            if (
+                active_count < self.min_active_count
+                or is_zero_score
+                or is_nan_score
+            ):
+                invalid_clients += 1
+
+        return {
+            "missing_payload_clients": int(missing_payload_clients),
+            "zero_score_clients": int(zero_score_clients),
+            "zero_active_clients": int(zero_active_clients),
+            "nan_score_clients": int(nan_score_clients),
+            "invalid_clients": int(invalid_clients),
         }
 
 
@@ -684,7 +900,7 @@ def _average_expert_weights(
 
 def _weight_entropy(weights: Mapping[int, float]) -> float:
     """
-    计算归一化前提下的权重熵。
+    计算权重熵。
 
     权重越均匀，熵越大。
     某个客户端支配 expert 时，熵会变小。
@@ -698,6 +914,141 @@ def _weight_entropy(weights: Mapping[int, float]) -> float:
         entropy -= weight * math.log(weight + 1.0e-12)
 
     return float(entropy)
+
+
+def _weight_entropy_norm(weights: Mapping[int, float]) -> float:
+    """
+    计算归一化权重熵。
+
+    含义：
+        接近 1：权重接近 uniform。
+        接近 0：某个客户端强烈支配。
+    """
+    if len(weights) <= 1:
+        return 0.0
+
+    entropy = _weight_entropy(weights)
+    max_entropy = math.log(float(len(weights)) + 1.0e-12)
+
+    return _safe_divide(entropy, max_entropy)
+
+
+def _effective_clients(weights: Mapping[int, float]) -> float:
+    """
+    计算有效客户端数。
+
+    公式：
+        effective_clients = 1 / sum_i w_i^2
+
+    含义：
+        接近参与客户端数：权重接近 uniform。
+        接近 1：单个客户端支配。
+    """
+    if len(weights) == 0:
+        return 0.0
+
+    square_sum = 0.0
+
+    for weight in weights.values():
+        square_sum += float(weight) ** 2
+
+    if square_sum <= 0.0:
+        return 0.0
+
+    return float(1.0 / square_sum)
+
+
+def _top_weight_stats(
+    weights: Mapping[int, float],
+) -> Tuple[float, float, float]:
+    """
+    返回 top1_weight、top2_weight、top1_gap。
+    """
+    if len(weights) == 0:
+        return 0.0, 0.0, 0.0
+
+    sorted_weights = sorted(
+        [float(weight) for weight in weights.values()],
+        reverse=True,
+    )
+
+    top1 = sorted_weights[0]
+    top2 = sorted_weights[1] if len(sorted_weights) >= 2 else 0.0
+
+    return float(top1), float(top2), float(top1 - top2)
+
+
+def _coefficient_of_variation(
+    values: Sequence[Any],
+    eps: float = 1.0e-12,
+) -> float:
+    """
+    计算变异系数 CV = std / abs(mean)。
+
+    用途：
+        判断 score / active_count / fisher_strength 是否有区分度。
+    """
+    clean_values = [
+        float(value)
+        for value in values
+        if _is_finite_number(value)
+    ]
+
+    if len(clean_values) <= 1:
+        return 0.0
+
+    mean = sum(clean_values) / len(clean_values)
+    if abs(mean) <= eps:
+        return 0.0
+
+    var = sum((value - mean) ** 2 for value in clean_values) / len(clean_values)
+    std = math.sqrt(max(var, 0.0))
+
+    return float(std / (abs(mean) + eps))
+
+
+def _pearson_corr(
+    xs: Sequence[Any],
+    ys: Sequence[Any],
+    eps: float = 1.0e-12,
+) -> float:
+    """
+    计算 Pearson 相关系数。
+
+    用途：
+        weight_active_corr:
+            判断权重是否主要由 active_count 控制。
+
+        weight_fisher_corr:
+            判断权重是否真的受 Fisher 强度影响。
+    """
+    clean_pairs = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+        if _is_finite_number(x) and _is_finite_number(y)
+    ]
+
+    if len(clean_pairs) <= 1:
+        return 0.0
+
+    clean_xs = [pair[0] for pair in clean_pairs]
+    clean_ys = [pair[1] for pair in clean_pairs]
+
+    mean_x = sum(clean_xs) / len(clean_xs)
+    mean_y = sum(clean_ys) / len(clean_ys)
+
+    centered_xs = [value - mean_x for value in clean_xs]
+    centered_ys = [value - mean_y for value in clean_ys]
+
+    numerator = sum(x * y for x, y in zip(centered_xs, centered_ys))
+    denom_x = math.sqrt(sum(x * x for x in centered_xs))
+    denom_y = math.sqrt(sum(y * y for y in centered_ys))
+
+    denominator = denom_x * denom_y
+    if denominator <= eps:
+        return 0.0
+
+    return float(numerator / (denominator + eps))
 
 
 def _stat_dict(values: Sequence[Any]) -> Dict[str, float]:
@@ -730,6 +1081,39 @@ def _stat_dict(values: Sequence[Any]) -> Dict[str, float]:
         "min": float(min(clean_values)),
         "max": float(max(clean_values)),
     }
+
+
+def _mean_clean(values: Sequence[Any]) -> float:
+    """
+    对有限数值求平均。
+    """
+    clean_values = [
+        float(value)
+        for value in values
+        if _is_finite_number(value)
+    ]
+
+    if len(clean_values) == 0:
+        return 0.0
+
+    return float(sum(clean_values) / len(clean_values))
+
+
+def _safe_divide(
+    numerator: Any,
+    denominator: Any,
+    default: float = 0.0,
+) -> float:
+    """
+    安全除法。
+    """
+    numerator = _safe_float(numerator, default=0.0)
+    denominator = _safe_float(denominator, default=0.0)
+
+    if denominator == 0.0:
+        return float(default)
+
+    return float(numerator / denominator)
 
 
 def _is_finite_number(value: Any) -> bool:

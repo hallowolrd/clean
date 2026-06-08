@@ -55,6 +55,38 @@ expert_fisher:
   # 数值稳定项。
   eps: 1.0e-8
 
+  # =========================
+  # Fisher-only 诊断日志配置
+  # =========================
+
+  # 是否在 aggregation/fisher_only.py 中生成 Fisher 诊断字段。
+  # 建议开启，这些字段会进入 summary.json，方便后续排查：
+  # - 权重是否接近 uniform
+  # - 是否 active_count 支配
+  # - Fisher strength 是否有区分度
+  # - 是否有 expert 触发 keep_global
+  diagnostics_enabled: true
+
+  # 是否在控制台和 train.log 中打印 Fisher 诊断摘要。
+  diagnostics_print: true
+
+  # 每隔多少轮打印一次 Fisher 诊断。
+  # 1 表示每轮都打印。
+  diagnostics_print_every: 1
+
+  # 是否逐 expert 打印诊断。
+  # 第一版建议 false，只打印 round-level 摘要，避免日志太大。
+  # 如果后面发现某些 expert 异常，再临时改成 true。
+  diagnostics_print_experts: false
+
+  # 是否把每个 client-expert 的完整 records / expert_weights 写入 summary.json。
+  # 第一版建议 false，避免 summary.json 过大。
+  # 如果要精查某一轮每个 expert 的客户端权重，再临时改成 true。
+  diagnostics_include_records: false
+
+  # Fisher 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[FisherDiag]"
+
 
 # =========================
 # 运行配置

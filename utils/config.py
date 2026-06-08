@@ -347,6 +347,32 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["expert_fisher"].setdefault("fallback", "keep_global")
     cfg["expert_fisher"].setdefault("eps", 1.0e-8)
 
+    # Fisher-only 诊断配置。
+    # diagnostics_enabled:
+    #   是否在 aggregation/fisher_only.py 中生成详细诊断字段。
+    #
+    # diagnostics_print:
+    #   是否由 server.py 打印 Fisher 诊断日志到控制台 / train.log。
+    #
+    # diagnostics_print_every:
+    #   每隔多少轮打印一次 Fisher 诊断。
+    #
+    # diagnostics_print_experts:
+    #   是否逐 expert 打印诊断。第一版建议 false，避免日志太大。
+    #
+    # diagnostics_include_records:
+    #   是否把完整 client-expert records / expert_weights 写入 summary.json。
+    #   第一版建议 false，避免文件过大。
+    #
+    # diagnostics_prefix:
+    #   Fisher 诊断日志前缀，方便 grep。
+    cfg["expert_fisher"].setdefault("diagnostics_enabled", True)
+    cfg["expert_fisher"].setdefault("diagnostics_print", True)
+    cfg["expert_fisher"].setdefault("diagnostics_print_every", 1)
+    cfg["expert_fisher"].setdefault("diagnostics_print_experts", False)
+    cfg["expert_fisher"].setdefault("diagnostics_include_records", False)
+    cfg["expert_fisher"].setdefault("diagnostics_prefix", "[FisherDiag]")
+
     # 运行配置
     cfg.setdefault("seed", 42)
     cfg.setdefault("device", "auto")
@@ -629,6 +655,7 @@ def _validate_expert_fisher_config(
         1. 客户端本地训练后额外做 evidence forward + backward
         2. 只对 expert Linear 层统计 K-FAC A / B
         3. 给 fisher_only 聚合器提供 active_count / mean_A / mean_B / score
+        4. 控制 fisher_only 诊断字段生成和日志打印
     """
     expert_fisher_cfg = cfg.get("expert_fisher", {})
 
@@ -664,14 +691,24 @@ def _validate_expert_fisher_config(
         )
 
     min_active_count = expert_fisher_cfg.get("min_active_count", 1)
-    if not isinstance(min_active_count, int) or min_active_count < 0:
+    if not isinstance(min_active_count, int) or isinstance(min_active_count, bool):
+        raise ConfigError(
+            "expert_fisher.min_active_count 必须是非负整数，"
+            f"当前值：{min_active_count}"
+        )
+
+    if min_active_count < 0:
         raise ConfigError(
             "expert_fisher.min_active_count 必须是非负整数，"
             f"当前值：{min_active_count}"
         )
 
     min_valid_clients = expert_fisher_cfg.get("min_valid_clients", 2)
-    if not isinstance(min_valid_clients, int) or min_valid_clients <= 0:
+    if (
+        not isinstance(min_valid_clients, int)
+        or isinstance(min_valid_clients, bool)
+        or min_valid_clients <= 0
+    ):
         raise ConfigError(
             "expert_fisher.min_valid_clients 必须是正整数，"
             f"当前值：{min_valid_clients}"
@@ -679,7 +716,11 @@ def _validate_expert_fisher_config(
 
     max_batches = expert_fisher_cfg.get("max_batches", None)
     if max_batches is not None:
-        if not isinstance(max_batches, int) or max_batches <= 0:
+        if (
+            not isinstance(max_batches, int)
+            or isinstance(max_batches, bool)
+            or max_batches <= 0
+        ):
             raise ConfigError(
                 "expert_fisher.max_batches 如果不为 null，必须是正整数，"
                 f"当前值：{max_batches}"
@@ -691,6 +732,52 @@ def _validate_expert_fisher_config(
             f"expert_fisher.eps 必须大于 0，当前值：{eps}"
         )
 
+    _validate_expert_fisher_diagnostics_config(expert_fisher_cfg)
+
+
+def _validate_expert_fisher_diagnostics_config(
+    expert_fisher_cfg: Mapping[str, Any],
+) -> None:
+    """
+    检查 Fisher-only 诊断配置。
+
+    这些字段主要服务于：
+        1. aggregation/fisher_only.py 生成 diagnostics
+        2. fl/server.py 打印 [FisherDiag] 日志
+    """
+    bool_fields = [
+        "diagnostics_enabled",
+        "diagnostics_print",
+        "diagnostics_print_experts",
+        "diagnostics_include_records",
+    ]
+
+    for key in bool_fields:
+        value = expert_fisher_cfg.get(key)
+
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"expert_fisher.{key} 必须是 bool，当前值：{value}"
+            )
+
+    diagnostics_print_every = expert_fisher_cfg.get("diagnostics_print_every", 1)
+    if (
+        not isinstance(diagnostics_print_every, int)
+        or isinstance(diagnostics_print_every, bool)
+        or diagnostics_print_every <= 0
+    ):
+        raise ConfigError(
+            "expert_fisher.diagnostics_print_every 必须是正整数，"
+            f"当前值：{diagnostics_print_every}"
+        )
+
+    diagnostics_prefix = expert_fisher_cfg.get("diagnostics_prefix", "[FisherDiag]")
+    if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
+        raise ConfigError(
+            "expert_fisher.diagnostics_prefix 必须是非空字符串，"
+            f"当前值：{diagnostics_prefix}"
+        )
+
 
 def _require_positive_int(
     cfg: Mapping[str, Any],
@@ -699,7 +786,7 @@ def _require_positive_int(
     """检查某个字段是否为正整数。"""
     value = cfg.get(key)
 
-    if not isinstance(value, int) or value <= 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ConfigError(f"{key} 必须是正整数，当前值：{value}")
 
 
@@ -710,5 +797,5 @@ def _require_non_negative_int(
     """检查某个字段是否为非负整数。"""
     value = cfg.get(key)
 
-    if not isinstance(value, int) or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ConfigError(f"{key} 必须是非负整数，当前值：{value}")
