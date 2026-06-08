@@ -584,6 +584,18 @@ class FLServer:
             kalman_gain:
                 历史状态更新速度是否过快 / 过慢。
 
+            abs_resid / abs_resid_p90:
+                当前 Fisher observation 和历史预测的偏离幅度。
+                如果 abs_resid 很大但 rho 仍高，说明 robust_c 可能太宽松。
+
+            mu_update:
+                历史状态这一轮实际改变量。
+                如果长期很小，说明历史可能冻结；如果长期很大，说明历史可能乱跳。
+
+            cold_start:
+                age==1 的 client-expert 比例。
+                中后期如果仍然很高，说明很多 client-expert 没有连续有效 evidence。
+
             support:
                 active_count 低支撑降权是否过强。
 
@@ -630,6 +642,10 @@ class FLServer:
             f"rho={_fmt_float(diagnostics.get('mean_rho', 0.0), 3)} | "
             f"rho_p10={_fmt_float(diagnostics.get('mean_rho_p10', 0.0), 3)} | "
             f"K={_fmt_float(diagnostics.get('mean_kalman_gain', 0.0), 3)} | "
+            f"abs_resid={_fmt_float(diagnostics.get('mean_abs_residual', 0.0), 3)} | "
+            f"abs_resid_p90={_fmt_float(diagnostics.get('mean_abs_residual_p90', 0.0), 3)} | "
+            f"mu_update={_fmt_float(diagnostics.get('mean_mu_update_abs', 0.0), 3)} | "
+            f"cold_start={_fmt_float(diagnostics.get('mean_cold_start_frac', 0.0), 3)} | "
             f"support={_fmt_float(diagnostics.get('mean_support', 0.0), 3)} | "
             f"fisher_cv={_fmt_float(diagnostics.get('mean_fisher_strength_cv', 0.0), 3)} | "
             f"active_cv={_fmt_float(diagnostics.get('mean_active_count_cv', 0.0), 3)} | "
@@ -664,6 +680,8 @@ class FLServer:
             rho_stats = expert_diag.get("rho_stats", {})
             gain_stats = expert_diag.get("kalman_gain_stats", {})
             support_stats = expert_diag.get("support_stats", {})
+            abs_residual_stats = expert_diag.get("abs_residual_stats", {})
+            mu_update_abs_stats = expert_diag.get("mu_update_abs_stats", {})
 
             print(
                 f"{prefix}[Round {round_result.round_id:03d}][Expert {expert_id}] "
@@ -677,6 +695,10 @@ class FLServer:
                 f"rho={_fmt_float(rho_stats.get('mean', 0.0), 3)} | "
                 f"rho_p10={_fmt_float(expert_diag.get('rho_p10', 0.0), 3)} | "
                 f"K={_fmt_float(gain_stats.get('mean', 0.0), 3)} | "
+                f"abs_resid={_fmt_float(abs_residual_stats.get('mean', 0.0), 3)} | "
+                f"abs_resid_p90={_fmt_float(expert_diag.get('abs_residual_p90', 0.0), 3)} | "
+                f"mu_update={_fmt_float(mu_update_abs_stats.get('mean', 0.0), 3)} | "
+                f"cold_start={_fmt_float(expert_diag.get('cold_start_frac', 0.0), 3)} | "
                 f"support={_fmt_float(support_stats.get('mean', 0.0), 3)} | "
                 f"fisher_cv={_fmt_float(expert_diag.get('fisher_strength_cv', 0.0), 3)} | "
                 f"active_cv={_fmt_float(expert_diag.get('active_count_cv', 0.0), 3)} | "

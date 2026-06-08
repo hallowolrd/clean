@@ -383,6 +383,7 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
 
             if old_state is None:
                 # 冷启动：第一次有效观测不降权，避免误伤前几轮快速学习。
+                cold_start = True
                 mu_pred = float(z)
                 P_pred = float(self.init_P)
                 residual = 0.0
@@ -394,6 +395,7 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 P_new = float(self.init_P)
                 age = 1.0
             else:
+                cold_start = False
                 mu_old = _safe_float(old_state.get("mu", 0.0), default=0.0)
                 P_old = max(
                     _safe_float(old_state.get("P", self.init_P), default=self.init_P),
@@ -420,6 +422,12 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 P_new = float(max((1.0 - kalman_gain) * P_pred, eps))
                 age = float(age_old + 1.0)
 
+            # 这两个派生量只用于诊断：
+            # abs_residual 避免正负 residual 抵消；
+            # mu_update_abs 直接反映历史状态本轮被改动了多少。
+            abs_residual = abs(float(residual))
+            mu_update_abs = abs(float(mu_new - mu_pred))
+
             expert_states[client_id] = {
                 "mu": float(mu_new),
                 "P": float(P_new),
@@ -445,13 +453,16 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                     "mu_pred": float(mu_pred),
                     "P_pred": float(P_pred),
                     "residual": float(residual),
+                    "abs_residual": float(abs_residual),
                     "d2": float(d2),
                     "rho": float(rho),
                     "R_eff": float(R_eff),
                     "kalman_gain": float(kalman_gain),
                     "mu_new": float(mu_new),
+                    "mu_update_abs": float(mu_update_abs),
                     "P_new": float(P_new),
                     "age": float(age),
+                    "cold_start": bool(cold_start),
                     "current_good": current_good,
                     "history_good": history_good,
                     "state_label": state_label,
@@ -574,6 +585,18 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             gain_values = [float(record.get("kalman_gain", 0.0)) for record in records]
             mu_new_values = [float(record.get("mu_new", 0.0)) for record in records]
             residual_values = [float(record.get("residual", 0.0)) for record in records]
+            abs_residual_values = [
+                float(record.get("abs_residual", abs(float(record.get("residual", 0.0)))))
+                for record in records
+            ]
+            mu_update_abs_values = [
+                float(record.get("mu_update_abs", 0.0))
+                for record in records
+            ]
+            cold_start_values = [
+                1.0 if bool(record.get("cold_start", False)) else 0.0
+                for record in records
+            ]
             ages = [float(record.get("age", 0.0)) for record in records]
 
             record_weights = [
@@ -630,6 +653,10 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 "kalman_gain_stats": _stat_dict(gain_values),
                 "mu_new_stats": _stat_dict(mu_new_values),
                 "residual_stats": _stat_dict(residual_values),
+                "abs_residual_stats": _stat_dict(abs_residual_values),
+                "abs_residual_p90": _percentile_clean(abs_residual_values, 90.0),
+                "mu_update_abs_stats": _stat_dict(mu_update_abs_values),
+                "cold_start_frac": _mean_clean(cold_start_values),
                 "age_stats": _stat_dict(ages),
                 "score_cv": _coefficient_of_variation(scores),
                 "active_count_cv": _coefficient_of_variation(active_counts),
@@ -662,7 +689,10 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                         "kalman_gain": float(record.get("kalman_gain", 0.0)),
                         "mu_pred": float(record.get("mu_pred", 0.0)),
                         "mu_new": float(record.get("mu_new", 0.0)),
+                        "abs_residual": float(record.get("abs_residual", 0.0)),
+                        "mu_update_abs": float(record.get("mu_update_abs", 0.0)),
                         "P_new": float(record.get("P_new", 0.0)),
+                        "cold_start": bool(record.get("cold_start", False)),
                         "state_label": str(record.get("state_label", "unknown")),
                         "logit": float(record.get("logit", 0.0)),
                         "weight": float(
@@ -731,6 +761,24 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             ),
             "mean_rho_p10": _mean_clean(
                 [diag.get("rho_p10", 0.0) for diag in all_expert_diags]
+            ),
+            "mean_abs_residual": _mean_clean(
+                [
+                    diag.get("abs_residual_stats", {}).get("mean", 0.0)
+                    for diag in all_expert_diags
+                ]
+            ),
+            "mean_abs_residual_p90": _mean_clean(
+                [diag.get("abs_residual_p90", 0.0) for diag in all_expert_diags]
+            ),
+            "mean_mu_update_abs": _mean_clean(
+                [
+                    diag.get("mu_update_abs_stats", {}).get("mean", 0.0)
+                    for diag in all_expert_diags
+                ]
+            ),
+            "mean_cold_start_frac": _mean_clean(
+                [diag.get("cold_start_frac", 0.0) for diag in all_expert_diags]
             ),
             "mean_kalman_gain": _mean_clean(
                 [

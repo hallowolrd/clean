@@ -7,3 +7,4 @@ conda activate fl_moe
 CUDA_VISIBLE_DEVICES=2 python train.py --config configs/uniform.yaml
 CUDA_VISIBLE_DEVICES=2 python train.py --config configs/sample_weighted.yaml
 CUDA_VISIBLE_DEVICES=2 python train.py --config configs/fisher_only.yaml
+CUDA_VISIBLE_DEVICES=2 python train.py --config configs/fisher_history_wolf.yaml
