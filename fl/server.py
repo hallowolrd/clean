@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
@@ -99,6 +99,7 @@ class FLServer:
         test_loader: DataLoader,
         device: torch.device | str,
         global_model: Optional[nn.Module] = None,
+        client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
     ) -> None:
         self.cfg = cfg
         self.device = torch.device(device)
@@ -113,17 +114,21 @@ class FLServer:
 
         self.global_model.to("cpu")
 
+        # client_evidence_loaders 用于 expert_fisher / fisher_only：
+        # 客户端本地训练完成后，会额外使用 evidence_loader 做一轮
+        # 无数据增强的 forward + backward 来统计 expert K-FAC。
+        # server 只负责把 evidence_loader 透传给 client，不关心 Fisher 细节。
         self.clients = build_clients(
             cfg=cfg,
             client_loaders=client_loaders,
+            client_evidence_loaders=client_evidence_loaders,
             device=self.device,
         )
 
         self.test_loader = test_loader
+        self.aggregators: AggregatorBundle = build_aggregators(cfg)
 
-        self.aggregators = build_aggregators(cfg)
-
-        self.param_groups = build_param_groups(
+        self.param_groups: ParamGroups = build_param_groups(
             model=self.global_model,
             expected_num_experts=int(_cfg_get(cfg, "num_experts", 0)),
             strict=True,
@@ -196,7 +201,6 @@ class FLServer:
                 eval_result=eval_result,
                 aggregation_info=aggregation_info,
             )
-
             self.round_results.append(round_result)
 
             if log_every > 0 and round_id % log_every == 0:
@@ -224,7 +228,7 @@ class FLServer:
 
         这样可以让二者使用不同聚合器：
             non_expert: sample_weighted / uniform
-            expert: uniform / sample_weighted / 后续 Fisher / Bayes
+            expert: uniform / sample_weighted / fisher_only / 后续 history_wolf
         """
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
@@ -251,7 +255,6 @@ class FLServer:
         )
 
         new_state_dict = expert_result.new_state_dict
-
         check_finite_state_dict(new_state_dict)
 
         self.global_model.load_state_dict(
@@ -308,6 +311,7 @@ class FLServer:
             weighted=True,
             default=None,
         )
+
         avg_train_acc = average_client_metric(
             client_updates=list(client_updates),
             metric_name="train_acc",
@@ -339,6 +343,9 @@ class FLServer:
             groups=self.param_groups,
         )
 
+        expert_fisher_cfg = _cfg_get(self.cfg, "expert_fisher", {})
+        expert_fisher_enabled = bool(_cfg_get(expert_fisher_cfg, "enabled", False))
+
         print()
         print("=" * 80)
         print("[Server] FL training start")
@@ -357,6 +364,7 @@ class FLServer:
             f"non_expert={self.aggregators.non_expert.method_name}, "
             f"expert={self.aggregators.expert.method_name}"
         )
+        print(f"[Server] expert_fisher.enabled: {expert_fisher_enabled}")
         print(f"[Server] param_groups: {self.param_groups.summary()}")
         print(f"[Server] param_numel: {param_summary['floating_numel']}")
         print("=" * 80)
@@ -410,7 +418,7 @@ class FLServer:
         if len(self.param_groups.expert) == 0:
             raise ValueError(
                 "没有找到 expert 参数。"
-                "请检查模型参数名是否包含 experts.<id>。"
+                "请检查模型参数名是否包含 experts.。"
             )
 
         if len(self.param_groups.non_expert) == 0:
@@ -432,15 +440,22 @@ def build_server(
     client_loaders: Sequence[DataLoader],
     test_loader: DataLoader,
     device: torch.device | str,
+    client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
 ) -> FLServer:
     """
     构建 FLServer。
 
     train.py 后面可以直接调用这个函数。
+
+    client_evidence_loaders:
+        可选的客户端 evidence DataLoader 列表。
+        当 expert_fisher.enabled=true 时必须传入，用于客户端训练完成后的
+        expert K-FAC evidence 统计。
     """
     return FLServer(
         cfg=cfg,
         client_loaders=client_loaders,
+        client_evidence_loaders=client_evidence_loaders,
         test_loader=test_loader,
         device=device,
     )

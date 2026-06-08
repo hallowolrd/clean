@@ -127,6 +127,7 @@ def run_training(
     print(
         "[Data] "
         f"train_size={len(dataset_bundle.train_dataset)} | "
+        f"train_evidence_size={len(dataset_bundle.train_evidence_dataset)} | "
         f"test_size={len(dataset_bundle.test_dataset)}"
     )
 
@@ -140,16 +141,26 @@ def run_training(
         output_path=run_dir / "partition_summary.json",
     )
 
+    # train_dataset：
+    #   正常本地训练使用，可以带随机数据增强。
+    #
+    # train_evidence_dataset：
+    #   Fisher / K-FAC evidence pass 使用，不带随机数据增强。
+    #   它和 train_dataset 使用同一份官方训练集，并复用同一份 client_indices。
     loader_bundle = build_dataloaders(
         cfg=cfg,
         train_dataset=dataset_bundle.train_dataset,
+        train_evidence_dataset=dataset_bundle.train_evidence_dataset,
         test_dataset=dataset_bundle.test_dataset,
         client_indices=partition.client_indices,
     )
 
+    # client_evidence_loaders 只负责透传给 client。
+    # server 本身不关心 Fisher / K-FAC 的统计细节，保持极致解耦。
     server = build_server(
         cfg=cfg,
         client_loaders=loader_bundle.client_loaders,
+        client_evidence_loaders=loader_bundle.client_evidence_loaders,
         test_loader=loader_bundle.test_loader,
         device=device,
     )
@@ -215,7 +226,6 @@ def save_train_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_path = output_dir / "summary.json"
-
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(
             make_json_safe(train_result.to_dict()),
@@ -288,7 +298,6 @@ def save_round_results_csv(
                 "test_acc": float(item.test_acc),
                 "best_acc": float(item.best_acc),
             }
-
             writer.writerow(row)
 
 
