@@ -39,7 +39,7 @@ local_epochs: 1
 batch_size: 64
 
 # 服务端测试 batch size
-test_batch_size: 256
+test_batch_size: 64
 
 # DataLoader 使用的子进程数量
 num_workers: 2
@@ -49,8 +49,8 @@ num_workers: 2
 # 模型配置
 # =========================
 
-# 模型名称：当前先支持 resnet_switch_moe
-model: resnet_switch_moe
+# 模型名称：当前先支持 resnet_switch_moe、resnet_sparse_moe_head
+model: resnet_sparse_moe_head
 
 # MoE expert 数量
 num_experts: 4
@@ -85,7 +85,7 @@ agg:
   # 非专家参数聚合方法
   # 包括 backbone / router / classifier / shared layers
   non_expert:
-    method: sample_weighted
+    method: uniform
 
   # 专家参数聚合方法
   # 包括 MoE experts
@@ -98,7 +98,7 @@ agg:
 # =========================
 
 # 随机种子
-seed: 42
+seed: 1
 
 # 设备选择
 # auto 表示代码里自动选择 cuda 或 cpu

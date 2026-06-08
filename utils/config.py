@@ -19,6 +19,7 @@ SUPPORTED_DATASETS = {
 
 SUPPORTED_MODELS = {
     "resnet_switch_moe",
+    "resnet_sparse_moe_head",
 }
 
 SUPPORTED_AGG_METHODS = {
