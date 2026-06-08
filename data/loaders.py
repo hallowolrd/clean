@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
-import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from utils.seed import build_torch_generator, seed_worker
@@ -16,20 +15,31 @@ class DataLoaderBundle:
 
     client_loaders:
         每个客户端对应一个训练 DataLoader。
+        用于正常本地训练，可以来自带随机增强的 train_dataset。
+
+    client_evidence_loaders:
+        每个客户端对应一个 evidence DataLoader。
+        用于本地训练完成后的 Fisher / K-FAC 统计。
+        它和 client_loaders 使用完全相同的样本索引，但数据集 transform 应该不含随机增强。
 
     test_loader:
         服务端测试集 DataLoader。
 
     client_datasets:
-        每个客户端对应的 Subset 数据集。
+        每个客户端对应的训练 Subset 数据集。
+
+    client_evidence_datasets:
+        每个客户端对应的 evidence Subset 数据集。
 
     client_sample_counts:
-        每个客户端的样本数量。
+        每个客户端的训练样本数量。
     """
 
     client_loaders: List[DataLoader]
+    client_evidence_loaders: List[DataLoader]
     test_loader: DataLoader
     client_datasets: List[Subset]
+    client_evidence_datasets: List[Subset]
     client_sample_counts: Dict[int, int]
 
 
@@ -38,36 +48,63 @@ def build_dataloaders(
     train_dataset: Dataset,
     test_dataset: Dataset,
     client_indices: Sequence[Sequence[int]],
+    train_evidence_dataset: Optional[Dataset] = None,
 ) -> DataLoaderBundle:
     """
     根据客户端样本索引构建 DataLoader。
 
     这个函数只负责：
         1. 把 train_dataset 切成多个客户端 Subset
-        2. 为每个客户端创建训练 DataLoader
-        3. 为服务端创建测试 DataLoader
+        2. 把 train_evidence_dataset 切成多个客户端 evidence Subset
+        3. 为每个客户端创建训练 DataLoader
+        4. 为每个客户端创建 evidence DataLoader
+        5. 为服务端创建测试 DataLoader
 
     不负责：
         1. 加载原始数据集
         2. 生成 Dirichlet 划分
         3. 本地训练
-        4. 参数聚合
+        4. Fisher / K-FAC 统计
+        5. 参数聚合
+
+    注意：
+        train_evidence_dataset 应该和 train_dataset 对应同一份官方训练集，
+        但 transform 不使用随机增强。
+        它会复用完全相同的 client_indices，保证 evidence pass 和本地训练看的是同一批样本。
     """
     batch_size = int(cfg.batch_size)
     test_batch_size = int(cfg.test_batch_size)
     num_workers = int(cfg.num_workers)
     seed = int(cfg.seed)
-
     pin_memory = _infer_pin_memory(cfg)
+
+    # 如果上层暂时没有传入 train_evidence_dataset，则退回 train_dataset。
+    # 这样可以兼容旧调用路径；但 Fisher/K-FAC evidence pass 推荐显式传入无增强数据集。
+    if train_evidence_dataset is None:
+        train_evidence_dataset = train_dataset
 
     client_datasets = build_client_datasets(
         train_dataset=train_dataset,
         client_indices=client_indices,
     )
 
+    client_evidence_datasets = build_client_datasets(
+        train_dataset=train_evidence_dataset,
+        client_indices=client_indices,
+    )
+
     client_loaders = build_client_train_loaders(
         cfg=cfg,
         client_datasets=client_datasets,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        seed=seed,
+    )
+
+    client_evidence_loaders = build_client_evidence_loaders(
+        cfg=cfg,
+        client_evidence_datasets=client_evidence_datasets,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -89,8 +126,10 @@ def build_dataloaders(
 
     return DataLoaderBundle(
         client_loaders=client_loaders,
+        client_evidence_loaders=client_evidence_loaders,
         test_loader=test_loader,
         client_datasets=client_datasets,
+        client_evidence_datasets=client_evidence_datasets,
         client_sample_counts=client_sample_counts,
     )
 
@@ -103,6 +142,7 @@ def build_client_datasets(
     根据 client_indices 创建客户端 Subset。
 
     每个客户端只看到自己对应的训练样本。
+    evidence dataset 也会复用同一组 client_indices，保证样本划分一致。
     """
     client_datasets: List[Subset] = []
 
@@ -155,10 +195,61 @@ def build_client_train_loaders(
             generator=generator,
             persistent_workers=persistent_workers,
         )
-
         client_loaders.append(loader)
 
     return client_loaders
+
+
+def build_client_evidence_loaders(
+    cfg: Any,
+    client_evidence_datasets: Sequence[Dataset],
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    seed: int,
+) -> List[DataLoader]:
+    """
+    为每个客户端创建 Fisher / K-FAC evidence DataLoader。
+
+    evidence_loader 用于客户端本地训练完成后的额外 forward + backward 统计：
+        - 不做 optimizer.step
+        - 不用于模型训练
+        - 只用于 expert K-FAC evidence 统计
+
+    这里固定：
+        shuffle=False
+        drop_last=False
+
+    原因：
+        evidence pass 需要尽量确定、稳定。
+        随机数据增强已经在 data/datasets.py 的 train_evidence_dataset 中关闭；
+        这里再关闭 shuffle，保证每轮 evidence 统计顺序稳定。
+    """
+    client_evidence_loaders: List[DataLoader] = []
+
+    persistent_workers = num_workers > 0
+
+    # evidence loader 使用和训练 loader 不同的 generator seed。
+    # 虽然这里 shuffle=False，但 worker 内部如果涉及随机性，仍然保持可复现。
+    evidence_seed_offset = int(_cfg_get(cfg, "evidence_seed_offset", 100000))
+
+    for client_id, client_evidence_dataset in enumerate(client_evidence_datasets):
+        generator = build_torch_generator(seed + evidence_seed_offset + client_id)
+
+        loader = DataLoader(
+            client_evidence_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+            worker_init_fn=seed_worker,
+            generator=generator,
+            persistent_workers=persistent_workers,
+        )
+        client_evidence_loaders.append(loader)
+
+    return client_evidence_loaders
 
 
 def build_test_loader(

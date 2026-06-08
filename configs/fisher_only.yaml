@@ -1,0 +1,63 @@
+# 继承基础配置，只覆盖 fisher_only 实验必须修改的字段
+include: base.yaml
+
+
+# =========================
+# 聚合配置
+# =========================
+agg:
+  # 非专家参数聚合方法
+  # 保持和普通 FedAvg 主干一致，不让 Fisher 影响 backbone / router / classifier。
+  non_expert:
+    method: sample_weighted
+
+  # 专家参数聚合方法
+  # fisher_only 只作用于 MoE experts 参数。
+  expert:
+    method: fisher_only
+
+
+# =========================
+# Expert Fisher / K-FAC evidence 配置
+# =========================
+expert_fisher:
+  # 开启客户端本地训练完成后的 expert K-FAC 统计。
+  # 如果 agg.expert.method=fisher_only，这里必须为 true。
+  enabled: true
+
+  # 统计 Fisher 时使用 eval 模式。
+  # 注意：eval 只关闭 Dropout / BN 更新，不会关闭 Dataset 里的随机增强；
+  # 随机增强已经通过 train_evidence_dataset 单独关闭。
+  model_mode: eval
+
+  # Linear 层有 bias 时，把 bias 合进 A 统计。
+  # 即输入激活 a 末尾拼一列 1。
+  include_bias: true
+
+  # evidence pass 的 loss 使用 sum。
+  # 这样不会因为最后一个 batch 较小导致梯度尺度被 batch mean 影响。
+  loss_reduction: sum
+
+  # 默认完整跑完客户端本地 evidence_loader。
+  # 如果只想 smoke 测试，可以临时改成 1 / 2。
+  max_batches: null
+
+  # expert 至少 routed 到多少 token / sample，才认为这个 client-expert evidence 有效。
+  min_active_count: 1
+
+  # 每个 expert 至少需要多少个有效客户端。
+  # 少于这个数量时，该 expert 本轮 keep_global。
+  min_valid_clients: 2
+
+  # 有效客户端不足时保留旧全局 expert。
+  fallback: keep_global
+
+  # 数值稳定项。
+  eps: 1.0e-8
+
+
+# =========================
+# 运行配置
+# =========================
+# auto 会自动根据 dataset / model / agg method / seed 等生成目录名。
+run_name: auto

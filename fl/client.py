@@ -3,13 +3,14 @@ from __future__ import annotations
 import copy
 import gc
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from fl.expert_kfac import collect_expert_kfac_stats
 from fl.types import ClientUpdate
 from utils.eval import extract_logits, unpack_batch
 from utils.state_dict_ops import (
@@ -60,8 +61,9 @@ class FLClient:
     职责：
         1. 接收 server 下发的 global_model
         2. 在自己的 train_loader 上本地训练
-        3. 计算 local_model 相对 global_model 的参数变化量
-        4. 返回 ClientUpdate
+        3. 如果启用 expert_fisher，则在本地训练完成后额外做一轮 evidence pass
+        4. 计算 local_model 相对 global_model 的参数变化量
+        5. 返回 ClientUpdate
 
     不负责：
         1. 选择客户端
@@ -76,14 +78,24 @@ class FLClient:
         train_loader: DataLoader,
         cfg: Any,
         device: torch.device | str,
+        evidence_loader: Optional[DataLoader] = None,
     ) -> None:
         self.client_id = int(client_id)
         self.train_loader = train_loader
+
+        # evidence_loader 用于本地训练完成后的 Fisher / K-FAC 统计。
+        # 它应该和 train_loader 使用同一批样本索引，但 transform 不包含随机数据增强。
+        # 如果没有传入，则后面会根据 expert_fisher.enabled 决定是否报错。
+        self.evidence_loader = evidence_loader
+
         self.cfg = cfg
         self.device = torch.device(device)
 
         if len(self.train_loader.dataset) <= 0:
             raise ValueError(f"客户端 {self.client_id} 的数据集为空。")
+
+        if self.evidence_loader is not None and len(self.evidence_loader.dataset) <= 0:
+            raise ValueError(f"客户端 {self.client_id} 的 evidence 数据集为空。")
 
     @property
     def num_samples(self) -> int:
@@ -109,7 +121,7 @@ class FLClient:
 
         返回：
             ClientUpdate:
-                包含 model_delta、num_samples、metrics 等信息。
+                包含 model_delta、num_samples、metrics、extra 等信息。
         """
         global_state_cpu = state_dict_to(
             global_model.state_dict(),
@@ -139,6 +151,48 @@ class FLClient:
             grad_clip=grad_clip,
         )
 
+        extra: Dict[str, Any] = {
+            "optimizer": get_optimizer_type(self.cfg),
+            "local_epochs": int(local_epochs),
+            "grad_clip": float(grad_clip) if grad_clip is not None else None,
+        }
+
+        # 本地训练完成后，额外进行一轮 expert K-FAC evidence pass。
+        #
+        # 注意：
+        #   1. 这里不做 optimizer.step。
+        #   2. 这里不使用 torch.no_grad，因为需要 backward hook 统计 B。
+        #   3. collect_expert_kfac_stats 内部会根据配置切换 eval / train 模式。
+        #   4. 推荐 evidence_loader 使用无随机增强的数据集。
+        #   5. 统计结果通过 ClientUpdate.extra["expert_kfac"] 上传给服务端聚合器。
+        if _is_expert_fisher_enabled(self.cfg):
+            if self.evidence_loader is None:
+                raise ValueError(
+                    "expert_fisher.enabled=true，但客户端没有 evidence_loader。"
+                    "请在 data/loaders.py 中构建 client_evidence_loaders，"
+                    "并在 build_clients(...) 时传入。"
+                )
+
+            expert_kfac = collect_expert_kfac_stats(
+                model=local_model,
+                evidence_loader=self.evidence_loader,
+                device=self.device,
+                cfg=self.cfg,
+            )
+            extra["expert_kfac"] = expert_kfac
+
+            # 记录轻量摘要，方便日志查看。
+            # 完整的 expert_kfac payload 仍然保存在 extra["expert_kfac"]。
+            kfac_meta = expert_kfac.get("meta", {})
+            extra["expert_kfac_summary"] = {
+                "num_experts": int(kfac_meta.get("num_experts", 0)),
+                "num_active_experts": int(kfac_meta.get("num_active_experts", 0)),
+                "num_expert_layers": int(kfac_meta.get("num_expert_layers", 0)),
+                "total_batches": int(kfac_meta.get("total_batches", 0)),
+                "total_samples": int(kfac_meta.get("total_samples", 0)),
+                "avg_loss": float(kfac_meta.get("avg_loss", 0.0)),
+            }
+
         local_state_cpu = state_dict_to(
             local_model.state_dict(),
             device="cpu",
@@ -149,7 +203,6 @@ class FLClient:
             global_state=global_state_cpu,
             strict=True,
         )
-
         check_finite_state_dict(model_delta)
 
         update = ClientUpdate(
@@ -158,18 +211,14 @@ class FLClient:
             num_samples=self.num_samples,
             model_delta=model_delta,
             metrics=stats.to_metrics(),
-            extra={
-                "optimizer": get_optimizer_type(self.cfg),
-                "local_epochs": int(local_epochs),
-                "grad_clip": float(grad_clip) if grad_clip is not None else None,
-            },
+            extra=extra,
         )
 
         del local_model
         del optimizer
         del criterion
-        gc.collect()
 
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -211,7 +260,6 @@ def train_local_model(
     for _ in range(local_epochs):
         for batch in train_loader:
             images, targets = unpack_batch(batch)
-
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -219,8 +267,8 @@ def train_local_model(
 
             outputs = model(images)
             logits = extract_logits(outputs)
-
             loss = criterion(logits, targets)
+
             loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
@@ -277,7 +325,6 @@ def build_optimizer(
         adamw
     """
     optimizer_type = get_optimizer_type(cfg)
-
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
 
     lr = float(_cfg_get(optimizer_cfg, "lr", 0.01))
@@ -348,6 +395,7 @@ def build_clients(
     cfg: Any,
     client_loaders: Sequence[DataLoader],
     device: torch.device | str,
+    client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
 ) -> List[FLClient]:
     """
     根据客户端 DataLoader 列表创建 FLClient 列表。
@@ -357,18 +405,42 @@ def build_clients(
             全局配置。
 
         client_loaders:
-            每个客户端对应一个 DataLoader。
+            每个客户端对应一个训练 DataLoader。
 
         device:
             本地训练使用的设备。
+
+        client_evidence_loaders:
+            每个客户端对应一个 evidence DataLoader。
+            用于本地训练完成后的 Fisher / K-FAC 统计。
+            如果 expert_fisher.enabled=true，则必须传入。
     """
     clients: List[FLClient] = []
 
+    if client_evidence_loaders is not None:
+        if len(client_evidence_loaders) != len(client_loaders):
+            raise ValueError(
+                "client_evidence_loaders 数量必须和 client_loaders 一致。"
+                f"当前 len(client_loaders)={len(client_loaders)}, "
+                f"len(client_evidence_loaders)={len(client_evidence_loaders)}"
+            )
+
+    if _is_expert_fisher_enabled(cfg) and client_evidence_loaders is None:
+        raise ValueError(
+            "expert_fisher.enabled=true，但 build_clients 没有收到 "
+            "client_evidence_loaders。"
+        )
+
     for client_id, train_loader in enumerate(client_loaders):
+        evidence_loader = None
+        if client_evidence_loaders is not None:
+            evidence_loader = client_evidence_loaders[client_id]
+
         clients.append(
             FLClient(
                 client_id=client_id,
                 train_loader=train_loader,
+                evidence_loader=evidence_loader,
                 cfg=cfg,
                 device=device,
             )
@@ -443,16 +515,17 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     读取梯度裁剪配置。
 
     支持两种写法：
-        optimizer:
-          grad_clip: 5.0
+
+    optimizer:
+      grad_clip: 5.0
 
     或者：
-        grad_clip: 5.0
+
+    grad_clip: 5.0
 
     如果没有配置，则返回 None。
     """
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
-
     value = _cfg_get(
         optimizer_cfg,
         "grad_clip",
@@ -477,6 +550,19 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     return value
 
 
+def _is_expert_fisher_enabled(cfg: Any) -> bool:
+    """
+    判断是否启用客户端 expert Fisher / K-FAC evidence 统计。
+
+    配置示例：
+
+    expert_fisher:
+      enabled: true
+    """
+    expert_fisher_cfg = _cfg_get(cfg, "expert_fisher", {})
+    return bool(_cfg_get(expert_fisher_cfg, "enabled", False))
+
+
 def _cfg_get(
     cfg: Any,
     key: str,
@@ -491,6 +577,9 @@ def _cfg_get(
     普通对象:
         getattr(cfg, key, default)
     """
+    if cfg is None:
+        return default
+
     if hasattr(cfg, "get"):
         return cfg.get(key, default)
 

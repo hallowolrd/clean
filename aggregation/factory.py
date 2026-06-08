@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aggregation.base import Aggregator, get_aggregation_method
+from aggregation.fisher_only import FisherOnlyExpertAggregator
 from aggregation.sample_weighted import SampleWeightedAggregator
 from aggregation.uniform import UniformAggregator
 
@@ -40,17 +41,25 @@ def build_aggregator(
 
         method:
             聚合方法名称。
+
             当前支持：
                 uniform
                 sample_weighted
+                fisher_only
+
+            注意：
+                fisher_only 是 expert-wise 聚合方法。
+                它依赖客户端上传的 extra["expert_kfac"]，
+                因此只允许用于 expert 参数组。
 
         param_group_name:
             当前聚合器负责的参数组。
+
             当前支持：
                 non_expert
                 expert
     """
-    method = str(method).lower()
+    method = str(method).lower().strip()
 
     if param_group_name not in {"non_expert", "expert"}:
         raise ValueError(
@@ -70,9 +79,21 @@ def build_aggregator(
             param_group_name=param_group_name,
         )
 
+    if method == "fisher_only":
+        if param_group_name != "expert":
+            raise ValueError(
+                "fisher_only 只能用于 expert 参数组。"
+                "non_expert 参数请继续使用 uniform 或 sample_weighted。"
+            )
+
+        return FisherOnlyExpertAggregator(
+            cfg=cfg,
+            param_group_name=param_group_name,
+        )
+
     raise ValueError(
         f"不支持的聚合方法：{method}。"
-        "当前支持：uniform, sample_weighted"
+        "当前支持：uniform, sample_weighted, fisher_only"
     )
 
 
@@ -81,12 +102,20 @@ def build_aggregators(cfg: Any) -> AggregatorBundle:
     根据配置创建非专家参数聚合器和专家参数聚合器。
 
     配置格式：
-        agg:
-          non_expert:
-            method: sample_weighted
 
-          expert:
-            method: uniform
+    agg:
+      non_expert:
+        method: sample_weighted
+      expert:
+        method: uniform
+
+    或者：
+
+    agg:
+      non_expert:
+        method: sample_weighted
+      expert:
+        method: fisher_only
 
     返回：
         AggregatorBundle(
@@ -98,6 +127,7 @@ def build_aggregators(cfg: Any) -> AggregatorBundle:
         cfg=cfg,
         param_group_name="non_expert",
     )
+
     expert_method = get_aggregation_method(
         cfg=cfg,
         param_group_name="expert",
@@ -127,6 +157,9 @@ def build_non_expert_aggregator(cfg: Any) -> Aggregator:
 
     一般 server.py 里更推荐直接用 build_aggregators()。
     这个函数主要用于测试或调试。
+
+    注意：
+        fisher_only 不允许用于 non_expert 参数组。
     """
     method = get_aggregation_method(
         cfg=cfg,

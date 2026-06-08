@@ -25,6 +25,7 @@ SUPPORTED_MODELS = {
 SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
+    "fisher_only",
 }
 
 
@@ -141,7 +142,10 @@ def load_config(config_path: str | Path) -> ConfigNode:
     return ConfigNode(raw_cfg)
 
 
-def save_config(cfg: ConfigNode | Mapping[str, Any], output_path: str | Path) -> None:
+def save_config(
+    cfg: ConfigNode | Mapping[str, Any],
+    output_path: str | Path,
+) -> None:
     """
     保存最终配置。
 
@@ -179,10 +183,14 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         run_dir = Path(cfg["run_dir"])
 
     run_dir.mkdir(parents=True, exist_ok=True)
+
     return run_dir
 
 
-def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = None) -> Dict[str, Any]:
+def _load_yaml_with_include(
+    config_path: Path,
+    stack: Optional[list[Path]] = None,
+) -> Dict[str, Any]:
     """
     读取 yaml，并处理 include。
 
@@ -213,6 +221,7 @@ def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = Non
         raise ConfigError(f"配置文件顶层必须是 dict：{config_path}")
 
     cfg = dict(cfg)
+
     include = cfg.pop("include", None)
 
     if include is None:
@@ -235,8 +244,9 @@ def _load_yaml_with_include(config_path: Path, stack: Optional[list[Path]] = Non
         )
         merged_cfg = _deep_merge(merged_cfg, base_cfg)
 
-    # 当前配置覆盖 include 进来的配置
+    # 当前配置覆盖 include 进来的配置。
     merged_cfg = _deep_merge(merged_cfg, cfg)
+
     return merged_cfg
 
 
@@ -280,6 +290,11 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("dataset", "cifar10")
     cfg.setdefault("data_root", "./data")
     cfg.setdefault("num_classes", _infer_num_classes(cfg["dataset"]))
+    cfg.setdefault("download_data", True)
+
+    # 正常训练集是否使用随机数据增强。
+    # Fisher / K-FAC evidence 数据集会单独强制关闭随机增强。
+    cfg.setdefault("data_augmentation", True)
 
     # 联邦学习配置
     cfg.setdefault("num_clients", 10)
@@ -292,6 +307,12 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("batch_size", 64)
     cfg.setdefault("test_batch_size", 256)
     cfg.setdefault("num_workers", 2)
+    cfg.setdefault("drop_last", False)
+    cfg.setdefault("pin_memory", None)
+
+    # evidence loader 的 worker 随机种子偏移。
+    # 虽然 evidence_loader 默认 shuffle=False，但 worker 内部仍可能涉及随机性。
+    cfg.setdefault("evidence_seed_offset", 100000)
 
     # 模型配置
     cfg.setdefault("model", "resnet_switch_moe")
@@ -307,12 +328,24 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # 聚合配置
     cfg.setdefault("agg", {})
-
     cfg["agg"].setdefault("non_expert", {})
     cfg["agg"]["non_expert"].setdefault("method", "sample_weighted")
-
     cfg["agg"].setdefault("expert", {})
     cfg["agg"]["expert"].setdefault("method", "uniform")
+
+    # Expert Fisher / K-FAC evidence 配置。
+    # 只有 expert_fisher.enabled=true 时，客户端本地训练完成后才会额外执行
+    # evidence forward + backward 统计 expert K-FAC。
+    cfg.setdefault("expert_fisher", {})
+    cfg["expert_fisher"].setdefault("enabled", False)
+    cfg["expert_fisher"].setdefault("model_mode", "eval")
+    cfg["expert_fisher"].setdefault("include_bias", True)
+    cfg["expert_fisher"].setdefault("loss_reduction", "sum")
+    cfg["expert_fisher"].setdefault("max_batches", None)
+    cfg["expert_fisher"].setdefault("min_active_count", 1)
+    cfg["expert_fisher"].setdefault("min_valid_clients", 2)
+    cfg["expert_fisher"].setdefault("fallback", "keep_global")
+    cfg["expert_fisher"].setdefault("eps", 1.0e-8)
 
     # 运行配置
     cfg.setdefault("seed", 42)
@@ -360,7 +393,6 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
         run_name = _safe_name(raw_run_name)
 
     output_dir = Path(cfg.get("output_dir", "outputs"))
-
     unique_name = bool(cfg.get("run", {}).get("unique_name", True))
     overwrite = bool(cfg.get("run", {}).get("overwrite", False))
 
@@ -379,6 +411,7 @@ def _is_auto_run_name(value: Any) -> bool:
         return True
 
     text = str(value).strip().lower()
+
     return text in {
         "",
         "auto",
@@ -404,11 +437,9 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     seed = _safe_name(cfg.get("seed", "seed"))
 
     agg_cfg = cfg.get("agg", {})
-
     non_expert_method = _safe_name(
         agg_cfg.get("non_expert", {}).get("method", "non_expert")
     )
-
     expert_method = _safe_name(
         agg_cfg.get("expert", {}).get("method", "expert")
     )
@@ -437,7 +468,6 @@ def _safe_name(value: Any) -> str:
         cuda:0 -> cuda_0
     """
     text = str(value).strip()
-
     text = text.replace(".", "p")
     text = text.replace("-", "m")
     text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
@@ -446,7 +476,10 @@ def _safe_name(value: Any) -> str:
     return text.strip("_")
 
 
-def _make_unique_run_name(run_name: str, output_dir: Path) -> str:
+def _make_unique_run_name(
+    run_name: str,
+    output_dir: Path,
+) -> str:
     """
     如果输出目录已存在，自动追加版本号。
 
@@ -473,7 +506,7 @@ def _infer_num_classes(dataset: str) -> int:
     if dataset == "cifar100":
         return 100
 
-    # 对未知数据集先返回 10，真正合法性检查在 _validate_config 里做
+    # 对未知数据集先返回 10，真正合法性检查在 _validate_config 里做。
     return 10
 
 
@@ -481,8 +514,8 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     """
     基础合法性检查。
 
-    这个函数只检查通用配置。
-    后面新增 Fisher / history / Bayes 时，可以继续拆出新的 validate 函数。
+    这个函数只检查通用配置和当前已接入的 expert_fisher 配置。
+    后面新增 history / Bayes 时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
     if dataset not in SUPPORTED_DATASETS:
@@ -499,7 +532,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     agg_cfg = cfg.get("agg", {})
-
     non_expert_method = agg_cfg.get("non_expert", {}).get("method")
     expert_method = agg_cfg.get("expert", {}).get("method")
 
@@ -513,6 +545,14 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             f"不支持的专家参数聚合方法：{expert_method}。"
             f"当前支持：{sorted(SUPPORTED_AGG_METHODS)}"
+        )
+
+    # fisher_only 是 expert-wise 权重聚合，只能用于 expert 参数组。
+    # non_expert 参数仍然应该使用 uniform / sample_weighted。
+    if non_expert_method == "fisher_only":
+        raise ConfigError(
+            "fisher_only 只能用于 agg.expert.method，"
+            "不能用于 agg.non_expert.method。"
         )
 
     _require_positive_int(cfg, "num_classes")
@@ -555,6 +595,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
 
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_type = optimizer_cfg.get("type")
+
     if optimizer_type not in {"sgd", "adam", "adamw"}:
         raise ConfigError(
             f"不支持的优化器：{optimizer_type}。"
@@ -571,8 +612,90 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
         )
 
+    _validate_expert_fisher_config(
+        cfg=cfg,
+        expert_method=expert_method,
+    )
 
-def _require_positive_int(cfg: Mapping[str, Any], key: str) -> None:
+
+def _validate_expert_fisher_config(
+    cfg: Mapping[str, Any],
+    expert_method: str,
+) -> None:
+    """
+    检查 expert_fisher 配置。
+
+    expert_fisher 用于：
+        1. 客户端本地训练后额外做 evidence forward + backward
+        2. 只对 expert Linear 层统计 K-FAC A / B
+        3. 给 fisher_only 聚合器提供 active_count / mean_A / mean_B / score
+    """
+    expert_fisher_cfg = cfg.get("expert_fisher", {})
+
+    if not isinstance(expert_fisher_cfg, Mapping):
+        raise ConfigError("expert_fisher 必须是一个 dict。")
+
+    enabled = bool(expert_fisher_cfg.get("enabled", False))
+
+    if expert_method == "fisher_only" and not enabled:
+        raise ConfigError(
+            "agg.expert.method=fisher_only 时，必须设置 "
+            "expert_fisher.enabled=true。"
+        )
+
+    model_mode = str(expert_fisher_cfg.get("model_mode", "eval")).lower()
+    if model_mode not in {"eval", "train"}:
+        raise ConfigError(
+            f"expert_fisher.model_mode 只支持 eval / train，当前值：{model_mode}"
+        )
+
+    loss_reduction = str(expert_fisher_cfg.get("loss_reduction", "sum")).lower()
+    if loss_reduction not in {"sum", "mean"}:
+        raise ConfigError(
+            "expert_fisher.loss_reduction 只支持 sum / mean，"
+            f"当前值：{loss_reduction}"
+        )
+
+    fallback = str(expert_fisher_cfg.get("fallback", "keep_global")).lower()
+    if fallback not in {"keep_global"}:
+        raise ConfigError(
+            "expert_fisher.fallback 当前只支持 keep_global，"
+            f"当前值：{fallback}"
+        )
+
+    min_active_count = expert_fisher_cfg.get("min_active_count", 1)
+    if not isinstance(min_active_count, int) or min_active_count < 0:
+        raise ConfigError(
+            "expert_fisher.min_active_count 必须是非负整数，"
+            f"当前值：{min_active_count}"
+        )
+
+    min_valid_clients = expert_fisher_cfg.get("min_valid_clients", 2)
+    if not isinstance(min_valid_clients, int) or min_valid_clients <= 0:
+        raise ConfigError(
+            "expert_fisher.min_valid_clients 必须是正整数，"
+            f"当前值：{min_valid_clients}"
+        )
+
+    max_batches = expert_fisher_cfg.get("max_batches", None)
+    if max_batches is not None:
+        if not isinstance(max_batches, int) or max_batches <= 0:
+            raise ConfigError(
+                "expert_fisher.max_batches 如果不为 null，必须是正整数，"
+                f"当前值：{max_batches}"
+            )
+
+    eps = float(expert_fisher_cfg.get("eps", 1.0e-8))
+    if eps <= 0:
+        raise ConfigError(
+            f"expert_fisher.eps 必须大于 0，当前值：{eps}"
+        )
+
+
+def _require_positive_int(
+    cfg: Mapping[str, Any],
+    key: str,
+) -> None:
     """检查某个字段是否为正整数。"""
     value = cfg.get(key)
 
@@ -580,7 +703,10 @@ def _require_positive_int(cfg: Mapping[str, Any], key: str) -> None:
         raise ConfigError(f"{key} 必须是正整数，当前值：{value}")
 
 
-def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
+def _require_non_negative_int(
+    cfg: Mapping[str, Any],
+    key: str,
+) -> None:
     """检查某个字段是否为非负整数。"""
     value = cfg.get(key)
 

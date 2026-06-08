@@ -32,12 +32,25 @@ class DatasetBundle:
     """
     数据集打包结果。
 
-    这里只保存原始 train / test dataset。
+    这里只保存原始 train / evidence / test dataset。
     客户端划分和 DataLoader 构建不要放在这里。
+
+    train_dataset:
+        正常本地训练使用的数据集，可以带随机数据增强。
+
+    train_evidence_dataset:
+        Fisher / K-FAC evidence pass 使用的数据集。
+        它和 train_dataset 使用同一份官方训练集，但 transform 不包含随机增强。
+        这样客户端本地训练完成后额外做 forward + backward 统计 Fisher 时，
+        不会因为 RandomCrop / RandomHorizontalFlip 导致 evidence 统计不稳定。
+
+    test_dataset:
+        服务端测试集，不使用随机增强。
     """
 
     name: str
     train_dataset: Any
+    train_evidence_dataset: Any
     test_dataset: Any
     num_classes: int
     input_shape: Tuple[int, int, int]
@@ -48,15 +61,20 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     根据配置构建数据集。
 
     输入：
-        cfg:
-            全局配置对象，需要至少包含：
-                cfg.dataset
-                cfg.data_root
+        cfg: 全局配置对象，需要至少包含：
+            cfg.dataset
+            cfg.data_root
 
     输出：
         DatasetBundle:
             train_dataset:
                 原始训练集，后续会交给 data/partition.py 划分给客户端。
+                这个数据集用于正常本地训练，可以使用随机数据增强。
+
+            train_evidence_dataset:
+                原始训练集的无随机增强版本。
+                后续使用同一份 client_indices 划分给客户端，用于本地训练完成后的
+                Fisher / K-FAC evidence pass。
 
             test_dataset:
                 服务端测试集。
@@ -82,6 +100,15 @@ def build_datasets(cfg: Any) -> DatasetBundle:
         dataset_name=dataset_name,
         use_augmentation=_cfg_get(cfg, "data_augmentation", True),
     )
+
+    # evidence transform 固定不使用随机增强。
+    # 目的：客户端本地训练完成后额外做一轮 Fisher/K-FAC 统计时，
+    # 输入数据保持确定，避免随机裁剪/翻转污染 evidence。
+    train_evidence_transform = build_train_transform(
+        dataset_name=dataset_name,
+        use_augmentation=False,
+    )
+
     test_transform = build_test_transform(dataset_name=dataset_name)
 
     download = bool(_cfg_get(cfg, "download_data", True))
@@ -93,6 +120,14 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             transform=train_transform,
             download=download,
         )
+
+        train_evidence_dataset = datasets.CIFAR10(
+            root=str(data_root),
+            train=True,
+            transform=train_evidence_transform,
+            download=download,
+        )
+
         test_dataset = datasets.CIFAR10(
             root=str(data_root),
             train=False,
@@ -107,6 +142,14 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             transform=train_transform,
             download=download,
         )
+
+        train_evidence_dataset = datasets.CIFAR100(
+            root=str(data_root),
+            train=True,
+            transform=train_evidence_transform,
+            download=download,
+        )
+
         test_dataset = datasets.CIFAR100(
             root=str(data_root),
             train=False,
@@ -121,6 +164,7 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     return DatasetBundle(
         name=dataset_name,
         train_dataset=train_dataset,
+        train_evidence_dataset=train_evidence_dataset,
         test_dataset=test_dataset,
         num_classes=int(info["num_classes"]),
         input_shape=tuple(info["input_shape"]),
@@ -143,6 +187,10 @@ def build_train_transform(
     如果 use_augmentation=False，则只使用：
         ToTensor
         Normalize
+
+    注意：
+        train_evidence_dataset 会调用 use_augmentation=False。
+        这样 Fisher / K-FAC evidence pass 不会使用随机数据增强。
     """
     dataset_name = dataset_name.lower()
     mean, std = get_normalization_stats(dataset_name)
@@ -213,7 +261,9 @@ def get_input_shape(dataset_name: str) -> Tuple[int, int, int]:
     return tuple(get_dataset_info(dataset_name)["input_shape"])
 
 
-def get_normalization_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+def get_normalization_stats(
+    dataset_name: str,
+) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     """
     获取数据集归一化均值和标准差。
     """
