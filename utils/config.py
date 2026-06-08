@@ -26,6 +26,7 @@ SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
     "fisher_only",
+    "fisher_history_wolf",
 }
 
 
@@ -373,6 +374,41 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["expert_fisher"].setdefault("diagnostics_include_records", False)
     cfg["expert_fisher"].setdefault("diagnostics_prefix", "[FisherDiag]")
 
+    # Fisher-History-WoLF 服务端历史滤波聚合配置。
+    # 注意：
+    #   expert_fisher 负责客户端 evidence 采集；
+    #   fisher_history_wolf 负责服务端如何把 evidence 转成 expert 聚合权重。
+    #
+    # init_P:
+    #   新 client-expert 历史状态的初始不确定性。
+    #
+    # process_noise_Q:
+    #   历史 Fisher evidence 状态的过程噪声，允许状态随训练缓慢变化。
+    #
+    # observation_R:
+    #   normalized z 的基础观测噪声。
+    #   因为 z 是同 expert 内 robust normalized log Fisher，
+    #   所以 R=1 表示约 1 个 MAD 单位的正常观测波动。
+    #
+    # robust_c:
+    #   WoLF-IMQ 的软阈值。越小越容易把偏离历史的 Fisher 当异常。
+    #
+    # diagnostics_*:
+    #   控制 aggregation/fisher_history_wolf.py 的诊断字段生成和
+    #   fl/server.py 中的 [FisherWolfDiag] 打印。
+    cfg.setdefault("fisher_history_wolf", {})
+    cfg["fisher_history_wolf"].setdefault("init_P", 1.0)
+    cfg["fisher_history_wolf"].setdefault("process_noise_Q", 0.05)
+    cfg["fisher_history_wolf"].setdefault("observation_R", 1.0)
+    cfg["fisher_history_wolf"].setdefault("robust_c", 2.0)
+    cfg["fisher_history_wolf"].setdefault("eps", 1.0e-8)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_enabled", True)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_print", True)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_print_every", 1)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_print_experts", False)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_include_records", False)
+    cfg["fisher_history_wolf"].setdefault("diagnostics_prefix", "[FisherWolfDiag]")
+
     # 运行配置
     cfg.setdefault("seed", 42)
     cfg.setdefault("device", "auto")
@@ -540,8 +576,8 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     """
     基础合法性检查。
 
-    这个函数只检查通用配置和当前已接入的 expert_fisher 配置。
-    后面新增 history / Bayes 时，可以继续拆出新的 validate 函数。
+    这个函数只检查通用配置和当前已接入的 expert_fisher / fisher_history_wolf 配置。
+    后面新增 Bayes 等模块时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
     if dataset not in SUPPORTED_DATASETS:
@@ -573,11 +609,11 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：{sorted(SUPPORTED_AGG_METHODS)}"
         )
 
-    # fisher_only 是 expert-wise 权重聚合，只能用于 expert 参数组。
-    # non_expert 参数仍然应该使用 uniform / sample_weighted。
-    if non_expert_method == "fisher_only":
+    # fisher_only / fisher_history_wolf 都是 expert-wise 权重聚合，
+    # 只能用于 expert 参数组，不能用于 non_expert。
+    if non_expert_method in {"fisher_only", "fisher_history_wolf"}:
         raise ConfigError(
-            "fisher_only 只能用于 agg.expert.method，"
+            "fisher_only / fisher_history_wolf 只能用于 agg.expert.method，"
             "不能用于 agg.non_expert.method。"
         )
 
@@ -642,6 +678,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         cfg=cfg,
         expert_method=expert_method,
     )
+    _validate_fisher_history_wolf_config(
+        cfg=cfg,
+        expert_method=expert_method,
+    )
 
 
 def _validate_expert_fisher_config(
@@ -654,7 +694,8 @@ def _validate_expert_fisher_config(
     expert_fisher 用于：
         1. 客户端本地训练后额外做 evidence forward + backward
         2. 只对 expert Linear 层统计 K-FAC A / B
-        3. 给 fisher_only 聚合器提供 active_count / mean_A / mean_B / score
+        3. 给 fisher_only / fisher_history_wolf 聚合器提供
+           active_count / mean_A / mean_B / fisher_strength / score
         4. 控制 fisher_only 诊断字段生成和日志打印
     """
     expert_fisher_cfg = cfg.get("expert_fisher", {})
@@ -664,9 +705,9 @@ def _validate_expert_fisher_config(
 
     enabled = bool(expert_fisher_cfg.get("enabled", False))
 
-    if expert_method == "fisher_only" and not enabled:
+    if expert_method in {"fisher_only", "fisher_history_wolf"} and not enabled:
         raise ConfigError(
-            "agg.expert.method=fisher_only 时，必须设置 "
+            "agg.expert.method=fisher_only 或 fisher_history_wolf 时，必须设置 "
             "expert_fisher.enabled=true。"
         )
 
@@ -775,6 +816,111 @@ def _validate_expert_fisher_diagnostics_config(
     if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
         raise ConfigError(
             "expert_fisher.diagnostics_prefix 必须是非空字符串，"
+            f"当前值：{diagnostics_prefix}"
+        )
+
+
+def _validate_fisher_history_wolf_config(
+    cfg: Mapping[str, Any],
+    expert_method: str,
+) -> None:
+    """
+    检查 fisher_history_wolf 配置。
+
+    fisher_history_wolf 只负责服务端历史滤波聚合：
+        1. 用 fisher_strength 构造 normalized log Fisher observation
+        2. 用 WoLF-IMQ residual 降低异常观测对历史状态的影响
+        3. 用 active_count 只做 support confidence，不做高 usage 奖励
+        4. 最终生成 expert-wise 客户端权重
+    """
+    wolf_cfg = cfg.get("fisher_history_wolf", {})
+
+    if not isinstance(wolf_cfg, Mapping):
+        raise ConfigError("fisher_history_wolf 必须是一个 dict。")
+
+    init_P = float(wolf_cfg.get("init_P", 1.0))
+    if init_P <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf.init_P 必须大于 0，当前值：{init_P}"
+        )
+
+    process_noise_Q = float(wolf_cfg.get("process_noise_Q", 0.05))
+    if process_noise_Q < 0:
+        raise ConfigError(
+            "fisher_history_wolf.process_noise_Q 不能小于 0，"
+            f"当前值：{process_noise_Q}"
+        )
+
+    observation_R = float(wolf_cfg.get("observation_R", 1.0))
+    if observation_R <= 0:
+        raise ConfigError(
+            "fisher_history_wolf.observation_R 必须大于 0，"
+            f"当前值：{observation_R}"
+        )
+
+    robust_c = float(wolf_cfg.get("robust_c", 2.0))
+    if robust_c <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf.robust_c 必须大于 0，当前值：{robust_c}"
+        )
+
+    eps = float(wolf_cfg.get("eps", 1.0e-8))
+    if eps <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf.eps 必须大于 0，当前值：{eps}"
+        )
+
+    _validate_fisher_history_wolf_diagnostics_config(wolf_cfg)
+
+    if expert_method == "fisher_history_wolf":
+        # 这里不做额外逻辑，只保留位置方便以后扩展。
+        # expert_fisher.enabled=true 的强约束已经在 _validate_expert_fisher_config 中完成。
+        return
+
+
+def _validate_fisher_history_wolf_diagnostics_config(
+    wolf_cfg: Mapping[str, Any],
+) -> None:
+    """
+    检查 Fisher-History-WoLF 诊断配置。
+
+    这些字段主要服务于：
+        1. aggregation/fisher_history_wolf.py 生成 diagnostics
+        2. fl/server.py 打印 [FisherWolfDiag] 日志
+    """
+    bool_fields = [
+        "diagnostics_enabled",
+        "diagnostics_print",
+        "diagnostics_print_experts",
+        "diagnostics_include_records",
+    ]
+
+    for key in bool_fields:
+        value = wolf_cfg.get(key)
+
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"fisher_history_wolf.{key} 必须是 bool，当前值：{value}"
+            )
+
+    diagnostics_print_every = wolf_cfg.get("diagnostics_print_every", 1)
+    if (
+        not isinstance(diagnostics_print_every, int)
+        or isinstance(diagnostics_print_every, bool)
+        or diagnostics_print_every <= 0
+    ):
+        raise ConfigError(
+            "fisher_history_wolf.diagnostics_print_every 必须是正整数，"
+            f"当前值：{diagnostics_print_every}"
+        )
+
+    diagnostics_prefix = wolf_cfg.get(
+        "diagnostics_prefix",
+        "[FisherWolfDiag]",
+    )
+    if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
+        raise ConfigError(
+            "fisher_history_wolf.diagnostics_prefix 必须是非空字符串，"
             f"当前值：{diagnostics_prefix}"
         )
 

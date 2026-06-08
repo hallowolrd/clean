@@ -1,0 +1,138 @@
+# 继承基础配置，只覆盖 fisher_history_wolf 实验必须修改的字段。
+include: base.yaml
+
+
+# =========================
+# 聚合配置
+# =========================
+agg:
+  # 非专家参数聚合方法。
+  # 保持和当前 fisher_only.yaml 一致，不让 Fisher / WoLF 影响 backbone / router / classifier。
+  non_expert:
+    method: uniform
+
+  # 专家参数聚合方法。
+  # fisher_history_wolf 只作用于 MoE experts 参数。
+  expert:
+    method: fisher_history_wolf
+
+
+# =========================
+# Expert Fisher / K-FAC evidence 配置
+# =========================
+expert_fisher:
+  # 开启客户端本地训练完成后的 expert K-FAC 统计。
+  # 如果 agg.expert.method=fisher_history_wolf，这里必须为 true。
+  enabled: true
+
+  # 统计 Fisher 时使用 eval 模式。
+  # 注意：
+  # eval 只关闭 Dropout / BN 更新，不会关闭 Dataset 里的随机增强；
+  # 随机增强已经通过 train_evidence_dataset 单独关闭。
+  model_mode: eval
+
+  # Linear 层有 bias 时，把 bias 合进 A 统计。
+  # 即输入激活 a 末尾拼一列 1。
+  include_bias: true
+
+  # evidence pass 的 loss 使用 sum。
+  # 这样不会因为最后一个 batch 较小导致梯度尺度被 batch mean 影响。
+  loss_reduction: sum
+
+  # 默认完整跑完客户端本地 evidence_loader。
+  # 如果只想 smoke 测试，可以临时改成 1 / 2。
+  max_batches: null
+
+  # expert 至少 routed 到多少 token / sample，才认为这个 client-expert evidence 有效。
+  min_active_count: 1
+
+  # 每个 expert 至少需要多少个有效客户端。
+  # 少于这个数量时，该 expert 本轮 keep_global。
+  min_valid_clients: 2
+
+  # 有效客户端不足时保留旧全局 expert。
+  fallback: keep_global
+
+  # 数值稳定项。
+  eps: 1.0e-8
+
+  # =========================
+  # Fisher-only 诊断日志配置
+  # =========================
+  # 这里保留字段是为了兼容 utils/config.py 的校验。
+  # 当前实验真正打印的是 fisher_history_wolf.diagnostics_* 对应的 [FisherWolfDiag]。
+  diagnostics_enabled: true
+
+  # fisher_history_wolf 实验不打印 [FisherDiag]，避免和 [FisherWolfDiag] 混淆。
+  diagnostics_print: false
+
+  # 每隔多少轮打印一次 Fisher-only 诊断。
+  # 当前 diagnostics_print=false，因此这个字段不会实际生效。
+  diagnostics_print_every: 1
+
+  # 是否逐 expert 打印 Fisher-only 诊断。
+  diagnostics_print_experts: false
+
+  # 是否把完整 client-expert records / expert_weights 写入 summary.json。
+  diagnostics_include_records: false
+
+  # Fisher-only 诊断日志前缀，当前实验不会实际打印。
+  diagnostics_prefix: "[FisherDiag]"
+
+
+# =========================
+# Fisher-History-WoLF 服务端历史滤波配置
+# =========================
+fisher_history_wolf:
+  # 新 client-expert 历史状态的初始不确定性。
+  # 第一次有效观测会直接初始化 mu，不会被 WoLF 降权，避免误伤前几轮快速上涨。
+  init_P: 1.0
+
+  # 历史 Fisher evidence 状态的过程噪声。
+  # 允许每个 client-expert 的历史 Fisher 状态随训练缓慢变化。
+  process_noise_Q: 0.05
+
+  # normalized z 的基础观测噪声。
+  # 因为 z 是同 expert 内 robust normalized log Fisher，
+  # 所以 R=1 表示约 1 个 MAD 单位的正常观测波动。
+  observation_R: 1.0
+
+  # WoLF-IMQ 的软阈值。
+  # 越小越容易把偏离历史的 Fisher 当作异常观测。
+  robust_c: 2.0
+
+  # 数值稳定项。
+  eps: 1.0e-8
+
+  # =========================
+  # Fisher-History-WoLF 诊断日志配置
+  # =========================
+  # 是否在 aggregation/fisher_history_wolf.py 中生成 WoLF 诊断字段。
+  diagnostics_enabled: true
+
+  # 是否在控制台和 train.log 中打印 WoLF 诊断摘要。
+  diagnostics_print: true
+
+  # 每隔多少轮打印一次 WoLF 诊断。
+  # 1 表示每轮都打印。
+  diagnostics_print_every: 1
+
+  # 是否逐 expert 打印诊断。
+  # 第一版建议 false，只打印 round-level 摘要，避免日志太大。
+  # 如果后面发现某些 expert 异常，再临时改成 true。
+  diagnostics_print_experts: false
+
+  # 是否把每个 client-expert 的完整 records / expert_weights 写入 summary.json。
+  # 第一版建议 false，避免 summary.json 过大。
+  # 如果要精查某一轮每个 expert 的客户端权重，再临时改成 true。
+  diagnostics_include_records: false
+
+  # WoLF 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[FisherWolfDiag]"
+
+
+# =========================
+# 运行配置
+# =========================
+# auto 会自动根据 dataset / model / agg method / seed 等生成目录名。
+run_name: auto
