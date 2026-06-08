@@ -9,7 +9,7 @@ agg:
   # 非专家参数聚合方法
   # 保持和普通 FedAvg 主干一致，不让 Fisher 影响 backbone / router / classifier。
   non_expert:
-    method: sample_weighted
+    method: uniform
 
   # 专家参数聚合方法
   # fisher_only 只作用于 MoE experts 参数。
