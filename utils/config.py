@@ -20,13 +20,23 @@ SUPPORTED_DATASETS = {
 SUPPORTED_MODELS = {
     "resnet_switch_moe",
     "resnet_sparse_moe_head",
+
+    # 新增：纯 FL ResNet18 FedAvg baseline。
+    # 这个模型没有 MoE、没有 expert、没有 router。
+    "resnet18_fedavg",
 }
 
 SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
+
+    # 原 FL+MoE expert-wise 聚合方法。
     "fisher_only",
     "fisher_history_wolf",
+
+    # 新增 pure-FL / full-model / client-wise 聚合方法。
+    "fisher_only_global",
+    "fisher_history_wolf_global",
 }
 
 
@@ -48,6 +58,7 @@ class ConfigNode:
     也支持路径读取：
         cfg.get("agg.non_expert.method", "sample_weighted")
         cfg.get("agg.expert.method", "uniform")
+        cfg.get("checkpoint.enabled", True)
     """
 
     def __init__(self, data: Mapping[str, Any]):
@@ -61,10 +72,7 @@ class ConfigNode:
             return ConfigNode(value)
 
         if isinstance(value, list):
-            return [
-                ConfigNode._wrap(item)
-                for item in value
-            ]
+            return [ConfigNode._wrap(item) for item in value]
 
         return value
 
@@ -103,10 +111,7 @@ class ConfigNode:
             return value.to_dict()
 
         if isinstance(value, list):
-            return [
-                ConfigNode._unwrap(item)
-                for item in value
-            ]
+            return [ConfigNode._unwrap(item) for item in value]
 
         return value
 
@@ -287,7 +292,9 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     cfg = copy.deepcopy(cfg)
 
+    # =========================
     # 数据配置
+    # =========================
     cfg.setdefault("dataset", "cifar10")
     cfg.setdefault("data_root", "./data")
     cfg.setdefault("num_classes", _infer_num_classes(cfg["dataset"]))
@@ -297,14 +304,18 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Fisher / K-FAC evidence 数据集会单独强制关闭随机增强。
     cfg.setdefault("data_augmentation", True)
 
+    # =========================
     # 联邦学习配置
+    # =========================
     cfg.setdefault("num_clients", 10)
     cfg.setdefault("alpha", 0.1)
     cfg.setdefault("frac", 1.0)
     cfg.setdefault("rounds", 100)
     cfg.setdefault("local_epochs", 1)
 
-    # dataloader 配置
+    # =========================
+    # DataLoader 配置
+    # =========================
     cfg.setdefault("batch_size", 64)
     cfg.setdefault("test_batch_size", 256)
     cfg.setdefault("num_workers", 2)
@@ -315,26 +326,41 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # 虽然 evidence_loader 默认 shuffle=False，但 worker 内部仍可能涉及随机性。
     cfg.setdefault("evidence_seed_offset", 100000)
 
+    # =========================
     # 模型配置
+    # =========================
     cfg.setdefault("model", "resnet_switch_moe")
+
+    # MoE 模型使用 num_experts / topk。
+    # pure-FL 模型 resnet18_fedavg 不使用这两个字段，
+    # 但保留默认值可以兼容 base.yaml 和 run_name 自动生成逻辑。
     cfg.setdefault("num_experts", 4)
     cfg.setdefault("topk", 2)
 
+    # resnet18_fedavg 默认适配 CIFAR 的 3x32x32 输入。
+    cfg.setdefault("input_shape", [3, 32, 32])
+
+    # =========================
     # 优化器配置
+    # =========================
     cfg.setdefault("optimizer", {})
     cfg["optimizer"].setdefault("type", "sgd")
     cfg["optimizer"].setdefault("lr", 0.01)
     cfg["optimizer"].setdefault("momentum", 0.9)
     cfg["optimizer"].setdefault("weight_decay", 1e-4)
 
+    # =========================
     # 聚合配置
+    # =========================
     cfg.setdefault("agg", {})
     cfg["agg"].setdefault("non_expert", {})
     cfg["agg"]["non_expert"].setdefault("method", "sample_weighted")
     cfg["agg"].setdefault("expert", {})
     cfg["agg"]["expert"].setdefault("method", "uniform")
 
-    # Expert Fisher / K-FAC evidence 配置。
+    # =========================
+    # Expert Fisher / K-FAC evidence 配置
+    # =========================
     # 只有 expert_fisher.enabled=true 时，客户端本地训练完成后才会额外执行
     # evidence forward + backward 统计 expert K-FAC。
     cfg.setdefault("expert_fisher", {})
@@ -349,24 +375,6 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["expert_fisher"].setdefault("eps", 1.0e-8)
 
     # Fisher-only 诊断配置。
-    # diagnostics_enabled:
-    #   是否在 aggregation/fisher_only.py 中生成详细诊断字段。
-    #
-    # diagnostics_print:
-    #   是否由 server.py 打印 Fisher 诊断日志到控制台 / train.log。
-    #
-    # diagnostics_print_every:
-    #   每隔多少轮打印一次 Fisher 诊断。
-    #
-    # diagnostics_print_experts:
-    #   是否逐 expert 打印诊断。第一版建议 false，避免日志太大。
-    #
-    # diagnostics_include_records:
-    #   是否把完整 client-expert records / expert_weights 写入 summary.json。
-    #   第一版建议 false，避免文件过大。
-    #
-    # diagnostics_prefix:
-    #   Fisher 诊断日志前缀，方便 grep。
     cfg["expert_fisher"].setdefault("diagnostics_enabled", True)
     cfg["expert_fisher"].setdefault("diagnostics_print", True)
     cfg["expert_fisher"].setdefault("diagnostics_print_every", 1)
@@ -374,28 +382,48 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["expert_fisher"].setdefault("diagnostics_include_records", False)
     cfg["expert_fisher"].setdefault("diagnostics_prefix", "[FisherDiag]")
 
-    # Fisher-History-WoLF 服务端历史滤波聚合配置。
+    # =========================
+    # Full-model Fisher evidence 配置
+    # =========================
+    # 这是新增的 pure-FL / full-model / client-wise Fisher evidence。
+    #
+    # 和 expert_fisher 的区别：
+    #   expert_fisher:
+    #       统计 MoE expert K-FAC，写入 update.extra["expert_kfac"]。
+    #
+    #   full_model_fisher:
+    #       统计整模型 mean(grad^2)，写入 update.extra["global_fisher"]。
+    #
+    # 只有 fisher_only_global / fisher_history_wolf_global 才需要开启。
+    cfg.setdefault("full_model_fisher", {})
+    cfg["full_model_fisher"].setdefault("enabled", False)
+    cfg["full_model_fisher"].setdefault("model_mode", "eval")
+    cfg["full_model_fisher"].setdefault("max_batches", 10)
+    cfg["full_model_fisher"].setdefault("eps", 1.0e-8)
+    cfg["full_model_fisher"].setdefault("min_valid_clients", 2)
+    cfg["full_model_fisher"].setdefault("missing_policy", "error")
+    cfg["full_model_fisher"].setdefault("diagnostics_enabled", True)
+    cfg["full_model_fisher"].setdefault("diagnostics_print", True)
+    cfg["full_model_fisher"].setdefault("diagnostics_print_every", 1)
+    cfg["full_model_fisher"].setdefault("diagnostics_include_records", False)
+    cfg["full_model_fisher"].setdefault("diagnostics_prefix", "[FullFisherDiag]")
+
+    # =========================
+    # Fisher-only global 聚合器配置
+    # =========================
+    # fisher_only_global 第一版故意保持简单：
+    #   score_i = num_samples_i * fisher_strength_i
+    #
+    # 不加温度系数、不加 uniform mix、不加额外归一化。
+    cfg.setdefault("fisher_only_global", {})
+    cfg["fisher_only_global"].setdefault("enabled", False)
+
+    # =========================
+    # Fisher-History-WoLF 服务端历史滤波聚合配置
+    # =========================
     # 注意：
     #   expert_fisher 负责客户端 evidence 采集；
     #   fisher_history_wolf 负责服务端如何把 evidence 转成 expert 聚合权重。
-    #
-    # init_P:
-    #   新 client-expert 历史状态的初始不确定性。
-    #
-    # process_noise_Q:
-    #   历史 Fisher evidence 状态的过程噪声，允许状态随训练缓慢变化。
-    #
-    # observation_R:
-    #   normalized z 的基础观测噪声。
-    #   因为 z 是同 expert 内 robust normalized log Fisher，
-    #   所以 R=1 表示约 1 个 MAD 单位的正常观测波动。
-    #
-    # robust_c:
-    #   WoLF-IMQ 的软阈值。越小越容易把偏离历史的 Fisher 当异常。
-    #
-    # diagnostics_*:
-    #   控制 aggregation/fisher_history_wolf.py 的诊断字段生成和
-    #   fl/server.py 中的 [FisherWolfDiag] 打印。
     cfg.setdefault("fisher_history_wolf", {})
     cfg["fisher_history_wolf"].setdefault("init_P", 1.0)
     cfg["fisher_history_wolf"].setdefault("process_noise_Q", 0.05)
@@ -409,7 +437,36 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["fisher_history_wolf"].setdefault("diagnostics_include_records", False)
     cfg["fisher_history_wolf"].setdefault("diagnostics_prefix", "[FisherWolfDiag]")
 
+    # =========================
+    # Fisher-History-WoLF global 聚合器配置
+    # =========================
+    # 这是新增的 pure-FL / full-model / client-wise 历史滤波器。
+    #
+    # 和 fisher_history_wolf 的区别：
+    #   fisher_history_wolf:
+    #       每个 (client_id, expert_id) 维护历史状态。
+    #
+    #   fisher_history_wolf_global:
+    #       每个 client_id 维护一个历史状态。
+    cfg.setdefault("fisher_history_wolf_global", {})
+    cfg["fisher_history_wolf_global"].setdefault("enabled", False)
+    cfg["fisher_history_wolf_global"].setdefault("init_P", 1.0)
+    cfg["fisher_history_wolf_global"].setdefault("process_noise_Q", 0.05)
+    cfg["fisher_history_wolf_global"].setdefault("observation_R", 1.0)
+    cfg["fisher_history_wolf_global"].setdefault("robust_c", 2.0)
+    cfg["fisher_history_wolf_global"].setdefault("eps", 1.0e-8)
+    cfg["fisher_history_wolf_global"].setdefault("diagnostics_enabled", True)
+    cfg["fisher_history_wolf_global"].setdefault("diagnostics_print", True)
+    cfg["fisher_history_wolf_global"].setdefault("diagnostics_print_every", 1)
+    cfg["fisher_history_wolf_global"].setdefault("diagnostics_include_records", False)
+    cfg["fisher_history_wolf_global"].setdefault(
+        "diagnostics_prefix",
+        "[FullFisherWoLFDiag]",
+    )
+
+    # =========================
     # 运行配置
+    # =========================
     cfg.setdefault("seed", 42)
     cfg.setdefault("device", "auto")
     cfg.setdefault("output_dir", "outputs")
@@ -576,7 +633,13 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     """
     基础合法性检查。
 
-    这个函数只检查通用配置和当前已接入的 expert_fisher / fisher_history_wolf 配置。
+    这个函数只检查通用配置和当前已接入的：
+        - expert_fisher
+        - fisher_history_wolf
+        - full_model_fisher
+        - fisher_only_global
+        - fisher_history_wolf_global
+
     后面新增 Bayes 等模块时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
@@ -615,7 +678,31 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             "fisher_only / fisher_history_wolf 只能用于 agg.expert.method，"
             "不能用于 agg.non_expert.method。"
+            "如果你是在 pure-FL 整模型场景使用 Fisher，"
+            "请改用 fisher_only_global / fisher_history_wolf_global。"
         )
+
+    # fisher_only_global / fisher_history_wolf_global 是 pure-FL 整模型聚合，
+    # 只能用于 non_expert 参数组，不能用于 expert。
+    if expert_method in {"fisher_only_global", "fisher_history_wolf_global"}:
+        raise ConfigError(
+            "fisher_only_global / fisher_history_wolf_global 只能用于 "
+            "agg.non_expert.method，不能用于 agg.expert.method。"
+        )
+
+    if expert_method in {"fisher_only", "fisher_history_wolf"}:
+        if model == "resnet18_fedavg":
+            raise ConfigError(
+                "resnet18_fedavg 是 pure-FL 模型，没有 expert 参数，"
+                "不能使用 expert-wise fisher_only / fisher_history_wolf。"
+            )
+
+    if non_expert_method in {"fisher_only_global", "fisher_history_wolf_global"}:
+        if model != "resnet18_fedavg":
+            raise ConfigError(
+                "fisher_only_global / fisher_history_wolf_global 是为 pure-FL "
+                "整模型聚合准备的。当前建议只和 model=resnet18_fedavg 一起使用。"
+            )
 
     _require_positive_int(cfg, "num_classes")
     _require_positive_int(cfg, "num_clients")
@@ -624,6 +711,9 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "batch_size")
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
+
+    # pure-FL 模型不使用 num_experts / topk，但为了兼容 base.yaml 和 run_name，
+    # 仍然要求它们是正整数。这样不会影响 resnet18_fedavg 的实际模型结构。
     _require_positive_int(cfg, "num_experts")
     _require_positive_int(cfg, "topk")
 
@@ -647,7 +737,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "momentum",
         "weight_decay",
     }
-
     for key in forbidden_top_level_optimizer_keys:
         if key in cfg:
             raise ConfigError(
@@ -674,6 +763,8 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
         )
 
+    _validate_input_shape_config(cfg)
+
     _validate_expert_fisher_config(
         cfg=cfg,
         expert_method=expert_method,
@@ -682,6 +773,54 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         cfg=cfg,
         expert_method=expert_method,
     )
+    _validate_full_model_fisher_config(
+        cfg=cfg,
+        non_expert_method=non_expert_method,
+    )
+    _validate_fisher_only_global_config(
+        cfg=cfg,
+        non_expert_method=non_expert_method,
+    )
+    _validate_fisher_history_wolf_global_config(
+        cfg=cfg,
+        non_expert_method=non_expert_method,
+    )
+
+
+def _validate_input_shape_config(cfg: Mapping[str, Any]) -> None:
+    """
+    检查 input_shape 配置。
+
+    当前主要服务于 resnet18_fedavg：
+        input_shape: [3, 32, 32]
+    """
+    input_shape = cfg.get("input_shape", [3, 32, 32])
+
+    if input_shape is None:
+        return
+
+    if not isinstance(input_shape, list) or len(input_shape) != 3:
+        raise ConfigError(
+            "input_shape 必须是长度为 3 的列表，例如 [3, 32, 32]，"
+            f"当前值：{input_shape}"
+        )
+
+    for value in input_shape:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ConfigError(
+                "input_shape 中每个元素都必须是正整数，"
+                f"当前值：{input_shape}"
+            )
+
+    model = cfg.get("model")
+
+    if model == "resnet18_fedavg":
+        if input_shape != [3, 32, 32]:
+            raise ConfigError(
+                "resnet18_fedavg 当前保留原始 fedavg.py 的结构，"
+                "只支持 input_shape: [3, 32, 32]。"
+                f"当前值：{input_shape}"
+            )
 
 
 def _validate_expert_fisher_config(
@@ -717,7 +856,9 @@ def _validate_expert_fisher_config(
             f"expert_fisher.model_mode 只支持 eval / train，当前值：{model_mode}"
         )
 
-    loss_reduction = str(expert_fisher_cfg.get("loss_reduction", "sum")).lower()
+    loss_reduction = str(
+        expert_fisher_cfg.get("loss_reduction", "sum")
+    ).lower()
     if loss_reduction not in {"sum", "mean"}:
         raise ConfigError(
             "expert_fisher.loss_reduction 只支持 sum / mean，"
@@ -769,9 +910,7 @@ def _validate_expert_fisher_config(
 
     eps = float(expert_fisher_cfg.get("eps", 1.0e-8))
     if eps <= 0:
-        raise ConfigError(
-            f"expert_fisher.eps 必须大于 0，当前值：{eps}"
-        )
+        raise ConfigError(f"expert_fisher.eps 必须大于 0，当前值：{eps}")
 
     _validate_expert_fisher_diagnostics_config(expert_fisher_cfg)
 
@@ -795,13 +934,15 @@ def _validate_expert_fisher_diagnostics_config(
 
     for key in bool_fields:
         value = expert_fisher_cfg.get(key)
-
         if not isinstance(value, bool):
             raise ConfigError(
                 f"expert_fisher.{key} 必须是 bool，当前值：{value}"
             )
 
-    diagnostics_print_every = expert_fisher_cfg.get("diagnostics_print_every", 1)
+    diagnostics_print_every = expert_fisher_cfg.get(
+        "diagnostics_print_every",
+        1,
+    )
     if (
         not isinstance(diagnostics_print_every, int)
         or isinstance(diagnostics_print_every, bool)
@@ -812,7 +953,10 @@ def _validate_expert_fisher_diagnostics_config(
             f"当前值：{diagnostics_print_every}"
         )
 
-    diagnostics_prefix = expert_fisher_cfg.get("diagnostics_prefix", "[FisherDiag]")
+    diagnostics_prefix = expert_fisher_cfg.get(
+        "diagnostics_prefix",
+        "[FisherDiag]",
+    )
     if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
         raise ConfigError(
             "expert_fisher.diagnostics_prefix 必须是非空字符串，"
@@ -897,13 +1041,15 @@ def _validate_fisher_history_wolf_diagnostics_config(
 
     for key in bool_fields:
         value = wolf_cfg.get(key)
-
         if not isinstance(value, bool):
             raise ConfigError(
                 f"fisher_history_wolf.{key} 必须是 bool，当前值：{value}"
             )
 
-    diagnostics_print_every = wolf_cfg.get("diagnostics_print_every", 1)
+    diagnostics_print_every = wolf_cfg.get(
+        "diagnostics_print_every",
+        1,
+    )
     if (
         not isinstance(diagnostics_print_every, int)
         or isinstance(diagnostics_print_every, bool)
@@ -921,6 +1067,274 @@ def _validate_fisher_history_wolf_diagnostics_config(
     if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
         raise ConfigError(
             "fisher_history_wolf.diagnostics_prefix 必须是非空字符串，"
+            f"当前值：{diagnostics_prefix}"
+        )
+
+
+def _validate_full_model_fisher_config(
+    cfg: Mapping[str, Any],
+    non_expert_method: str,
+) -> None:
+    """
+    检查 full_model_fisher 配置。
+
+    full_model_fisher 用于 pure-FL：
+        1. 客户端本地训练完成后，额外跑 evidence pass；
+        2. 对整个模型统计 mean(grad^2)；
+        3. 写入 update.extra["global_fisher"]；
+        4. 给 fisher_only_global / fisher_history_wolf_global 使用。
+    """
+    fisher_cfg = cfg.get("full_model_fisher", {})
+
+    if not isinstance(fisher_cfg, Mapping):
+        raise ConfigError("full_model_fisher 必须是一个 dict。")
+
+    enabled = bool(fisher_cfg.get("enabled", False))
+
+    if non_expert_method in {"fisher_only_global", "fisher_history_wolf_global"}:
+        if not enabled:
+            raise ConfigError(
+                "agg.non_expert.method=fisher_only_global 或 "
+                "fisher_history_wolf_global 时，必须设置 "
+                "full_model_fisher.enabled=true。"
+            )
+
+    model_mode = str(fisher_cfg.get("model_mode", "eval")).lower()
+    if model_mode not in {"eval", "train"}:
+        raise ConfigError(
+            f"full_model_fisher.model_mode 只支持 eval / train，当前值：{model_mode}"
+        )
+
+    max_batches = fisher_cfg.get("max_batches", 10)
+    if max_batches is not None:
+        if (
+            not isinstance(max_batches, int)
+            or isinstance(max_batches, bool)
+            or max_batches <= 0
+        ):
+            raise ConfigError(
+                "full_model_fisher.max_batches 如果不为 null，必须是正整数，"
+                f"当前值：{max_batches}"
+            )
+
+    eps = float(fisher_cfg.get("eps", 1.0e-8))
+    if eps <= 0:
+        raise ConfigError(f"full_model_fisher.eps 必须大于 0，当前值：{eps}")
+
+    min_valid_clients = fisher_cfg.get("min_valid_clients", 2)
+    if (
+        not isinstance(min_valid_clients, int)
+        or isinstance(min_valid_clients, bool)
+        or min_valid_clients <= 0
+    ):
+        raise ConfigError(
+            "full_model_fisher.min_valid_clients 必须是正整数，"
+            f"当前值：{min_valid_clients}"
+        )
+
+    missing_policy = str(fisher_cfg.get("missing_policy", "error")).lower()
+    if missing_policy not in {"error", "skip", "uniform"}:
+        raise ConfigError(
+            "full_model_fisher.missing_policy 只支持 error / skip / uniform，"
+            f"当前值：{missing_policy}"
+        )
+
+    _validate_full_model_fisher_diagnostics_config(fisher_cfg)
+
+
+def _validate_full_model_fisher_diagnostics_config(
+    fisher_cfg: Mapping[str, Any],
+) -> None:
+    """
+    检查 full_model_fisher 诊断配置。
+
+    这些字段主要服务于：
+        1. aggregation/fisher_only_global.py 生成 diagnostics
+        2. fl/server.py 打印 [FullFisherDiag] 日志
+    """
+    bool_fields = [
+        "diagnostics_enabled",
+        "diagnostics_print",
+        "diagnostics_include_records",
+    ]
+
+    for key in bool_fields:
+        value = fisher_cfg.get(key)
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"full_model_fisher.{key} 必须是 bool，当前值：{value}"
+            )
+
+    diagnostics_print_every = fisher_cfg.get(
+        "diagnostics_print_every",
+        1,
+    )
+    if (
+        not isinstance(diagnostics_print_every, int)
+        or isinstance(diagnostics_print_every, bool)
+        or diagnostics_print_every <= 0
+    ):
+        raise ConfigError(
+            "full_model_fisher.diagnostics_print_every 必须是正整数，"
+            f"当前值：{diagnostics_print_every}"
+        )
+
+    diagnostics_prefix = fisher_cfg.get(
+        "diagnostics_prefix",
+        "[FullFisherDiag]",
+    )
+    if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
+        raise ConfigError(
+            "full_model_fisher.diagnostics_prefix 必须是非空字符串，"
+            f"当前值：{diagnostics_prefix}"
+        )
+
+
+def _validate_fisher_only_global_config(
+    cfg: Mapping[str, Any],
+    non_expert_method: str,
+) -> None:
+    """
+    检查 fisher_only_global 配置。
+
+    fisher_only_global 本身第一版很简单：
+        score_i = num_samples_i * fisher_strength_i
+
+    主要强约束：
+        1. 只能用于 agg.non_expert.method；
+        2. 必须开启 full_model_fisher.enabled=true。
+    """
+    global_cfg = cfg.get("fisher_only_global", {})
+
+    if not isinstance(global_cfg, Mapping):
+        raise ConfigError("fisher_only_global 必须是一个 dict。")
+
+    enabled = bool(global_cfg.get("enabled", False))
+
+    if non_expert_method == "fisher_only_global" and not enabled:
+        raise ConfigError(
+            "agg.non_expert.method=fisher_only_global 时，建议显式设置 "
+            "fisher_only_global.enabled=true。"
+        )
+
+    if "enabled" in global_cfg and not isinstance(global_cfg.get("enabled"), bool):
+        raise ConfigError(
+            "fisher_only_global.enabled 必须是 bool，"
+            f"当前值：{global_cfg.get('enabled')}"
+        )
+
+
+def _validate_fisher_history_wolf_global_config(
+    cfg: Mapping[str, Any],
+    non_expert_method: str,
+) -> None:
+    """
+    检查 fisher_history_wolf_global 配置。
+
+    fisher_history_wolf_global 用于 pure-FL：
+        1. 使用 full_model_fisher 的 fisher_strength；
+        2. 每个 client_id 维护一个历史状态；
+        3. 用 WoLF-IMQ 抑制异常 observation；
+        4. 输出整模型 client-wise 权重。
+    """
+    wolf_cfg = cfg.get("fisher_history_wolf_global", {})
+
+    if not isinstance(wolf_cfg, Mapping):
+        raise ConfigError("fisher_history_wolf_global 必须是一个 dict。")
+
+    enabled = bool(wolf_cfg.get("enabled", False))
+
+    if non_expert_method == "fisher_history_wolf_global" and not enabled:
+        raise ConfigError(
+            "agg.non_expert.method=fisher_history_wolf_global 时，建议显式设置 "
+            "fisher_history_wolf_global.enabled=true。"
+        )
+
+    if "enabled" in wolf_cfg and not isinstance(wolf_cfg.get("enabled"), bool):
+        raise ConfigError(
+            "fisher_history_wolf_global.enabled 必须是 bool，"
+            f"当前值：{wolf_cfg.get('enabled')}"
+        )
+
+    init_P = float(wolf_cfg.get("init_P", 1.0))
+    if init_P <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf_global.init_P 必须大于 0，当前值：{init_P}"
+        )
+
+    process_noise_Q = float(wolf_cfg.get("process_noise_Q", 0.05))
+    if process_noise_Q < 0:
+        raise ConfigError(
+            "fisher_history_wolf_global.process_noise_Q 不能小于 0，"
+            f"当前值：{process_noise_Q}"
+        )
+
+    observation_R = float(wolf_cfg.get("observation_R", 1.0))
+    if observation_R <= 0:
+        raise ConfigError(
+            "fisher_history_wolf_global.observation_R 必须大于 0，"
+            f"当前值：{observation_R}"
+        )
+
+    robust_c = float(wolf_cfg.get("robust_c", 2.0))
+    if robust_c <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf_global.robust_c 必须大于 0，当前值：{robust_c}"
+        )
+
+    eps = float(wolf_cfg.get("eps", 1.0e-8))
+    if eps <= 0:
+        raise ConfigError(
+            f"fisher_history_wolf_global.eps 必须大于 0，当前值：{eps}"
+        )
+
+    _validate_fisher_history_wolf_global_diagnostics_config(wolf_cfg)
+
+
+def _validate_fisher_history_wolf_global_diagnostics_config(
+    wolf_cfg: Mapping[str, Any],
+) -> None:
+    """
+    检查 Fisher-History-WoLF global 诊断配置。
+
+    这些字段主要服务于：
+        1. aggregation/fisher_history_wolf_global.py 生成 diagnostics
+        2. fl/server.py 打印 [FullFisherWoLFDiag] 日志
+    """
+    bool_fields = [
+        "diagnostics_enabled",
+        "diagnostics_print",
+        "diagnostics_include_records",
+    ]
+
+    for key in bool_fields:
+        value = wolf_cfg.get(key)
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"fisher_history_wolf_global.{key} 必须是 bool，当前值：{value}"
+            )
+
+    diagnostics_print_every = wolf_cfg.get(
+        "diagnostics_print_every",
+        1,
+    )
+    if (
+        not isinstance(diagnostics_print_every, int)
+        or isinstance(diagnostics_print_every, bool)
+        or diagnostics_print_every <= 0
+    ):
+        raise ConfigError(
+            "fisher_history_wolf_global.diagnostics_print_every 必须是正整数，"
+            f"当前值：{diagnostics_print_every}"
+        )
+
+    diagnostics_prefix = wolf_cfg.get(
+        "diagnostics_prefix",
+        "[FullFisherWoLFDiag]",
+    )
+    if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
+        raise ConfigError(
+            "fisher_history_wolf_global.diagnostics_prefix 必须是非空字符串，"
             f"当前值：{diagnostics_prefix}"
         )
 

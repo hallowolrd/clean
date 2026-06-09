@@ -1,0 +1,157 @@
+# 继承基础配置，只覆盖 pure-FL fisher_history_wolf_global 实验必须修改的字段。
+include: base.yaml
+
+# =========================
+# 模型配置
+# =========================
+# 纯 FL ResNet18 baseline。
+# 这个模型没有 MoE、没有 expert、没有 router。
+# 需要你已经新增 models/resnet18_fedavg.py，
+# 并在 models/build.py 中注册 resnet18_fedavg。
+model: resnet18_fedavg
+
+# CIFAR10 使用 10 类。
+# 如果后面切 CIFAR100，再改成 100。
+num_classes: 10
+
+# 当前 resnet18_fedavg 保留原始 fedavg.py 的 32x32 输入结构。
+input_shape: [3, 32, 32]
+
+# =========================
+# 聚合配置
+# =========================
+agg:
+  # pure-FL 场景下，整个模型都应被当作 non_expert 参数组聚合。
+  #
+  # fisher_history_wolf_global 表示：
+  #   1. 每个客户端本地训练完成后，统计整模型 Fisher strength；
+  #   2. 用 log(fisher_strength) 构造当前轮 observation；
+  #   3. 对当前轮 observation 做 median / MAD robust normalization；
+  #   4. 为每个 client_id 维护一个历史状态 mu / P；
+  #   5. 用 WoLF-IMQ 降低异常 observation 对历史状态的影响；
+  #   6. 用 filtered_mu + log(support) 得到客户端 logit；
+  #   7. 对整个模型参数使用同一套客户端权重。
+  #
+  # 注意：
+  # - 这个不是原来的 expert-wise fisher_history_wolf。
+  # - 原 fisher_history_wolf 是给 MoE expert 参数用的。
+  # - 这里的 fisher_history_wolf_global 是纯 FL / client-wise / full-model 版本。
+  non_expert:
+    method: fisher_history_wolf_global
+
+  # pure-FL 模型没有 expert 参数。
+  # 这里保留 expert 字段是为了兼容 clean_ablation 现有配置结构。
+  # server.py / param_groups.py 应该在 expert 参数为空时自动跳过 expert 聚合。
+  expert:
+    method: uniform
+
+# =========================
+# Expert Fisher / K-FAC evidence 配置
+# =========================
+expert_fisher:
+  # pure-FL 不使用 MoE expert K-FAC。
+  # 必须关闭，避免错误读取 update.extra["expert_kfac"]。
+  enabled: false
+
+# =========================
+# Full-model Fisher evidence 配置
+# =========================
+full_model_fisher:
+  # fisher_history_wolf_global 必须开启。
+  # 客户端本地训练完成后，会额外做 evidence pass，
+  # 并写入 update.extra["global_fisher"]。
+  enabled: true
+
+  # evidence pass 最多使用多少个 batch。
+  # 第一版建议先用 10，控制额外开销。
+  # 如果后面想更稳定，可以改成 null / full，表示使用完整 evidence_loader。
+  max_batches: full
+
+  # evidence pass 使用 eval 模式。
+  # eval 只是不更新 BN running stats / 关闭 dropout；
+  # 不会阻止 backward，因此仍然可以正常统计梯度平方。
+  model_mode: eval
+
+  # 数值稳定项。
+  eps: 1.0e-8
+
+  # 至少需要多少个有效客户端 Fisher record。
+  # 少于这个数量时，fisher_history_wolf_global 会退化为 uniform。
+  min_valid_clients: 2
+
+  # 缺少 update.extra["global_fisher"] 时的策略。
+  # error：直接报错，方便发现 client.py 没接好 full_model_fisher。
+  # skip：跳过缺失客户端。
+  # uniform：直接退化为 uniform。
+  missing_policy: error
+
+  # 是否生成 full-model Fisher 诊断字段。
+  diagnostics_enabled: true
+
+  # 是否把每个客户端的完整 fisher record 写入 summary。
+  # 第一版建议 false，避免日志太大。
+  diagnostics_include_records: false
+
+  # 是否在控制台和 train.log 打印 full-model Fisher 诊断。
+  # 需要 server.py 对这个字段做对应打印支持。
+  diagnostics_print: true
+
+  # 每隔多少轮打印一次诊断。
+  diagnostics_print_every: 1
+
+  # 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[FullFisherDiag]"
+
+# =========================
+# Fisher-History-WoLF global 聚合器配置
+# =========================
+fisher_history_wolf_global:
+  # 开启 pure-FL 版 Fisher-History-WoLF。
+  enabled: true
+
+  # 数值稳定项。
+  # 如果这里不写，聚合器会回退使用 full_model_fisher.eps。
+  eps: 1.0e-8
+
+  # 新客户端历史状态的初始不确定性 P。
+  # P 越大，说明刚开始越不确定，历史状态更容易被当前 observation 改动。
+  init_P: 1.0
+
+  # 过程噪声 Q。
+  # 越大表示历史 Fisher 状态允许更快变化；
+  # 越小表示历史状态更平滑。
+  process_noise_Q: 0.05
+
+  # 基础观测噪声 R。
+  # 因为 observation 是 robust normalized log Fisher，
+  # 所以 R=1 可以理解为约 1 个 MAD 单位的正常观测波动。
+  observation_R: 1.0
+
+  # WoLF-IMQ 软阈值。
+  # residual 越大，rho 越小；
+  # rho 越小，本轮 observation 对历史状态的影响越弱。
+  robust_c: 2.0
+
+  # 是否生成 fisher_history_wolf_global 诊断字段。
+  diagnostics_enabled: true
+
+  # 是否把每个客户端的 raw_records / filtered_records 写入 summary。
+  # 第一版建议 false，避免日志太大。
+  diagnostics_include_records: false
+
+  # 是否在控制台和 train.log 打印 WoLF 诊断。
+  # 需要 server.py 对这个字段做对应打印支持。
+  diagnostics_print: true
+
+  # 每隔多少轮打印一次诊断。
+  diagnostics_print_every: 1
+
+  # 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[FullFisherWoLFDiag]"
+
+# =========================
+# 运行配置
+# =========================
+# auto 会根据 dataset / model / agg method / seed 等生成目录名。
+# 如果你想固定实验名，可以改成 pure_fl_fisher_history_wolf_global。
+run_name: auto

@@ -11,6 +11,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from fl.expert_kfac import collect_expert_kfac_stats
+from fl.full_model_fisher import (
+    collect_full_model_fisher_stats,
+    is_full_model_fisher_enabled,
+)
 from fl.types import ClientUpdate
 from utils.eval import extract_logits, unpack_batch
 from utils.state_dict_ops import (
@@ -59,17 +63,18 @@ class FLClient:
     联邦学习客户端。
 
     职责：
-        1. 接收 server 下发的 global_model
-        2. 在自己的 train_loader 上本地训练
-        3. 如果启用 expert_fisher，则在本地训练完成后额外做一轮 evidence pass
-        4. 计算 local_model 相对 global_model 的参数变化量
-        5. 返回 ClientUpdate
+    1. 接收 server 下发的 global_model；
+    2. 在自己的 train_loader 上本地训练；
+    3. 如果启用 expert_fisher，则在本地训练完成后额外做 expert K-FAC evidence pass；
+    4. 如果启用 full_model_fisher，则在本地训练完成后额外做整模型 Fisher evidence pass；
+    5. 计算 local_model 相对 global_model 的参数变化量；
+    6. 返回 ClientUpdate。
 
     不负责：
-        1. 选择客户端
-        2. 聚合参数
-        3. 测试集评估
-        4. 保存 checkpoint
+    1. 选择客户端；
+    2. 聚合参数；
+    3. 测试集评估；
+    4. 保存 checkpoint。
     """
 
     def __init__(
@@ -84,8 +89,15 @@ class FLClient:
         self.train_loader = train_loader
 
         # evidence_loader 用于本地训练完成后的 Fisher / K-FAC 统计。
-        # 它应该和 train_loader 使用同一批样本索引，但 transform 不包含随机数据增强。
-        # 如果没有传入，则后面会根据 expert_fisher.enabled 决定是否报错。
+        #
+        # 推荐：
+        # - 和 train_loader 使用同一批样本索引；
+        # - transform 不包含随机数据增强；
+        # - 这样 Fisher evidence 更稳定。
+        #
+        # 如果没有传入：
+        # - expert_fisher.enabled=true 时会报错，因为 expert K-FAC 更依赖干净 evidence；
+        # - full_model_fisher.enabled=true 时会 fallback 到 train_loader，保证 pure-FL 第一版能直接跑通。
         self.evidence_loader = evidence_loader
 
         self.cfg = cfg
@@ -157,14 +169,18 @@ class FLClient:
             "grad_clip": float(grad_clip) if grad_clip is not None else None,
         }
 
+        # ============================================================
+        # Expert K-FAC evidence：原 FL+MoE / expert-wise 逻辑
+        # ============================================================
         # 本地训练完成后，额外进行一轮 expert K-FAC evidence pass。
         #
         # 注意：
-        #   1. 这里不做 optimizer.step。
-        #   2. 这里不使用 torch.no_grad，因为需要 backward hook 统计 B。
-        #   3. collect_expert_kfac_stats 内部会根据配置切换 eval / train 模式。
-        #   4. 推荐 evidence_loader 使用无随机增强的数据集。
-        #   5. 统计结果通过 ClientUpdate.extra["expert_kfac"] 上传给服务端聚合器。
+        # 1. 这里不做 optimizer.step；
+        # 2. 这里不使用 torch.no_grad，因为需要 backward hook 统计 B；
+        # 3. collect_expert_kfac_stats 内部会根据配置切换 eval / train 模式；
+        # 4. 推荐 evidence_loader 使用无随机增强的数据集；
+        # 5. 统计结果通过 ClientUpdate.extra["expert_kfac"] 上传给服务端 expert-wise 聚合器；
+        # 6. pure-FL 实验里 expert_fisher.enabled 应该为 false。
         if _is_expert_fisher_enabled(self.cfg):
             if self.evidence_loader is None:
                 raise ValueError(
@@ -179,6 +195,7 @@ class FLClient:
                 device=self.device,
                 cfg=self.cfg,
             )
+
             extra["expert_kfac"] = expert_kfac
 
             # 记录轻量摘要，方便日志查看。
@@ -193,6 +210,53 @@ class FLClient:
                 "avg_loss": float(kfac_meta.get("avg_loss", 0.0)),
             }
 
+        # ============================================================
+        # Full-model Fisher evidence：新增 pure-FL / client-wise 逻辑
+        # ============================================================
+        # 这个逻辑只用于普通 FL 整模型聚合：
+        #
+        #   client i -> global_fisher_i
+        #
+        # 它不会读取 expert_id，不会读取 routed token，也不会写 expert_kfac。
+        # 后续 fisher_only_global / fisher_history_wolf_global 会读取：
+        #
+        #   update.extra["global_fisher"]
+        #
+        # 如果没有单独 evidence_loader，则 fallback 到 train_loader。
+        # 这样 pure-FL 第一版不用强制改 data/loaders.py，也能先跑通。
+        if is_full_model_fisher_enabled(self.cfg):
+            fisher_loader = self.evidence_loader
+
+            if fisher_loader is None:
+                fisher_loader = self.train_loader
+
+            full_model_fisher = collect_full_model_fisher_stats(
+                model=local_model,
+                evidence_loader=fisher_loader,
+                device=self.device,
+                cfg=self.cfg,
+                criterion=criterion,
+            )
+
+            extra["global_fisher"] = full_model_fisher.to_payload()
+
+            # 轻量摘要，方便 server.py 日志打印和排查。
+            # 完整 payload 仍然保存在 extra["global_fisher"]。
+            extra["global_fisher_summary"] = {
+                "fisher_strength": float(full_model_fisher.fisher_strength),
+                "score": float(
+                    full_model_fisher.total_samples
+                    * full_model_fisher.fisher_strength
+                ),
+                "total_samples": int(full_model_fisher.total_samples),
+                "total_batches": int(full_model_fisher.total_batches),
+                "avg_loss": float(full_model_fisher.avg_loss),
+                "num_tensors": int(full_model_fisher.num_tensors),
+                "num_grad_elements": int(full_model_fisher.num_grad_elements),
+                "max_batches": full_model_fisher.max_batches,
+                "model_mode": str(full_model_fisher.model_mode),
+            }
+
         local_state_cpu = state_dict_to(
             local_model.state_dict(),
             device="cpu",
@@ -203,6 +267,7 @@ class FLClient:
             global_state=global_state_cpu,
             strict=True,
         )
+
         check_finite_state_dict(model_delta)
 
         update = ClientUpdate(
@@ -219,6 +284,7 @@ class FLClient:
         del criterion
 
         gc.collect()
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -240,12 +306,12 @@ def train_local_model(
     这里的训练 loss 只有 CrossEntropyLoss。
 
     明确不加入：
-        1. aux_loss
-        2. router balance
-        3. entropy regularization
-        4. expert diversity
-        5. router consistency
-        6. proximal loss
+    1. aux_loss；
+    2. router balance；
+    3. entropy regularization；
+    4. expert diversity；
+    5. router consistency；
+    6. proximal loss。
     """
     if local_epochs <= 0:
         raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
@@ -260,6 +326,7 @@ def train_local_model(
     for _ in range(local_epochs):
         for batch in train_loader:
             images, targets = unpack_batch(batch)
+
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -280,6 +347,7 @@ def train_local_model(
             optimizer.step()
 
             batch_size = int(targets.size(0))
+
             total_loss += float(loss.item()) * batch_size
             total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
             total_samples += batch_size
@@ -320,9 +388,9 @@ def build_optimizer(
     根据 cfg.optimizer 构建优化器。
 
     当前支持：
-        sgd
-        adam
-        adamw
+    - sgd
+    - adam
+    - adamw
     """
     optimizer_type = get_optimizer_type(cfg)
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
@@ -413,7 +481,9 @@ def build_clients(
         client_evidence_loaders:
             每个客户端对应一个 evidence DataLoader。
             用于本地训练完成后的 Fisher / K-FAC 统计。
+
             如果 expert_fisher.enabled=true，则必须传入。
+            如果 full_model_fisher.enabled=true 但没有传入，则客户端会 fallback 到 train_loader。
     """
     clients: List[FLClient] = []
 
@@ -433,6 +503,7 @@ def build_clients(
 
     for client_id, train_loader in enumerate(client_loaders):
         evidence_loader = None
+
         if client_evidence_loaders is not None:
             evidence_loader = client_evidence_loaders[client_id]
 
@@ -516,16 +587,17 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
 
     支持两种写法：
 
-    optimizer:
-      grad_clip: 5.0
+        optimizer:
+          grad_clip: 5.0
 
     或者：
 
-    grad_clip: 5.0
+        grad_clip: 5.0
 
     如果没有配置，则返回 None。
     """
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
+
     value = _cfg_get(
         optimizer_cfg,
         "grad_clip",
@@ -556,8 +628,8 @@ def _is_expert_fisher_enabled(cfg: Any) -> bool:
 
     配置示例：
 
-    expert_fisher:
-      enabled: true
+        expert_fisher:
+          enabled: true
     """
     expert_fisher_cfg = _cfg_get(cfg, "expert_fisher", {})
     return bool(_cfg_get(expert_fisher_cfg, "enabled", False))

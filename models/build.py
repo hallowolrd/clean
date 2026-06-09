@@ -10,6 +10,7 @@ from models.resnet_switch_moe import (
     build_resnet_switch_moe_from_cfg,
 )
 from models.resnet_sparse_moe_head import build_resnet_sparse_moe_head_from_cfg
+from models.resnet18_fedavg import build_resnet18_fedavg_from_cfg
 
 
 ModelBuilder = Callable[[Any], nn.Module]
@@ -19,9 +20,18 @@ MODEL_BUILDERS: Dict[str, ModelBuilder] = {
     # 原有模型：ResNet tokenizer + Switch Transformer MoE。
     "resnet_switch_moe": build_resnet_switch_moe_from_cfg,
 
-    # 新增模型：ResNet backbone + Sparse MoE Head。
+    # 原有模型：ResNet backbone + Sparse MoE Head。
     # 只在这里注册模型入口，不把训练、数据划分、聚合逻辑耦合进来。
     "resnet_sparse_moe_head": build_resnet_sparse_moe_head_from_cfg,
+
+    # 新增模型：纯 FL ResNet18 FedAvg baseline。
+    # 这个模型没有 MoE、没有 expert、没有 router。
+    # 用于 pure-FL 场景下验证：
+    # - uniform
+    # - sample_weighted
+    # - fisher_only_global
+    # - fisher_history_wolf_global
+    "resnet18_fedavg": build_resnet18_fedavg_from_cfg,
 }
 
 
@@ -32,15 +42,17 @@ def build_model(cfg: Any) -> nn.Module:
     配置示例：
         model: resnet_switch_moe
         model: resnet_sparse_moe_head
+        model: resnet18_fedavg
 
     当前支持：
         - resnet_switch_moe
         - resnet_sparse_moe_head
+        - resnet18_fedavg
 
     后续扩展其他模型时，只需要：
-        1. 新增模型文件
-        2. 写一个 build_xxx_from_cfg(cfg)
-        3. 在 MODEL_BUILDERS 里注册
+        1. 新增模型文件；
+        2. 写一个 build_xxx_from_cfg(cfg)；
+        3. 在 MODEL_BUILDERS 里注册。
     """
     model_name = get_model_name(cfg)
 
@@ -100,6 +112,7 @@ def count_parameters(
     for param in model.parameters():
         if trainable_only and not param.requires_grad:
             continue
+
         total += int(param.numel())
 
     return total
