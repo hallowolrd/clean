@@ -68,7 +68,7 @@ expert_fisher:
 
 full_model_fisher:
   enabled: false
-  max_batches: full
+  max_batches: null
   model_mode: eval
   eps: 1.0e-8
   min_valid_clients: 2
