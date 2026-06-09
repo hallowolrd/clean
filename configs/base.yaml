@@ -25,7 +25,7 @@ alpha: 0.1
 frac: 1.0
 
 # 联邦训练轮数
-rounds: 100
+rounds: 150
 
 # 每个客户端每轮本地训练 epoch 数
 local_epochs: 1
@@ -98,7 +98,7 @@ agg:
 # =========================
 
 # 随机种子
-seed: 3
+seed: 2
 
 # 设备选择
 # auto 表示代码里自动选择 cuda 或 cpu
