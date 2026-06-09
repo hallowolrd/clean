@@ -1,0 +1,86 @@
+# 纯 FL 实验公共配置。
+# 这个文件专门用于对齐原始 fl/fedavg.py 的实验设置。
+include: base.yaml
+
+# =========================
+# 数据与联邦设置
+# =========================
+dataset: cifar10
+num_classes: 10
+
+# 对齐 fedavg.py:
+# alpha1 = 0.1
+# num_users = 10
+# epochs = 200
+# frac = 1
+# local_ep = 1
+# SEED = 1234
+num_clients: 10
+alpha: 0.1
+frac: 1.0
+rounds: 200
+local_epochs: 1
+seed: 1234
+
+# =========================
+# DataLoader 设置
+# =========================
+# 对齐 fedavg.py:
+# batch_size1 = 256
+batch_size: 256
+test_batch_size: 256
+
+# 这个可以按你服务器情况调。
+num_workers: 2
+
+# =========================
+# 模型设置
+# =========================
+# 纯 FL ResNet18 baseline。
+# 没有 MoE、没有 expert、没有 router。
+model: resnet18_fedavg
+input_shape: [3, 32, 32]
+
+# pure-FL 模型不使用 num_experts/topk。
+# 但 config.py 里为了兼容原框架仍要求它们是正整数，所以保留默认即可。
+num_experts: 4
+topk: 2
+
+# =========================
+# 优化器设置
+# =========================
+# 对齐 fedavg.py:
+# torch.optim.SGD(model.parameters(), lr=0.03, momentum=0.9)
+# 原始 fedavg.py 没有设置 weight_decay，因此这里设为 0.0。
+optimizer:
+  type: sgd
+  lr: 0.03
+  momentum: 0.9
+  weight_decay: 0.0
+
+# =========================
+# Fisher 开关默认关闭
+# =========================
+# pure_fl_uniform / pure_fl_sample_weighted 不需要 Fisher。
+# fisher_only_global / fisher_history_wolf_global 再单独覆盖为 true。
+expert_fisher:
+  enabled: false
+
+full_model_fisher:
+  enabled: false
+  max_batches: full
+  model_mode: eval
+  eps: 1.0e-8
+  min_valid_clients: 2
+  missing_policy: error
+  diagnostics_enabled: true
+  diagnostics_include_records: false
+  diagnostics_print: true
+  diagnostics_print_every: 1
+  diagnostics_prefix: "[FullFisherDiag]"
+
+# =========================
+# 运行设置
+# =========================
+device: cuda
+run_name: auto

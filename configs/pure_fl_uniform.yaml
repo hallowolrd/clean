@@ -1,66 +1,12 @@
-# 继承基础配置，只覆盖 pure-FL uniform baseline 必须修改的字段。
-include: base.yaml
+include: pure_fl_base.yaml
 
-# =========================
-# 模型配置
-# =========================
-# 纯 FL ResNet18 baseline。
-# 这个模型没有 MoE、没有 expert、没有 router。
-# 需要你已经新增 models/resnet18_fedavg.py，
-# 并在 models/build.py 中注册 resnet18_fedavg。
-model: resnet18_fedavg
-
-# CIFAR10 使用 10 类。
-# 如果后面切 CIFAR100，再改成 100。
-num_classes: 10
-
-# 当前 resnet18_fedavg 保留原始 fedavg.py 的 32x32 输入结构。
-input_shape: [3, 32, 32]
-
-# =========================
-# 聚合配置
-# =========================
 agg:
-  # pure-FL 场景下，整个模型都应被当作 non_expert 参数组聚合。
-  # uniform 表示每个客户端权重相同：
-  #   w_i = 1 / K
   non_expert:
     method: uniform
-
-  # pure-FL 模型没有 expert 参数。
-  # 这里保留 expert 字段是为了兼容 clean_ablation 现有配置结构。
-  # 后续 server.py / param_groups.py 应该在 expert 参数为空时自动跳过 expert 聚合。
   expert:
     method: uniform
 
-# =========================
-# Expert Fisher / K-FAC evidence 配置
-# =========================
-expert_fisher:
-  # pure-FL uniform baseline 不需要 expert K-FAC。
-  # 必须关闭，避免错误地走 MoE expert evidence。
-  enabled: false
-
-# =========================
-# Full-model Fisher evidence 配置
-# =========================
 full_model_fisher:
-  # uniform baseline 不需要 full-model Fisher。
-  # 必须关闭，保证 baseline 没有额外 evidence pass 开销。
   enabled: false
 
-  # 下面字段保留是为了和 fisher_only_global / fisher_history_wolf_global 配置结构对齐。
-  # enabled=false 时这些字段不会实际生效。
-  max_batches: 10
-  model_mode: eval
-  eps: 1.0e-8
-  min_valid_clients: 2
-  missing_policy: error
-  diagnostics_enabled: false
-
-# =========================
-# 运行配置
-# =========================
-# auto 会根据 dataset / model / agg method / seed 等生成目录名。
-# 如果你想固定实验名，可以改成 pure_fl_uniform。
 run_name: auto
