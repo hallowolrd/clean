@@ -967,10 +967,20 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
 
             active_count = _safe_int(payload.get("active_count", 0), default=0)
             raw_score = _extract_raw_score(payload)
-            score = _extract_nonnegative_score(payload)
 
+            # NaN / Inf score 表示 evidence 统计异常，会在 _build_expert_records() 中直接跳过。
+            # 这类样本只计入 nan_score_clients / invalid_clients，不再计入 zero_score_clients。
             is_nan_score = not math.isfinite(raw_score)
-            is_zero_score = score <= 0.0
+
+            if is_nan_score:
+                score = 0.0
+                is_zero_score = False
+            else:
+                # score=0 是合法低 evidence，会保留并得到 h=log(eps)。
+                # 有限负数 score 压成 0，也按 zero_score 统计。
+                score = max(float(raw_score), 0.0)
+                is_zero_score = score <= 0.0
+
             is_zero_active = active_count <= 0
 
             if is_nan_score:
