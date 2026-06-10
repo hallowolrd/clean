@@ -554,7 +554,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
 
                 # 非冷启动才进入 ratio 统计，避免冷启动 residual=0 造成 ratio 爆炸。
                 non_cold_residual_abs_values.append(abs(residual))
-                non_cold_mu_update_abs_values.append(abs(mu_plus - old_mu))
+                # 只统计 Kalman correction 部分，不把共同漂移 delta 算进 mu_update_ratio。
+                non_cold_mu_update_abs_values.append(abs(mu_plus - mu_minus))
 
             new_age = old_age + 1
             self.history_state[(client_id, int(expert_id))] = _HistoryState(
