@@ -457,6 +457,9 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 "R": 0.0,
                 "num_history_clients": 0,
                 "num_cold_start_clients": 0,
+                # 新增诊断：没有有效 record 时，WoLF 降权比例自然为 0。
+                "W2_lt_0p5_frac": 0.0,
+                "W2_lt_0p1_frac": 0.0,
             }
 
         history_records = [
@@ -592,6 +595,17 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "mu_update_abs_stats": _stat_dict(mu_update_abs_values),
             "P_stats": _stat_dict(P_values),
             "mu_stats": _stat_dict(mu_values),
+            # 新增诊断：
+            # W2 < 0.5 表示观测被明显降权；
+            # W2 < 0.1 表示观测被强烈视为异常。
+            "W2_lt_0p5_frac": _safe_divide(
+                sum(1 for value in W2_values if value < 0.5),
+                len(W2_values),
+            ),
+            "W2_lt_0p1_frac": _safe_divide(
+                sum(1 for value in W2_values if value < 0.1),
+                len(W2_values),
+            ),
         }
 
     def _apply_expert_weighted_delta(
@@ -681,6 +695,17 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
         top1_weight, top2_weight, top1_gap = _top_weight_stats(final_weights)
         fisher_filtered_l1 = _weight_l1(fisher_weights, filtered_weights)
 
+        # 新增诊断：
+        # mu_update_ratio 用来判断滤波器吸收 residual 的比例。
+        #   接近 1：mu 几乎跟着当前 h 走，平滑弱；
+        #   接近 0：mu 几乎不动，可能过保守。
+        abs_residual_mean = _nested_stat_mean(update_diag, "residual_abs_stats")
+        abs_mu_update_mean = _nested_stat_mean(update_diag, "mu_update_abs_stats")
+        mu_update_ratio = _safe_divide(
+            abs_mu_update_mean,
+            abs_residual_mean + self.eps,
+        )
+
         diag: Dict[str, Any] = {
             "expert_id": int(expert_id),
             "keep_global": bool(keep_global),
@@ -710,16 +735,16 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "W2_mean": _nested_stat_mean(update_diag, "W2_stats"),
             "W2_min": _nested_stat_min(update_diag, "W2_stats"),
             "W2_max": _nested_stat_max(update_diag, "W2_stats"),
+            "W2_lt_0p5_frac": float(update_diag.get("W2_lt_0p5_frac", 0.0)),
+            "W2_lt_0p1_frac": float(update_diag.get("W2_lt_0p1_frac", 0.0)),
             "R_eff_mean": _nested_stat_mean(update_diag, "R_eff_stats"),
             "P_mean": _nested_stat_mean(update_diag, "P_stats"),
             "P_min": _nested_stat_min(update_diag, "P_stats"),
             "P_max": _nested_stat_max(update_diag, "P_stats"),
             "mu_mean": _nested_stat_mean(update_diag, "mu_stats"),
-            "abs_residual_mean": _nested_stat_mean(update_diag, "residual_abs_stats"),
-            "abs_mu_update_mean": _nested_stat_mean(
-                update_diag,
-                "mu_update_abs_stats",
-            ),
+            "abs_residual_mean": float(abs_residual_mean),
+            "abs_mu_update_mean": float(abs_mu_update_mean),
+            "mu_update_ratio": float(mu_update_ratio),
             "score_stats": _stat_dict(scores),
             "h_stats": _stat_dict(hs),
             "mu_plus_stats": _stat_dict(mus),
@@ -733,6 +758,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "fisher_weight_entropy_norm": _weight_entropy_norm(fisher_weights),
             "filtered_weight_entropy_norm": _weight_entropy_norm(filtered_weights),
             "effective_clients": _effective_clients(final_weights),
+            "fisher_effective_clients": _effective_clients(fisher_weights),
+            "filtered_effective_clients": _effective_clients(filtered_weights),
             "weight_min": min(final_weights.values()) if len(final_weights) > 0 else 0.0,
             "weight_max": max(final_weights.values()) if len(final_weights) > 0 else 0.0,
             "top_client": int(top_client) if top_client is not None else None,
@@ -868,11 +895,26 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "mean_R": _mean_clean([diag.get("R", 0.0) for diag in all_diags]),
             "mean_K": _mean_clean([diag.get("K_mean", 0.0) for diag in all_diags]),
             "mean_W2": _mean_clean([diag.get("W2_mean", 0.0) for diag in all_diags]),
+            "mean_W2_lt_0p5_frac": _mean_clean(
+                [diag.get("W2_lt_0p5_frac", 0.0) for diag in all_diags]
+            ),
+            "mean_W2_lt_0p1_frac": _mean_clean(
+                [diag.get("W2_lt_0p1_frac", 0.0) for diag in all_diags]
+            ),
+            "mean_R_eff": _mean_clean(
+                [diag.get("R_eff_mean", 0.0) for diag in all_diags]
+            ),
+            "mean_P": _mean_clean([diag.get("P_mean", 0.0) for diag in all_diags]),
+            "mean_P_min": _mean_clean([diag.get("P_min", 0.0) for diag in all_diags]),
+            "mean_P_max": _mean_clean([diag.get("P_max", 0.0) for diag in all_diags]),
             "mean_abs_residual": _mean_clean(
                 [diag.get("abs_residual_mean", 0.0) for diag in all_diags]
             ),
             "mean_abs_mu_update": _mean_clean(
                 [diag.get("abs_mu_update_mean", 0.0) for diag in all_diags]
+            ),
+            "mean_mu_update_ratio": _mean_clean(
+                [diag.get("mu_update_ratio", 0.0) for diag in all_diags]
             ),
             "mean_fisher_filtered_l1": _mean_clean(
                 [diag.get("fisher_filtered_l1", 0.0) for diag in all_diags]
@@ -888,6 +930,12 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             ),
             "mean_effective_clients": _mean_clean(
                 [diag.get("effective_clients", 0.0) for diag in updated_diags]
+            ),
+            "mean_fisher_effective_clients": _mean_clean(
+                [diag.get("fisher_effective_clients", 0.0) for diag in all_diags]
+            ),
+            "mean_filtered_effective_clients": _mean_clean(
+                [diag.get("filtered_effective_clients", 0.0) for diag in all_diags]
             ),
             "mean_weight_max": _mean_clean(
                 [diag.get("weight_max", 0.0) for diag in updated_diags]
