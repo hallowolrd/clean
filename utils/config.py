@@ -26,6 +26,7 @@ SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
     "fisher_only",
+    "fisher_history_wolf",
 }
 
 
@@ -125,12 +126,12 @@ def load_config(config_path: str | Path) -> ConfigNode:
     读取配置文件，并返回 ConfigNode。
 
     主要流程：
-        1. 读取 yaml
-        2. 处理 include
-        3. 合并默认值
-        4. 自动生成 run_name / run_dir
-        5. 做基础合法性检查
-        6. 转成 ConfigNode
+    1. 读取 yaml
+    2. 处理 include
+    3. 合并默认值
+    4. 自动生成 run_name / run_dir
+    5. 做基础合法性检查
+    6. 转成 ConfigNode
     """
     config_path = Path(config_path).expanduser().resolve()
 
@@ -221,7 +222,6 @@ def _load_yaml_with_include(
         raise ConfigError(f"配置文件顶层必须是 dict：{config_path}")
 
     cfg = dict(cfg)
-
     include = cfg.pop("include", None)
 
     if include is None:
@@ -258,9 +258,9 @@ def _deep_merge(
     递归合并配置。
 
     规则：
-        1. override 里的普通字段覆盖 base
-        2. override 里的 dict 会递归覆盖 base 里的 dict
-        3. list 不做递归合并，直接整体覆盖
+    1. override 里的普通字段覆盖 base
+    2. override 里的 dict 会递归覆盖 base 里的 dict
+    3. list 不做递归合并，直接整体覆盖
     """
     result = copy.deepcopy(dict(base))
 
@@ -349,29 +349,77 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Fisher-only 诊断配置。
     # diagnostics_enabled:
-    #   是否在 aggregation/fisher_only.py 中生成详细诊断字段。
+    #     是否在 aggregation/fisher_only.py 中生成详细诊断字段。
     #
     # diagnostics_print:
-    #   是否由 server.py 打印 Fisher 诊断日志到控制台 / train.log。
+    #     是否由 server.py 打印 Fisher 诊断日志到控制台 / train.log。
     #
     # diagnostics_print_every:
-    #   每隔多少轮打印一次 Fisher 诊断。
+    #     每隔多少轮打印一次 Fisher 诊断。
     #
     # diagnostics_print_experts:
-    #   是否逐 expert 打印诊断。第一版建议 false，避免日志太大。
+    #     是否逐 expert 打印诊断。第一版建议 false，避免日志太大。
     #
     # diagnostics_include_records:
-    #   是否把完整 client-expert records / expert_weights 写入 summary.json。
-    #   第一版建议 false，避免文件过大。
+    #     是否把完整 client-expert records / expert_weights 写入 summary.json。
+    #     第一版建议 false，避免文件过大。
     #
     # diagnostics_prefix:
-    #   Fisher 诊断日志前缀，方便 grep。
+    #     Fisher 诊断日志前缀，方便 grep。
     cfg["expert_fisher"].setdefault("diagnostics_enabled", True)
     cfg["expert_fisher"].setdefault("diagnostics_print", True)
     cfg["expert_fisher"].setdefault("diagnostics_print_every", 1)
     cfg["expert_fisher"].setdefault("diagnostics_print_experts", False)
     cfg["expert_fisher"].setdefault("diagnostics_include_records", False)
     cfg["expert_fisher"].setdefault("diagnostics_prefix", "[FisherDiag]")
+
+    # History-WoLF 服务端滤波配置。
+    # 注意：
+    # expert_fisher 负责“客户端如何采集 evidence”；
+    # history_filter 负责“服务端如何用 evidence 维护 mu / P / age 并生成 expert 权重”。
+    cfg.setdefault("history_filter", {})
+    cfg["history_filter"].setdefault("global_warmup_rounds", 10)
+    cfg["history_filter"].setdefault("post_warmup_force_filtered_weight", True)
+
+    # active_count_min:
+    #     判断 client-expert evidence 是否有效。
+    #
+    # min_valid_clients:
+    #     判断 expert 参数本轮是否允许更新。
+    #     这个参数不控制后台滤波器是否更新。
+    #     例如 min_valid_clients=2 时，只有 1 个有效客户端：
+    #         mu / P / age 仍然更新；
+    #         expert 参数本轮保持上一轮全局值。
+    cfg["history_filter"].setdefault("active_count_min", 1)
+    cfg["history_filter"].setdefault("min_valid_clients", 2)
+
+    # 判断能不能使用完整 History-WoLF 后台更新。
+    # 历史不足时使用普通 Kalman fallback，但 post-warmup 后最终权重仍然来自 mu+。
+    cfg["history_filter"].setdefault("history_warmup_age", 2)
+    cfg["history_filter"].setdefault("min_history_clients", 3)
+    cfg["history_filter"].setdefault("insufficient_history_update", "kalman_fallback")
+    cfg["history_filter"].setdefault("warmup_weight_mode", "fisher_only")
+
+    # log-score 空间 Kalman / WoLF 参数。
+    cfg["history_filter"].setdefault("observation_R", 1.0)
+    cfg["history_filter"].setdefault("mad_floor", 0.1)
+    cfg["history_filter"].setdefault("init_P", 1.0)
+    cfg["history_filter"].setdefault("process_noise_Q", 0.05)
+    cfg["history_filter"].setdefault("robust_c", 2.0)
+    cfg["history_filter"].setdefault("expert_weight_tau", 1.0)
+
+    # 数值稳定参数。
+    cfg["history_filter"].setdefault("w2_floor", 1.0e-6)
+    cfg["history_filter"].setdefault("P_floor", 1.0e-8)
+    cfg["history_filter"].setdefault("eps", 1.0e-12)
+
+    # History-WoLF 诊断配置。
+    cfg["history_filter"].setdefault("diagnostics_enabled", True)
+    cfg["history_filter"].setdefault("diagnostics_print", True)
+    cfg["history_filter"].setdefault("diagnostics_print_every", 1)
+    cfg["history_filter"].setdefault("diagnostics_print_experts", False)
+    cfg["history_filter"].setdefault("diagnostics_include_records", False)
+    cfg["history_filter"].setdefault("diagnostics_prefix", "[HistWolfDiag]")
 
     # 运行配置
     cfg.setdefault("seed", 42)
@@ -404,9 +452,9 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     生成 run_name 和 run_dir。
 
     规则：
-        1. run_name 缺失 / 为空 / auto / null 时，自动根据实验设置生成
-        2. 如果输出目录已存在，默认自动追加 _v2 / _v3
-        3. 如果 run.overwrite=True，则允许使用已有目录，不自动追加版本号
+    1. run_name 缺失 / 为空 / auto / null 时，自动根据实验设置生成
+    2. 如果输出目录已存在，默认自动追加 _v2 / _v3
+    3. 如果 run.overwrite=True，则允许使用已有目录，不自动追加版本号
     """
     cfg = copy.deepcopy(cfg)
 
@@ -540,7 +588,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     """
     基础合法性检查。
 
-    这个函数只检查通用配置和当前已接入的 expert_fisher 配置。
+    这个函数只检查通用配置和当前已接入的 expert_fisher / history_filter 配置。
     后面新增 history / Bayes 时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
@@ -573,11 +621,16 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：{sorted(SUPPORTED_AGG_METHODS)}"
         )
 
-    # fisher_only 是 expert-wise 权重聚合，只能用于 expert 参数组。
+    # fisher_only / fisher_history_wolf 都是 expert-wise 权重聚合，
+    # 只能用于 expert 参数组。
     # non_expert 参数仍然应该使用 uniform / sample_weighted。
-    if non_expert_method == "fisher_only":
+    expert_only_methods = {
+        "fisher_only",
+        "fisher_history_wolf",
+    }
+    if non_expert_method in expert_only_methods:
         raise ConfigError(
-            "fisher_only 只能用于 agg.expert.method，"
+            f"{non_expert_method} 只能用于 agg.expert.method，"
             "不能用于 agg.non_expert.method。"
         )
 
@@ -611,7 +664,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "momentum",
         "weight_decay",
     }
-
     for key in forbidden_top_level_optimizer_keys:
         if key in cfg:
             raise ConfigError(
@@ -621,7 +673,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
 
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_type = optimizer_cfg.get("type")
-
     if optimizer_type not in {"sgd", "adam", "adamw"}:
         raise ConfigError(
             f"不支持的优化器：{optimizer_type}。"
@@ -642,6 +693,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         cfg=cfg,
         expert_method=expert_method,
     )
+    _validate_history_filter_config(
+        cfg=cfg,
+        expert_method=expert_method,
+    )
 
 
 def _validate_expert_fisher_config(
@@ -652,10 +707,10 @@ def _validate_expert_fisher_config(
     检查 expert_fisher 配置。
 
     expert_fisher 用于：
-        1. 客户端本地训练后额外做 evidence forward + backward
-        2. 只对 expert Linear 层统计 K-FAC A / B
-        3. 给 fisher_only 聚合器提供 active_count / mean_A / mean_B / score
-        4. 控制 fisher_only 诊断字段生成和日志打印
+    1. 客户端本地训练后额外做 evidence forward + backward
+    2. 只对 expert Linear 层统计 K-FAC A / B
+    3. 给 fisher_only / fisher_history_wolf 聚合器提供 active_count / mean_A / mean_B / score
+    4. 控制 fisher_only 诊断字段生成和日志打印
     """
     expert_fisher_cfg = cfg.get("expert_fisher", {})
 
@@ -663,10 +718,9 @@ def _validate_expert_fisher_config(
         raise ConfigError("expert_fisher 必须是一个 dict。")
 
     enabled = bool(expert_fisher_cfg.get("enabled", False))
-
-    if expert_method == "fisher_only" and not enabled:
+    if expert_method in {"fisher_only", "fisher_history_wolf"} and not enabled:
         raise ConfigError(
-            "agg.expert.method=fisher_only 时，必须设置 "
+            f"agg.expert.method={expert_method} 时，必须设置 "
             "expert_fisher.enabled=true。"
         )
 
@@ -696,7 +750,6 @@ def _validate_expert_fisher_config(
             "expert_fisher.min_active_count 必须是非负整数，"
             f"当前值：{min_active_count}"
         )
-
     if min_active_count < 0:
         raise ConfigError(
             "expert_fisher.min_active_count 必须是非负整数，"
@@ -728,9 +781,7 @@ def _validate_expert_fisher_config(
 
     eps = float(expert_fisher_cfg.get("eps", 1.0e-8))
     if eps <= 0:
-        raise ConfigError(
-            f"expert_fisher.eps 必须大于 0，当前值：{eps}"
-        )
+        raise ConfigError(f"expert_fisher.eps 必须大于 0，当前值：{eps}")
 
     _validate_expert_fisher_diagnostics_config(expert_fisher_cfg)
 
@@ -742,8 +793,8 @@ def _validate_expert_fisher_diagnostics_config(
     检查 Fisher-only 诊断配置。
 
     这些字段主要服务于：
-        1. aggregation/fisher_only.py 生成 diagnostics
-        2. fl/server.py 打印 [FisherDiag] 日志
+    1. aggregation/fisher_only.py 生成 diagnostics
+    2. fl/server.py 打印 [FisherDiag] 日志
     """
     bool_fields = [
         "diagnostics_enabled",
@@ -754,7 +805,6 @@ def _validate_expert_fisher_diagnostics_config(
 
     for key in bool_fields:
         value = expert_fisher_cfg.get(key)
-
         if not isinstance(value, bool):
             raise ConfigError(
                 f"expert_fisher.{key} 必须是 bool，当前值：{value}"
@@ -775,6 +825,160 @@ def _validate_expert_fisher_diagnostics_config(
     if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
         raise ConfigError(
             "expert_fisher.diagnostics_prefix 必须是非空字符串，"
+            f"当前值：{diagnostics_prefix}"
+        )
+
+
+def _validate_history_filter_config(
+    cfg: Mapping[str, Any],
+    expert_method: str,
+) -> None:
+    """
+    检查 history_filter 配置。
+
+    history_filter 用于 fisher_history_wolf：
+    1. 控制 warmup 阶段最终权重来源；
+    2. 控制 client-expert 级别 mu / P / age 后台滤波更新；
+    3. 控制 History-WoLF 诊断字段生成和日志打印。
+    """
+    history_filter_cfg = cfg.get("history_filter", {})
+
+    if not isinstance(history_filter_cfg, Mapping):
+        raise ConfigError("history_filter 必须是一个 dict。")
+
+    # 这些字段即使当前不启用 fisher_history_wolf，也做轻量检查。
+    # 这样配置写错时可以尽早暴露。
+    _require_non_negative_int(history_filter_cfg, "global_warmup_rounds")
+    _require_non_negative_int(history_filter_cfg, "active_count_min")
+    _require_positive_int(history_filter_cfg, "min_valid_clients")
+    _require_non_negative_int(history_filter_cfg, "history_warmup_age")
+    _require_positive_int(history_filter_cfg, "min_history_clients")
+
+    post_warmup_force_filtered_weight = history_filter_cfg.get(
+        "post_warmup_force_filtered_weight",
+        True,
+    )
+    if not isinstance(post_warmup_force_filtered_weight, bool):
+        raise ConfigError(
+            "history_filter.post_warmup_force_filtered_weight 必须是 bool，"
+            f"当前值：{post_warmup_force_filtered_weight}"
+        )
+
+    insufficient_history_update = str(
+        history_filter_cfg.get("insufficient_history_update", "kalman_fallback")
+    ).lower()
+    if insufficient_history_update not in {"kalman_fallback"}:
+        raise ConfigError(
+            "history_filter.insufficient_history_update 当前只支持 kalman_fallback，"
+            f"当前值：{insufficient_history_update}"
+        )
+
+    warmup_weight_mode = str(
+        history_filter_cfg.get("warmup_weight_mode", "fisher_only")
+    ).lower()
+    if warmup_weight_mode not in {"fisher_only"}:
+        raise ConfigError(
+            "history_filter.warmup_weight_mode 当前只支持 fisher_only，"
+            f"当前值：{warmup_weight_mode}"
+        )
+
+    positive_float_fields = [
+        "observation_R",
+        "mad_floor",
+        "init_P",
+        "expert_weight_tau",
+        "w2_floor",
+        "P_floor",
+        "eps",
+    ]
+    for key in positive_float_fields:
+        value = float(history_filter_cfg.get(key))
+        if value <= 0:
+            raise ConfigError(
+                f"history_filter.{key} 必须大于 0，当前值：{value}"
+            )
+
+    process_noise_Q = float(history_filter_cfg.get("process_noise_Q"))
+    if process_noise_Q < 0:
+        raise ConfigError(
+            "history_filter.process_noise_Q 必须大于等于 0，"
+            f"当前值：{process_noise_Q}"
+        )
+
+    robust_c = float(history_filter_cfg.get("robust_c"))
+    if robust_c <= 0:
+        raise ConfigError(
+            f"history_filter.robust_c 必须大于 0，当前值：{robust_c}"
+        )
+
+    # fisher_history_wolf 才真正依赖 history_filter。
+    # 这里保留明确检查，防止后面有人误删默认配置。
+    if expert_method == "fisher_history_wolf":
+        required_keys = [
+            "global_warmup_rounds",
+            "active_count_min",
+            "min_valid_clients",
+            "history_warmup_age",
+            "min_history_clients",
+            "observation_R",
+            "mad_floor",
+            "init_P",
+            "process_noise_Q",
+            "robust_c",
+            "expert_weight_tau",
+            "w2_floor",
+            "P_floor",
+            "eps",
+        ]
+        for key in required_keys:
+            if key not in history_filter_cfg:
+                raise ConfigError(
+                    f"agg.expert.method=fisher_history_wolf 时，"
+                    f"history_filter.{key} 不能为空。"
+                )
+
+    _validate_history_filter_diagnostics_config(history_filter_cfg)
+
+
+def _validate_history_filter_diagnostics_config(
+    history_filter_cfg: Mapping[str, Any],
+) -> None:
+    """
+    检查 History-WoLF 诊断配置。
+
+    这些字段主要服务于：
+    1. aggregation/fisher_history_wolf.py 生成 diagnostics
+    2. fl/server.py 打印 [HistWolfDiag] 日志
+    """
+    bool_fields = [
+        "diagnostics_enabled",
+        "diagnostics_print",
+        "diagnostics_print_experts",
+        "diagnostics_include_records",
+    ]
+
+    for key in bool_fields:
+        value = history_filter_cfg.get(key)
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"history_filter.{key} 必须是 bool，当前值：{value}"
+            )
+
+    diagnostics_print_every = history_filter_cfg.get("diagnostics_print_every", 1)
+    if (
+        not isinstance(diagnostics_print_every, int)
+        or isinstance(diagnostics_print_every, bool)
+        or diagnostics_print_every <= 0
+    ):
+        raise ConfigError(
+            "history_filter.diagnostics_print_every 必须是正整数，"
+            f"当前值：{diagnostics_print_every}"
+        )
+
+    diagnostics_prefix = history_filter_cfg.get("diagnostics_prefix", "[HistWolfDiag]")
+    if not isinstance(diagnostics_prefix, str) or len(diagnostics_prefix.strip()) == 0:
+        raise ConfigError(
+            "history_filter.diagnostics_prefix 必须是非空字符串，"
             f"当前值：{diagnostics_prefix}"
         )
 

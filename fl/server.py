@@ -79,18 +79,18 @@ class FLServer:
     联邦学习服务端。
 
     职责：
-        1. 持有全局模型
-        2. 选择每轮参与训练的客户端
-        3. 收集客户端更新
-        4. 分别聚合 non_expert 参数和 expert 参数
-        5. 在服务器测试集上评估全局模型
+    1. 持有全局模型
+    2. 选择每轮参与训练的客户端
+    3. 收集客户端更新
+    4. 分别聚合 non_expert 参数和 expert 参数
+    5. 在服务器测试集上评估全局模型
 
     不负责：
-        1. 数据集加载
-        2. 数据划分
-        3. 具体客户端本地训练细节
-        4. 具体聚合权重算法细节
-        5. checkpoint 保存
+    1. 数据集加载
+    2. 数据划分
+    3. 具体客户端本地训练细节
+    4. 具体聚合权重算法细节
+    5. checkpoint 保存
     """
 
     def __init__(
@@ -115,10 +115,10 @@ class FLServer:
 
         self.global_model.to("cpu")
 
-        # client_evidence_loaders 用于 expert_fisher / fisher_only：
+        # client_evidence_loaders 用于 expert_fisher / fisher_only / fisher_history_wolf：
         # 客户端本地训练完成后，会额外使用 evidence_loader 做一轮
         # 无数据增强的 forward + backward 来统计 expert K-FAC。
-        # server 只负责把 evidence_loader 透传给 client，不关心 Fisher 细节。
+        # server 只负责把 evidence_loader 透传给 client，不关心 Fisher / History-WoLF 细节。
         self.clients = build_clients(
             cfg=cfg,
             client_loaders=client_loaders,
@@ -127,6 +127,7 @@ class FLServer:
         )
 
         self.test_loader = test_loader
+
         self.aggregators: AggregatorBundle = build_aggregators(cfg)
 
         self.param_groups: ParamGroups = build_param_groups(
@@ -151,13 +152,13 @@ class FLServer:
         执行完整 FL 训练流程。
 
         每一轮流程：
-            1. 选择客户端
-            2. 客户端本地训练
-            3. 聚合 non_expert 参数
-            4. 聚合 expert 参数
-            5. 更新全局模型
-            6. 在服务器测试集评估
-            7. 记录 RoundResult
+        1. 选择客户端
+        2. 客户端本地训练
+        3. 聚合 non_expert 参数
+        4. 聚合 expert 参数
+        5. 更新全局模型
+        6. 在服务器测试集评估
+        7. 记录 RoundResult
         """
         rounds = int(_cfg_get(self.cfg, "rounds", 1))
         frac = float(_cfg_get(self.cfg, "frac", 1.0))
@@ -202,15 +203,21 @@ class FLServer:
                 eval_result=eval_result,
                 aggregation_info=aggregation_info,
             )
+
             self.round_results.append(round_result)
 
             if log_every > 0 and round_id % log_every == 0:
                 self.print_round_summary(round_result)
 
             # Fisher-only 诊断打印由 expert_fisher.diagnostics_print 控制。
-            # 这里仅负责读取聚合器已经生成的 diagnostics 并打印摘要，
+            # 这里只负责读取聚合器已经生成的 diagnostics 并打印摘要，
             # 不在 server 里计算 Fisher 细节，保持解耦。
             self.print_fisher_diagnostics(round_result)
+
+            # Fisher evidence + History-WoLF 诊断打印由 history_filter.diagnostics_print 控制。
+            # 这里同样只打印 aggregation/fisher_history_wolf.py 已经生成的诊断字段，
+            # server 不参与 mu / P / age / W2 / R_eff 的计算。
+            self.print_history_wolf_diagnostics(round_result)
 
             self._cleanup_after_round()
 
@@ -229,12 +236,16 @@ class FLServer:
         聚合客户端更新。
 
         聚合顺序：
-            1. non_expert 参数
-            2. expert 参数
+        1. non_expert 参数
+        2. expert 参数
 
         这样可以让二者使用不同聚合器：
-            non_expert: sample_weighted / uniform
-            expert: uniform / sample_weighted / fisher_only / 后续 history_wolf
+
+            non_expert:
+                sample_weighted / uniform
+
+            expert:
+                uniform / sample_weighted / fisher_only / fisher_history_wolf
         """
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
@@ -317,7 +328,6 @@ class FLServer:
             weighted=True,
             default=None,
         )
-
         avg_train_acc = average_client_metric(
             client_updates=list(client_updates),
             metric_name="train_acc",
@@ -351,8 +361,13 @@ class FLServer:
 
         expert_fisher_cfg = _cfg_get(self.cfg, "expert_fisher", {})
         expert_fisher_enabled = bool(_cfg_get(expert_fisher_cfg, "enabled", False))
-        diagnostics_print = bool(
+        fisher_diagnostics_print = bool(
             _cfg_get(expert_fisher_cfg, "diagnostics_print", False)
+        )
+
+        history_filter_cfg = _cfg_get(self.cfg, "history_filter", {})
+        history_diagnostics_print = bool(
+            _cfg_get(history_filter_cfg, "diagnostics_print", False)
         )
 
         print()
@@ -374,7 +389,8 @@ class FLServer:
             f"expert={self.aggregators.expert.method_name}"
         )
         print(f"[Server] expert_fisher.enabled: {expert_fisher_enabled}")
-        print(f"[Server] expert_fisher.diagnostics_print: {diagnostics_print}")
+        print(f"[Server] expert_fisher.diagnostics_print: {fisher_diagnostics_print}")
+        print(f"[Server] history_filter.diagnostics_print: {history_diagnostics_print}")
         print(f"[Server] param_groups: {self.param_groups.summary()}")
         print(f"[Server] param_numel: {param_summary['floating_numel']}")
         print("=" * 80)
@@ -424,18 +440,17 @@ class FLServer:
 
         打印开关在 yaml 中控制：
 
-        expert_fisher:
-          diagnostics_print: true
-          diagnostics_print_every: 1
-          diagnostics_print_experts: false
-          diagnostics_prefix: "[FisherDiag]"
+            expert_fisher:
+              diagnostics_print: true
+              diagnostics_print_every: 1
+              diagnostics_print_experts: false
+              diagnostics_prefix: "[FisherDiag]"
 
         注意：
             这里只打印 diagnostics 中已经存在的摘要字段。
             Fisher score / 权重 / 相关性等计算仍然放在 aggregation/fisher_only.py。
         """
         expert_fisher_cfg = _cfg_get(self.cfg, "expert_fisher", {})
-
         diagnostics_print = bool(
             _cfg_get(expert_fisher_cfg, "diagnostics_print", False)
         )
@@ -458,7 +473,7 @@ class FLServer:
         if not isinstance(diagnostics, dict):
             return
 
-        # 只打印 fisher_only 的诊断，避免 uniform / sample_weighted 时误打。
+        # 只打印 fisher_only 的诊断，避免 uniform / sample_weighted / fisher_history_wolf 时误打。
         if diagnostics.get("method", None) != "fisher_only":
             return
 
@@ -528,6 +543,139 @@ class FLServer:
                 f"zero_active={_safe_int(expert_diag.get('zero_active_clients', 0))}"
             )
 
+    def print_history_wolf_diagnostics(
+        self,
+        round_result: RoundResult,
+    ) -> None:
+        """
+        打印 fisher_history_wolf 的紧凑诊断日志。
+
+        打印开关在 yaml 中控制：
+
+            history_filter:
+              diagnostics_print: true
+              diagnostics_print_every: 1
+              diagnostics_print_experts: false
+              diagnostics_prefix: "[HistWolfDiag]"
+
+        注意：
+            这里只读取 aggregation/fisher_history_wolf.py 已经生成的 diagnostics。
+            server 不计算 mu / P / age / R / W2 / K，避免把算法逻辑写进训练流程。
+        """
+        history_filter_cfg = _cfg_get(self.cfg, "history_filter", {})
+        diagnostics_print = bool(
+            _cfg_get(history_filter_cfg, "diagnostics_print", False)
+        )
+        if not diagnostics_print:
+            return
+
+        print_every = int(
+            _cfg_get(history_filter_cfg, "diagnostics_print_every", 1)
+        )
+        print_every = max(print_every, 1)
+
+        if int(round_result.round_id) % print_every != 0:
+            return
+
+        expert_summary = round_result.aggregation_info.get("expert", {})
+        if not isinstance(expert_summary, dict):
+            return
+
+        diagnostics = expert_summary.get("diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            return
+
+        # 只打印 fisher_history_wolf 的诊断，避免其他 expert 聚合器误打。
+        if diagnostics.get("method", None) != "fisher_history_wolf":
+            return
+
+        if not bool(diagnostics.get("history_diag_enabled", False)):
+            return
+
+        prefix = str(
+            _cfg_get(history_filter_cfg, "diagnostics_prefix", "[HistWolfDiag]")
+        )
+
+        num_experts = _safe_int(diagnostics.get("num_experts", 0))
+        num_keep_global_experts = _safe_int(
+            diagnostics.get("num_keep_global_experts", 0)
+        )
+        is_global_warmup = bool(diagnostics.get("is_global_warmup", False))
+        phase = "warmup" if is_global_warmup else "filtered"
+
+        update_mode_counts = diagnostics.get("update_mode_counts", {})
+        weight_source_counts = diagnostics.get("weight_source_counts", {})
+
+        print(
+            f"{prefix}[Round {round_result.round_id:03d}] "
+            f"phase={phase} | "
+            f"experts={num_experts} | "
+            f"keep_global={num_keep_global_experts}/{num_experts} | "
+            f"fallback_ratio={_fmt_float(diagnostics.get('fallback_ratio', 0.0), 3)} | "
+            f"valid={_fmt_float(diagnostics.get('mean_valid_clients', 0.0), 2)} | "
+            f"history={_fmt_float(diagnostics.get('mean_history_clients', 0.0), 2)} | "
+            f"cold={_fmt_float(diagnostics.get('mean_cold_start_clients', 0.0), 2)} | "
+            f"eff_clients={_fmt_float(diagnostics.get('mean_effective_clients', 0.0), 2)} | "
+            f"entropy_norm={_fmt_float(diagnostics.get('mean_final_weight_entropy_norm', 0.0), 3)} | "
+            f"w_max={_fmt_float(diagnostics.get('mean_weight_max', 0.0), 3)} | "
+            f"R={_fmt_float(diagnostics.get('mean_R', 0.0), 4)} | "
+            f"K={_fmt_float(diagnostics.get('mean_K', 0.0), 3)} | "
+            f"W2={_fmt_float(diagnostics.get('mean_W2', 0.0), 3)} | "
+            f"abs_res={_fmt_float(diagnostics.get('mean_abs_residual', 0.0), 3)} | "
+            f"mu_upd={_fmt_float(diagnostics.get('mean_abs_mu_update', 0.0), 3)} | "
+            f"fisher_filtered_l1={_fmt_float(diagnostics.get('mean_fisher_filtered_l1', 0.0), 3)} | "
+            f"update_modes={_fmt_count_dict(update_mode_counts)} | "
+            f"weight_sources={_fmt_count_dict(weight_source_counts)}"
+        )
+
+        print_experts = bool(
+            _cfg_get(history_filter_cfg, "diagnostics_print_experts", False)
+        )
+        if not print_experts:
+            return
+
+        expert_diagnostics = diagnostics.get("expert_diagnostics", {})
+        if not isinstance(expert_diagnostics, dict):
+            return
+
+        for expert_id, expert_diag in _sorted_expert_diagnostics(
+            expert_diagnostics
+        ):
+            if not isinstance(expert_diag, dict):
+                continue
+
+            keep_global = bool(expert_diag.get("keep_global", False))
+            keep_global_reason = expert_diag.get("fallback_reason", None)
+            reason_text = "none" if keep_global_reason is None else str(keep_global_reason)
+
+            top_client = expert_diag.get("top_client", None)
+            top_client_text = "none" if top_client is None else str(top_client)
+
+            print(
+                f"{prefix}[Round {round_result.round_id:03d}][Expert {expert_id}] "
+                f"valid={_safe_int(expert_diag.get('valid_clients', 0))} | "
+                f"history={_safe_int(expert_diag.get('history_clients', 0))} | "
+                f"cold={_safe_int(expert_diag.get('cold_start_clients', 0))} | "
+                f"keep_global={str(keep_global).lower()} | "
+                f"reason={reason_text} | "
+                f"update_mode={expert_diag.get('update_mode', 'unknown')} | "
+                f"weight_source={expert_diag.get('weight_source', 'unknown')} | "
+                f"eff={_fmt_float(expert_diag.get('effective_clients', 0.0), 2)} | "
+                f"entropy_norm={_fmt_float(expert_diag.get('final_weight_entropy_norm', 0.0), 3)} | "
+                f"w_max={_fmt_float(expert_diag.get('weight_max', 0.0), 3)} | "
+                f"top_client={top_client_text} | "
+                f"top1_gap={_fmt_float(expert_diag.get('top1_gap', 0.0), 3)} | "
+                f"R={_fmt_float(expert_diag.get('R', 0.0), 4)} | "
+                f"K={_fmt_float(expert_diag.get('K_mean', 0.0), 3)} | "
+                f"W2={_fmt_float(expert_diag.get('W2_mean', 0.0), 3)} | "
+                f"abs_res={_fmt_float(expert_diag.get('abs_residual_mean', 0.0), 3)} | "
+                f"mu_upd={_fmt_float(expert_diag.get('abs_mu_update_mean', 0.0), 3)} | "
+                f"delta={_fmt_float(expert_diag.get('delta', 0.0), 3)} | "
+                f"mad_h={_fmt_float(expert_diag.get('mad_h', 0.0), 3)} | "
+                f"mad_r={_fmt_float(expert_diag.get('mad_r', 0.0), 3)} | "
+                f"fisher_filtered_l1={_fmt_float(expert_diag.get('fisher_filtered_l1', 0.0), 3)}"
+            )
+
     def _validate_server_state(self) -> None:
         """
         检查服务端初始化状态是否合法。
@@ -572,8 +720,8 @@ def build_server(
 
     client_evidence_loaders:
         可选的客户端 evidence DataLoader 列表。
-        当 expert_fisher.enabled=true 时必须传入，用于客户端训练完成后的
-        expert K-FAC evidence 统计。
+        当 expert_fisher.enabled=true 时必须传入，
+        用于客户端训练完成后的 expert K-FAC evidence 统计。
     """
     return FLServer(
         cfg=cfg,
@@ -608,13 +756,11 @@ def resolve_device(cfg: Any) -> torch.device:
     if device_name == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("配置 device=cuda，但当前环境 CUDA 不可用。")
-
         return torch.device("cuda")
 
     if device_name == "mps":
         if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
             raise RuntimeError("配置 device=mps，但当前环境 MPS 不可用。")
-
         return torch.device("mps")
 
     if device_name == "cpu":
@@ -665,6 +811,24 @@ def _fmt_float(
         return "nan"
 
     return f"{value:.{digits}f}"
+
+
+def _fmt_count_dict(value: Any) -> str:
+    """
+    把诊断中的计数字典格式化成短字符串。
+
+    示例：
+        {"history_wolf": 3, "kalman_fallback": 1}
+        -> history_wolf:3,kalman_fallback:1
+    """
+    if not isinstance(value, dict) or len(value) == 0:
+        return "none"
+
+    items: List[str] = []
+    for key in sorted(value.keys()):
+        items.append(f"{key}:{_safe_int(value.get(key, 0))}")
+
+    return ",".join(items)
 
 
 def _safe_int(

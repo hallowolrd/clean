@@ -1,0 +1,204 @@
+# 继承基础配置，只覆盖 fisher_history_wolf 实验必须修改的字段
+include: base.yaml
+
+
+# =========================
+# 聚合配置
+# =========================
+agg:
+  # 非专家参数聚合方法
+  # 保持和普通 FedAvg 主干一致，不让 History-WoLF 影响 backbone / router / classifier。
+  non_expert:
+    method: uniform
+
+  # 专家参数聚合方法
+  # fisher_history_wolf 只作用于 MoE experts 参数。
+  expert:
+    method: fisher_history_wolf
+
+
+# =========================
+# Expert Fisher / K-FAC evidence 配置
+# =========================
+expert_fisher:
+  # 开启客户端本地训练完成后的 expert K-FAC 统计。
+  # 如果 agg.expert.method=fisher_history_wolf，这里必须为 true。
+  enabled: true
+
+  # 统计 Fisher 时使用 eval 模式。
+  # 注意：eval 只关闭 Dropout / BN 更新，不会关闭 Dataset 里的随机增强；
+  # 随机增强已经通过 train_evidence_dataset 单独关闭。
+  model_mode: eval
+
+  # Linear 层有 bias 时，把 bias 合进 A 统计。
+  # 即输入激活 a 末尾拼一列 1。
+  include_bias: true
+
+  # evidence pass 的 loss 使用 sum。
+  # 这样不会因为最后一个 batch 较小导致梯度尺度被 batch mean 影响。
+  loss_reduction: sum
+
+  # 默认完整跑完客户端本地 evidence_loader。
+  # 如果只想 smoke 测试，可以临时改成 1 / 2。
+  max_batches: null
+
+  # expert 至少 routed 到多少 token / sample，才认为这个 client-expert evidence 有效。
+  # 这里是客户端 evidence 统计侧的默认阈值。
+  min_active_count: 1
+
+  # fisher_only 旧逻辑保留字段。
+  # fisher_history_wolf 不直接使用这个字段控制参数更新；
+  # 新算法的参数更新阈值放在 history_filter.min_valid_clients。
+  min_valid_clients: 2
+
+  # fisher_only 旧逻辑保留字段。
+  # fisher_history_wolf 的 keep_global 逻辑由 history_filter.min_valid_clients 控制。
+  fallback: keep_global
+
+  # Fisher evidence 统计侧数值稳定项。
+  eps: 1.0e-8
+
+  # =========================
+  # Fisher evidence 诊断日志配置
+  # =========================
+  # 是否在 aggregation/fisher_only.py 中生成 Fisher 诊断字段。
+  # fisher_history_wolf 主要使用 history_filter 的诊断；
+  # 这里保留 true，方便兼容 fisher_only 配置。
+  diagnostics_enabled: true
+
+  # fisher_history_wolf 主要打印 [HistWolfDiag]；
+  # 这里建议先关掉，避免和新算法诊断日志重复。
+  diagnostics_print: false
+
+  # 每隔多少轮打印一次 Fisher 诊断。
+  diagnostics_print_every: 1
+
+  # 是否逐 expert 打印 Fisher 诊断。
+  diagnostics_print_experts: false
+
+  # 是否把每个 client-expert 的完整 records / expert_weights 写入 summary.json。
+  diagnostics_include_records: false
+
+  # Fisher 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[FisherDiag]"
+
+
+# =========================
+# Fisher Evidence + History-WoLF 配置
+# =========================
+history_filter:
+  # 前几轮只限制最终权重来源，不限制滤波器后台更新。
+  # 第 1 ~ global_warmup_rounds 轮：
+  #   最终 expert 权重使用 fisher_only。
+  #   但是 mu / P / age 后台照常更新。
+  global_warmup_rounds: 10
+
+  # 第 global_warmup_rounds + 1 轮开始，最终 expert 权重统一使用 filtered mu+。
+  # 历史是否充足只决定后台更新模式，不再决定最终权重是否 fallback 到 fisher_only。
+  post_warmup_force_filtered_weight: true
+
+  # 判断 client-expert evidence 是否有效。
+  # active_count < active_count_min 时，该 client-expert 本轮不更新 mu / P / age。
+  active_count_min: 1
+
+  # 每个 expert 本轮至少需要多少个有效客户端，才允许更新 expert 参数。
+  #
+  # 注意：
+  #   这个参数只控制 expert 参数是否更新；
+  #   不控制后台滤波器是否更新。
+  #
+  # 例如 min_valid_clients=2 时：
+  #   如果某个 expert 本轮只有 1 个有效客户端，
+  #   则这个客户端的 mu / P / age 仍然更新，
+  #   但是该 expert 参数本轮 keep_global。
+  #
+  # 可做消融：
+  #   1 = 更激进，一个有效客户端也允许更新 expert；
+  #   2 = 更保守，至少两个有效客户端才更新 expert。
+  min_valid_clients: 2
+
+  # client-expert 至少被有效观测多少次，才算成熟历史。
+  history_warmup_age: 2
+
+  # 一个 expert 至少需要多少个成熟历史客户端，才启用完整 History-WoLF 更新。
+  # 不足时使用普通 Kalman fallback。
+  min_history_clients: 3
+
+  # 历史不足时的后台更新方式。
+  # 当前只支持普通 Kalman fallback。
+  insufficient_history_update: kalman_fallback
+
+  # warmup 阶段最终 expert 权重来源。
+  # 当前只支持 fisher_only。
+  warmup_weight_mode: fisher_only
+
+  # 观测噪声倍率。
+  # 历史不足时：
+  #   R = observation_R * max(MAD(h), mad_floor)^2
+  # 历史充足时：
+  #   R = observation_R * max(MAD(r), mad_floor)^2
+  observation_R: 1.0
+
+  # log-score 空间 MAD 下限。
+  # 防止 MAD 太小导致 R 太小，Kalman gain 过大。
+  mad_floor: 0.1
+
+  # 冷启动时的初始不确定性倍率。
+  # P = init_P * R
+  init_P: 1.0
+
+  # 过程噪声倍率。
+  # P- = P_old + process_noise_Q * R
+  process_noise_Q: 0.05
+
+  # WoLF-IMQ 软阈值 c。
+  # residual 越大，W2 越小，R_eff 越大，Kalman gain 越小。
+  robust_c: 2.0
+
+  # post-warmup 阶段 filtered mu 权重的 softmax 温度。
+  # 第一版保持 1.0，不额外调温。
+  expert_weight_tau: 1.0
+
+  # WoLF 权重 W2 下限。
+  # 防止 W2 太小导致 R_eff 爆炸。
+  w2_floor: 1.0e-6
+
+  # P 下限。
+  # 防止 P 太小导致滤波器完全冻结。
+  P_floor: 1.0e-8
+
+  # History-WoLF 数值稳定项。
+  eps: 1.0e-12
+
+  # =========================
+  # History-WoLF 诊断日志配置
+  # =========================
+  # 是否在 aggregation/fisher_history_wolf.py 中生成详细诊断字段。
+  diagnostics_enabled: true
+
+  # 是否在控制台和 train.log 中打印 History-WoLF 诊断摘要。
+  diagnostics_print: true
+
+  # 每隔多少轮打印一次 History-WoLF 诊断。
+  # 1 表示每轮都打印。
+  diagnostics_print_every: 1
+
+  # 是否逐 expert 打印诊断。
+  # 第一版建议 false，只打印 round-level 摘要，避免日志太大。
+  # 如果后面发现某些 expert 异常，再临时改成 true。
+  diagnostics_print_experts: false
+
+  # 是否把每个 client-expert 的完整 records / expert_weights 写入 summary.json。
+  # 第一版建议 false，避免 summary.json 过大。
+  # 如果要精查某一轮每个 expert 的客户端权重，再临时改成 true。
+  diagnostics_include_records: false
+
+  # History-WoLF 诊断日志前缀，方便 grep。
+  diagnostics_prefix: "[HistWolfDiag]"
+
+
+# =========================
+# 运行配置
+# =========================
+# auto 会自动根据 dataset / model / agg method / seed 等生成目录名。
+run_name: auto
