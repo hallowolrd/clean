@@ -114,19 +114,6 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
     ) -> AggregationResult:
         """
         执行 Fisher evidence + History-WoLF expert-wise delta 聚合。
-
-        参数：
-            global_state:
-                本轮聚合前的全局模型参数。
-            client_updates:
-                本轮客户端更新。每个 update.extra 必须包含 extra["expert_kfac"]。
-            param_names:
-                当前聚合器负责的 expert 参数名。
-            base_state:
-                聚合结果写入的基础 state_dict。
-                极致解耦流程中通常是 non_expert 聚合后的 state_dict。
-            strict:
-                True 时缺少必要字段直接报错；False 时尽量跳过缺失项。
         """
         if self.param_group_name != "expert":
             raise ValueError(
@@ -457,7 +444,15 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 "R": 0.0,
                 "num_history_clients": 0,
                 "num_cold_start_clients": 0,
-                # 新增诊断：没有有效 record 时，WoLF 降权比例自然为 0。
+                "K_stats": _stat_dict([]),
+                "W2_stats": _stat_dict([]),
+                "R_eff_stats": _stat_dict([]),
+                "residual_abs_stats": _stat_dict([]),
+                "mu_update_abs_stats": _stat_dict([]),
+                "non_cold_residual_abs_stats": _stat_dict([]),
+                "non_cold_mu_update_abs_stats": _stat_dict([]),
+                "P_stats": _stat_dict([]),
+                "mu_stats": _stat_dict([]),
                 "W2_lt_0p5_frac": 0.0,
                 "W2_lt_0p1_frac": 0.0,
             }
@@ -507,6 +502,10 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
         R_eff_values: List[float] = []
         residual_values_all: List[float] = []
         mu_update_abs_values: List[float] = []
+        # 只统计非冷启动样本，用来计算 mu_update_ratio。
+        # 冷启动时 residual 被定义为 0，但 mu_plus=h，若混进去会导致 ratio 爆炸。
+        non_cold_residual_abs_values: List[float] = []
+        non_cold_mu_update_abs_values: List[float] = []
         P_values: List[float] = []
         mu_values: List[float] = []
         cold_start_count = 0
@@ -553,6 +552,10 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 P_plus = (1.0 - K) * P_minus
                 P_plus = max(float(P_plus), self.P_floor)
 
+                # 非冷启动才进入 ratio 统计，避免冷启动 residual=0 造成 ratio 爆炸。
+                non_cold_residual_abs_values.append(abs(residual))
+                non_cold_mu_update_abs_values.append(abs(mu_plus - old_mu))
+
             new_age = old_age + 1
             self.history_state[(client_id, int(expert_id))] = _HistoryState(
                 mu=float(mu_plus),
@@ -593,6 +596,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "R_eff_stats": _stat_dict(R_eff_values),
             "residual_abs_stats": _stat_dict([abs(v) for v in residual_values_all]),
             "mu_update_abs_stats": _stat_dict(mu_update_abs_values),
+            "non_cold_residual_abs_stats": _stat_dict(non_cold_residual_abs_values),
+            "non_cold_mu_update_abs_stats": _stat_dict(non_cold_mu_update_abs_values),
             "P_stats": _stat_dict(P_values),
             "mu_stats": _stat_dict(mu_values),
             # 新增诊断：
@@ -695,15 +700,24 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
         top1_weight, top2_weight, top1_gap = _top_weight_stats(final_weights)
         fisher_filtered_l1 = _weight_l1(fisher_weights, filtered_weights)
 
-        # 新增诊断：
-        # mu_update_ratio 用来判断滤波器吸收 residual 的比例。
-        #   接近 1：mu 几乎跟着当前 h 走，平滑弱；
-        #   接近 0：mu 几乎不动，可能过保守。
+        # 全量 residual / mu_update 仍保留，用于观察整体状态变化。
         abs_residual_mean = _nested_stat_mean(update_diag, "residual_abs_stats")
         abs_mu_update_mean = _nested_stat_mean(update_diag, "mu_update_abs_stats")
+
+        # mu_update_ratio 只使用非冷启动样本计算。
+        # 冷启动时 residual 被定义为 0，但 mu 会直接初始化成 h，
+        # 如果混入冷启动样本，ratio 会因为除以接近 0 而爆炸。
+        non_cold_abs_residual_mean = _nested_stat_mean(
+            update_diag,
+            "non_cold_residual_abs_stats",
+        )
+        non_cold_abs_mu_update_mean = _nested_stat_mean(
+            update_diag,
+            "non_cold_mu_update_abs_stats",
+        )
         mu_update_ratio = _safe_divide(
-            abs_mu_update_mean,
-            abs_residual_mean + self.eps,
+            non_cold_abs_mu_update_mean,
+            non_cold_abs_residual_mean + self.eps,
         )
 
         diag: Dict[str, Any] = {
@@ -744,6 +758,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             "mu_mean": _nested_stat_mean(update_diag, "mu_stats"),
             "abs_residual_mean": float(abs_residual_mean),
             "abs_mu_update_mean": float(abs_mu_update_mean),
+            "non_cold_abs_residual_mean": float(non_cold_abs_residual_mean),
+            "non_cold_abs_mu_update_mean": float(non_cold_abs_mu_update_mean),
             "mu_update_ratio": float(mu_update_ratio),
             "score_stats": _stat_dict(scores),
             "h_stats": _stat_dict(hs),
@@ -912,6 +928,12 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
             ),
             "mean_abs_mu_update": _mean_clean(
                 [diag.get("abs_mu_update_mean", 0.0) for diag in all_diags]
+            ),
+            "mean_non_cold_abs_residual": _mean_clean(
+                [diag.get("non_cold_abs_residual_mean", 0.0) for diag in all_diags]
+            ),
+            "mean_non_cold_abs_mu_update": _mean_clean(
+                [diag.get("non_cold_abs_mu_update_mean", 0.0) for diag in all_diags]
             ),
             "mean_mu_update_ratio": _mean_clean(
                 [diag.get("mu_update_ratio", 0.0) for diag in all_diags]
