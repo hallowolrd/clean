@@ -53,7 +53,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
     - active_count < active_count_min：该 client-expert 本轮无效，不更新状态。
     - len(valid_records) < min_valid_clients：该 expert 参数本轮 keep_global，
       但是 valid_records 中的状态仍然会更新，用于积累历史。
-    - score=0 不会直接丢弃，只会得到 h=log(eps)，权重自然变小或接近 uniform。
+    - NaN / Inf score：认为 evidence 统计异常，直接跳过该 client-expert。
+    - score=0：认为是合法的低 evidence，保留并得到 h=log(eps)。
     """
 
     def __init__(self, cfg: Any, param_group_name: str) -> None:
@@ -91,9 +92,13 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 if active_count < self.active_count_min:
                     continue
 
-                score = _extract_nonnegative_score(payload)
-                if math.isfinite(score):
-                    total_score += max(float(score), 0.0)
+                # NaN / Inf score 表示 evidence 统计异常，诊断权重里也直接跳过；
+                # score=0 是合法低 evidence，保留但不会贡献总 score。
+                raw_score = _extract_raw_score(payload)
+                if not math.isfinite(raw_score):
+                    continue
+
+                total_score += max(float(raw_score), 0.0)
 
             weights[int(update.client_id)] = float(total_score)
 
@@ -371,8 +376,8 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
         """
         为单个 expert 收集本轮有效 client-expert records。
 
-        有效性只由 active_count_min 和 h 是否有限决定。
-        score=0 不会被过滤，而是得到 h=log(eps)。
+        有效性由 active_count_min、raw_score 是否有限、h 是否有限决定。
+        NaN / Inf score 会直接跳过；score=0 会保留。
         """
         records: List[Dict[str, Any]] = []
 
@@ -396,8 +401,15 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
                 mean_A=mean_A,
                 mean_B=mean_B,
             )
-            score = _extract_nonnegative_score(payload)
-            h = math.log(max(score, 0.0) + self.eps)
+
+            # NaN / Inf score 通常表示 evidence 统计异常，直接跳过；
+            # score=0 是合法的低 evidence，保留并得到 h=log(eps)。
+            raw_score = _extract_raw_score(payload)
+            if not math.isfinite(raw_score):
+                continue
+
+            score = max(float(raw_score), 0.0)
+            h = math.log(score + self.eps)
 
             if not math.isfinite(h):
                 continue
@@ -932,8 +944,9 @@ class FisherHistoryWolfExpertAggregator(Aggregator):
         统计单个 expert 的原始 payload 状态。
 
         注意：
-        这里的 invalid_clients 只表示不能进入 V 的客户端数量。
-        score=0 不算 invalid，因为新算法允许 h=log(eps)。
+        - score=0 不算 invalid，因为新算法允许 h=log(eps)。
+        - NaN / Inf score 算 invalid，因为 evidence 统计异常，
+          会在构建 records 时直接跳过。
         """
         missing_payload_clients = 0
         zero_score_clients = 0

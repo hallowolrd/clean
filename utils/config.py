@@ -48,6 +48,7 @@ class ConfigNode:
     也支持路径读取：
         cfg.get("agg.non_expert.method", "sample_weighted")
         cfg.get("agg.expert.method", "uniform")
+        cfg.get("checkpoint.enabled", True)
     """
 
     def __init__(self, data: Mapping[str, Any]):
@@ -862,6 +863,16 @@ def _validate_history_filter_config(
         raise ConfigError(
             "history_filter.post_warmup_force_filtered_weight 必须是 bool，"
             f"当前值：{post_warmup_force_filtered_weight}"
+        )
+
+    # 当前 fisher_history_wolf 版本固定采用：
+    #   warmup 后最终 expert 权重统一使用 filtered mu+。
+    # 因此保留这个配置项，但要求它必须为 true，
+    # 避免出现“配置写成 false，但实现仍然强制使用 filtered mu+”的语义错位。
+    if expert_method == "fisher_history_wolf" and not post_warmup_force_filtered_weight:
+        raise ConfigError(
+            "当前 fisher_history_wolf 实现要求 "
+            "history_filter.post_warmup_force_filtered_weight=true。"
         )
 
     insufficient_history_update = str(
