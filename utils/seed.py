@@ -10,7 +10,7 @@ import torch
 
 def set_seed(
     seed: int,
-    deterministic: bool = False,
+    deterministic: bool = True,
     benchmark: Optional[bool] = None,
 ) -> None:
     """

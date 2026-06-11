@@ -49,7 +49,7 @@ expert_fisher:
   # fisher_only 旧逻辑保留字段。
   # fisher_history_wolf 不直接使用这个字段控制参数更新；
   # 新算法的参数更新阈值放在 history_filter.min_valid_clients。
-  min_valid_clients: 2
+  min_valid_clients: 1
 
   # fisher_only 旧逻辑保留字段。
   # fisher_history_wolf 的 keep_global 逻辑由 history_filter.min_valid_clients 控制。
@@ -91,7 +91,7 @@ history_filter:
   # 第 1 ~ global_warmup_rounds 轮：
   #   最终 expert 权重使用 fisher_only。
   #   但是 mu / P / age 后台照常更新。
-  global_warmup_rounds: 10
+  global_warmup_rounds: 5
 
   # 第 global_warmup_rounds + 1 轮开始，最终 expert 权重统一使用 filtered mu+。
   # 历史是否充足只决定后台更新模式，不再决定最终权重是否 fallback 到 fisher_only。
@@ -115,7 +115,7 @@ history_filter:
   # 可做消融：
   #   1 = 更激进，一个有效客户端也允许更新 expert；
   #   2 = 更保守，至少两个有效客户端才更新 expert。
-  min_valid_clients: 2
+  min_valid_clients: 1
 
   # client-expert 至少被有效观测多少次，才算成熟历史。
   history_warmup_age: 2
@@ -149,15 +149,15 @@ history_filter:
 
   # 过程噪声倍率。
   # P- = P_old + process_noise_Q * R
-  process_noise_Q: 0.05
+  process_noise_Q: 0.15
 
   # WoLF-IMQ 软阈值 c。
   # residual 越大，W2 越小，R_eff 越大，Kalman gain 越小。
-  robust_c: 2.0
+  robust_c: 4.0
 
   # post-warmup 阶段 filtered mu 权重的 softmax 温度。
   # 第一版保持 1.0，不额外调温。
-  expert_weight_tau: 1.0
+  expert_weight_tau: 0.9
 
   # WoLF 权重 W2 下限。
   # 防止 W2 太小导致 R_eff 爆炸。

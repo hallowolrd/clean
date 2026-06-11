@@ -54,7 +54,7 @@ def main() -> int:
 
     set_seed(
         seed=int(cfg.seed),
-        deterministic=bool(cfg.get("deterministic", False)),
+        deterministic=bool(cfg.get("deterministic", True)),
     )
 
     run_dir = Path(ensure_run_dir(cfg))

@@ -47,7 +47,7 @@ expert_fisher:
 
   # 每个 expert 至少需要多少个有效客户端。
   # 少于这个数量时，该 expert 本轮 keep_global。
-  min_valid_clients: 2
+  min_valid_clients: 1
 
   # 有效客户端不足时保留旧全局 expert。
   fallback: keep_global
