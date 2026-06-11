@@ -100,6 +100,9 @@ agg:
 # 随机种子
 seed: 3
 
+# 是否开启确定性模式；用于同 seed 复现实验
+deterministic: true
+
 # 设备选择
 # auto 表示代码里自动选择 cuda 或 cpu
 device: auto
