@@ -1,3 +1,6 @@
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=3
+
 tmux new -s train_clean1
 tmux attach -t train_clean1
 
