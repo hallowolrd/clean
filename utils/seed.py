@@ -8,6 +8,26 @@ import numpy as np
 import torch
 
 
+def disable_tf32() -> None:
+    """
+    关闭 TF32，减少 Ampere 及以后 NVIDIA GPU 上的数值差异。
+
+    说明：
+        1. torch.backends.cuda.matmul.allow_tf32 控制 Linear / matmul / bmm 等矩阵乘法是否允许 TF32。
+        2. torch.backends.cudnn.allow_tf32 控制 cuDNN 卷积是否允许 TF32。
+        3. torch.set_float32_matmul_precision("highest") 是 PyTorch 2.x 的补充设置，
+           表示 float32 矩阵乘法尽量使用更高精度路径。
+    """
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+
+
 def set_seed(
     seed: int,
     deterministic: bool = True,
@@ -52,6 +72,10 @@ def set_seed(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    # 关闭 TF32，避免 Ampere 及以后 GPU 上使用低精度 Tensor Core 路径。
+    # 这会让训练稍慢一点，但数值更稳定，更适合做可复现实验。
+    disable_tf32()
 
     # 控制 cudnn 行为
     torch.backends.cudnn.deterministic = deterministic

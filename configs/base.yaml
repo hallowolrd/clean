@@ -25,7 +25,7 @@ alpha: 0.1
 frac: 1.0
 
 # 联邦训练轮数
-rounds: 100
+rounds: 200
 
 # 每个客户端每轮本地训练 epoch 数
 local_epochs: 1
@@ -56,7 +56,7 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每次路由激活的 expert 数量
-topk: 2
+topk: 1
 
 
 # =========================
@@ -98,7 +98,7 @@ agg:
 # =========================
 
 # 随机种子
-seed: 3
+seed: 1
 
 # 是否开启确定性模式；用于同 seed 复现实验
 deterministic: true
