@@ -42,15 +42,15 @@ def main() -> int:
     训练入口。
 
     这里负责：
-    1. 读取配置
-    2. 设置随机种子
-    3. 创建输出目录
-    4. 打开 train.log 双写
-    5. 调用 run_training() 执行实际训练
+        1. 读取配置
+        2. 设置随机种子
+        3. 创建输出目录
+        4. 打开 train.log 双写
+        5. 调用 run_training() 执行实际训练
 
     日志说明：
-    - 普通 print / 报错信息会写入控制台和 train.log。
-    - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
+        - 普通 print / 报错信息会写入控制台和 train.log。
+        - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
     """
     args = parse_args()
 
@@ -98,17 +98,17 @@ def run_training(
     所以这里的普通 print 和报错会同时写入控制台和 train.log。
 
     注意：
-    tqdm 进度条由 utils/logging.py 过滤，不写入 train.log。
+        tqdm 进度条由 utils/logging.py 过滤，不写入 train.log。
 
     总流程：
-    1. 保存配置
-    2. 解析设备
-    3. 加载数据集
-    4. 划分客户端数据
-    5. 创建 DataLoader
-    6. 创建 FLServer
-    7. 执行联邦训练
-    8. 保存结果
+        1. 保存配置
+        2. 解析设备
+        3. 加载数据集
+        4. 划分客户端数据
+        5. 创建 DataLoader
+        6. 创建 FLServer
+        7. 执行联邦训练
+        8. 保存结果
     """
     if bool(cfg.get("logging.save_config", True)):
         save_config(
@@ -156,6 +156,10 @@ def run_training(
     loader_bundle = build_dataloaders(
         cfg=cfg,
         train_dataset=dataset_bundle.train_dataset,
+        # Fisher / K-FAC evidence 专用数据集。
+        # 它和 train_dataset 使用同一份原始样本，
+        # 但 transform 在 data/datasets.py 中强制关闭随机数据增强。
+        train_evidence_dataset=dataset_bundle.train_evidence_dataset,
         test_dataset=dataset_bundle.test_dataset,
         client_indices=partition.client_indices,
     )
@@ -163,6 +167,9 @@ def run_training(
     server = build_server(
         cfg=cfg,
         client_loaders=loader_bundle.client_loaders,
+        # Fisher / K-FAC evidence 专用 loader。
+        # 训练仍然走 client_loaders，统计 Fisher 时走 client_evidence_loaders。
+        client_evidence_loaders=loader_bundle.client_evidence_loaders,
         test_loader=loader_bundle.test_loader,
         device=device,
     )
@@ -194,8 +201,8 @@ def save_partition_summary(
     保存数据划分摘要。
 
     注意：
-    不保存完整 client_indices。
-    这里只保存每个客户端样本数、类别分布等轻量信息。
+        不保存完整 client_indices。
+        这里只保存每个客户端样本数、类别分布等轻量信息。
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -219,13 +226,15 @@ def save_train_outputs(
     保存训练输出。
 
     输出文件：
-    summary.json: 完整训练摘要。
-    results.csv: 每轮核心指标，方便直接画图或导入 Excel。
+        summary.json:
+            完整训练摘要。
+
+        results.csv:
+            每轮核心指标，方便直接画图或导入 Excel。
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_path = output_dir / "summary.json"
-
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(
             make_json_safe(train_result.to_dict()),
@@ -250,13 +259,13 @@ def save_round_results_csv(
     保存每轮训练结果到 CSV。
 
     CSV 只保存最常用的核心指标：
-    round_id
-    selected_clients
-    avg_train_loss
-    avg_train_acc
-    test_loss
-    test_acc
-    best_acc
+        round_id
+        selected_clients
+        avg_train_loss
+        avg_train_acc
+        test_loss
+        test_acc
+        best_acc
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -298,7 +307,6 @@ def save_round_results_csv(
                 "test_acc": float(item.test_acc),
                 "best_acc": float(item.best_acc),
             }
-
             writer.writerow(row)
 
 
@@ -307,16 +315,15 @@ def make_json_safe(obj: Any) -> Any:
     把对象转换成 JSON 可保存格式。
 
     主要处理：
-    torch.Tensor
-    torch.device
-    Path
-    dict
-    list / tuple
+        torch.Tensor
+        torch.device
+        Path
+        dict
+        list / tuple
     """
     if isinstance(obj, torch.Tensor):
         if obj.numel() == 1:
             return obj.item()
-
         return obj.detach().cpu().tolist()
 
     if isinstance(obj, torch.device):

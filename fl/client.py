@@ -25,10 +25,17 @@ class ClientTrainStats:
     """
     客户端本地训练统计结果。
 
-    avg_loss: 本地训练平均 loss。
-    train_acc: 本地训练准确率，百分比形式。
-    num_samples: 本地训练样本数。
-    num_batches: 本地训练 batch 数。
+    avg_loss:
+        本地训练平均 loss。
+
+    train_acc:
+        本地训练准确率，百分比形式。
+
+    num_samples:
+        本地训练样本数。
+
+    num_batches:
+        本地训练 batch 数。
     """
 
     avg_loss: float
@@ -52,16 +59,17 @@ class FLClient:
     联邦学习客户端。
 
     职责：
-    1. 接收 server 下发的 global_model
-    2. 在自己的 train_loader 上本地训练
-    3. 计算 local_model 相对 global_model 的参数变化量
-    4. 返回 ClientUpdate
+        1. 接收 server 下发的 global_model
+        2. 在自己的 train_loader 上本地训练
+        3. 在自己的 evidence_loader 上统计 Fisher / K-FAC evidence
+        4. 计算 local_model 相对 global_model 的参数变化量
+        5. 返回 ClientUpdate
 
     不负责：
-    1. 选择客户端
-    2. 聚合参数
-    3. 测试集评估
-    4. 保存 checkpoint
+        1. 选择客户端
+        2. 聚合参数
+        3. 测试集评估
+        4. 保存 checkpoint
     """
 
     def __init__(
@@ -70,19 +78,40 @@ class FLClient:
         train_loader: DataLoader,
         cfg: Any,
         device: torch.device | str,
+        evidence_loader: Optional[DataLoader] = None,
     ) -> None:
         self.client_id = int(client_id)
         self.train_loader = train_loader
+
+        # Fisher / K-FAC evidence 专用 loader。
+        # 正常情况下由 data/loaders.py 基于 train_evidence_dataset 构建，
+        # 其 transform 已经关闭 RandomCrop / RandomHorizontalFlip。
+        #
+        # 如果旧代码路径没有传入 evidence_loader，则回退到 train_loader，
+        # 这样可以兼容旧配置，但推荐新流程始终显式传入 evidence_loader。
+        self.evidence_loader = (
+            evidence_loader
+            if evidence_loader is not None
+            else train_loader
+        )
+
         self.cfg = cfg
         self.device = torch.device(device)
 
         if len(self.train_loader.dataset) <= 0:
             raise ValueError(f"客户端 {self.client_id} 的数据集为空。")
 
+        if len(self.evidence_loader.dataset) <= 0:
+            raise ValueError(f"客户端 {self.client_id} 的 evidence 数据集为空。")
+
     @property
     def num_samples(self) -> int:
         """
-        当前客户端本地样本数。
+        当前客户端本地训练样本数。
+
+        注意：
+            聚合时的样本数仍然按训练集 train_loader 统计。
+            evidence_loader 只是 Fisher / K-FAC 统计用，不改变客户端样本权重定义。
         """
         return int(len(self.train_loader.dataset))
 
@@ -95,11 +124,15 @@ class FLClient:
         执行本地训练，并返回客户端更新。
 
         参数：
-            global_model: server 当前轮下发的全局模型。
-            round_id: 当前联邦训练轮数。
+            global_model:
+                server 当前轮下发的全局模型。
+
+            round_id:
+                当前联邦训练轮数。
 
         返回：
-            ClientUpdate: 包含 model_delta、num_samples、metrics、extra 等信息。
+            ClientUpdate:
+                包含 model_delta、num_samples、metrics、extra 等信息。
         """
         global_state_cpu = state_dict_to(
             global_model.state_dict(),
@@ -133,12 +166,15 @@ class FLClient:
         # 可选：采集当前客户端本地模型的 expert usage。
         #
         # 统计含义：
-        #   本地训练结束后，local_model 在该客户端自己的 train_loader 上，
-        #   每个 expert 被 top-k router 选中了多少次。
+        #     本地训练结束后，local_model 在该客户端自己的 train_loader 上，
+        #     每个 expert 被 top-k router 选中了多少次。
         #
         # 注意：
-        #   topk=2 时，一个样本会贡献 2 次 expert 激活。
-        #   所以 expert_counts 的总和通常约等于 num_samples * topk。
+        #     这里仍然使用 train_loader，保持原有日志诊断语义不变。
+        #     Fisher / K-FAC evidence 统计才使用 evidence_loader。
+        #
+        #     topk=2 时，一个样本会贡献 2 次 expert 激活。
+        #     所以 expert_counts 的总和通常约等于 num_samples * topk。
         # ------------------------------------------------------------
         expert_usage = None
         if bool(_cfg_get(self.cfg, "logging.collect_expert_usage", False)):
@@ -175,9 +211,27 @@ class FLClient:
                     "请不要在本地训练过程中混合统计 K-FAC。"
                 )
 
+            # ------------------------------------------------------------
+            # Fisher / K-FAC evidence 统计使用 evidence_loader。
+            #
+            # 这一步是本次修改的关键：
+            #     原代码这里使用 self.train_loader，
+            #     如果 train_dataset 开启了 RandomCrop / RandomHorizontalFlip，
+            #     那么统计 Fisher 时也会触发随机数据增强。
+            #
+            #     现在改为 self.evidence_loader。
+            #     新的 evidence_loader 来自 train_evidence_dataset，
+            #     transform 强制关闭随机数据增强，只保留 ToTensor + Normalize。
+            #
+            # 注意：
+            #     collect_expert_kfac 内部仍然会根据 kfac.model_mode 切换 eval/train。
+            #     model.eval() 只能关闭 Dropout / BN 训练态行为，
+            #     不能关闭 torchvision transform 的随机增强。
+            #     所以必须在 loader / dataset 层面单独处理。
+            # ------------------------------------------------------------
             expert_kfac = collect_expert_kfac(
                 model=local_model,
-                train_loader=self.train_loader,
+                train_loader=self.evidence_loader,
                 criterion=criterion,
                 device=self.device,
                 cfg=self.cfg,
@@ -241,12 +295,12 @@ def train_local_model(
     这里的训练 loss 只有 CrossEntropyLoss。
 
     明确不加入：
-    1. aux_loss
-    2. router balance
-    3. entropy regularization
-    4. expert diversity
-    5. router consistency
-    6. proximal loss
+        1. aux_loss
+        2. router balance
+        3. entropy regularization
+        4. expert diversity
+        5. router consistency
+        6. proximal loss
     """
     if local_epochs <= 0:
         raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
@@ -269,8 +323,8 @@ def train_local_model(
 
             outputs = model(images)
             logits = extract_logits(outputs)
-            loss = criterion(logits, targets)
 
+            loss = criterion(logits, targets)
             loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
@@ -321,23 +375,32 @@ def collect_expert_usage(
     输出字段：
         num_samples:
             实际用于统计的样本数。
+
         num_batches:
             实际用于统计的 batch 数。
+
         num_experts:
             expert 总数。
+
         topk:
             每个样本激活的 expert 数。
+
         total_activations:
             expert 总激活次数。
             通常约等于 num_samples * topk。
+
         expert_counts:
             每个 expert 被选中的次数。
+
         expert_fraction:
             每个 expert 被选中的比例。
+
         active_experts:
             至少被选中过一次的 expert 数。
+
         dead_experts:
             本次统计中完全没有被选中的 expert id。
+
         supported:
             当前模型是否支持 return_router_info=True。
 
@@ -365,6 +428,7 @@ def collect_expert_usage(
 
     total_samples = 0
     total_batches = 0
+
     supported = True
     unsupported_reason = ""
 
@@ -390,14 +454,12 @@ def collect_expert_usage(
                 break
 
             router_info = extract_router_info(outputs)
-
             if router_info is None:
                 supported = False
                 unsupported_reason = "model output does not contain router_info"
                 break
 
             batch_expert_counts = router_info.get("expert_counts", None)
-
             if batch_expert_counts is None:
                 supported = False
                 unsupported_reason = "router_info does not contain expert_counts"
@@ -478,12 +540,9 @@ def extract_router_info(outputs: Any) -> Optional[Mapping[str, Any]]:
     从模型输出中提取 router_info。
 
     兼容几种常见输出：
-    1. dataclass / object:
-        outputs.router_info
-    2. dict:
-        outputs["router_info"]
-    3. tuple/list:
-        outputs[1] 是 router_info
+        1. dataclass / object: outputs.router_info
+        2. dict: outputs["router_info"]
+        3. tuple/list: outputs[1] 是 router_info
 
     当前 resnet_sparse_moe_head 在 return_router_info=True 时，
     返回对象里包含 .router_info。
@@ -530,9 +589,9 @@ def build_optimizer(
     根据 cfg.optimizer 构建优化器。
 
     当前支持：
-    sgd
-    adam
-    adamw
+        sgd
+        adam
+        adamw
     """
     optimizer_type = get_optimizer_type(cfg)
     optimizer_cfg = _cfg_get(cfg, "optimizer", {})
@@ -605,22 +664,45 @@ def build_clients(
     cfg: Any,
     client_loaders: Sequence[DataLoader],
     device: torch.device | str,
+    client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
 ) -> List[FLClient]:
     """
     根据客户端 DataLoader 列表创建 FLClient 列表。
 
     参数：
-        cfg: 全局配置。
-        client_loaders: 每个客户端对应一个 DataLoader。
-        device: 本地训练使用的设备。
+        cfg:
+            全局配置。
+
+        client_loaders:
+            每个客户端对应一个训练 DataLoader。
+
+        device:
+            本地训练使用的设备。
+
+        client_evidence_loaders:
+            每个客户端对应一个 Fisher / K-FAC evidence DataLoader。
+            如果为 None，则每个客户端回退使用自己的 train_loader。
     """
+    if client_evidence_loaders is not None and len(client_evidence_loaders) != len(client_loaders):
+        raise ValueError(
+            "client_evidence_loaders 数量必须和 client_loaders 一致。"
+            f"当前 client_loaders={len(client_loaders)}, "
+            f"client_evidence_loaders={len(client_evidence_loaders)}。"
+        )
+
     clients: List[FLClient] = []
 
     for client_id, train_loader in enumerate(client_loaders):
+        if client_evidence_loaders is None:
+            evidence_loader = None
+        else:
+            evidence_loader = client_evidence_loaders[client_id]
+
         clients.append(
             FLClient(
                 client_id=client_id,
                 train_loader=train_loader,
+                evidence_loader=evidence_loader,
                 cfg=cfg,
                 device=device,
             )
@@ -695,13 +777,11 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     读取梯度裁剪配置。
 
     支持两种写法：
-
-    optimizer:
-      grad_clip: 5.0
+        optimizer:
+            grad_clip: 5.0
 
     或者：
-
-    grad_clip: 5.0
+        grad_clip: 5.0
 
     如果没有配置，则返回 None。
     """

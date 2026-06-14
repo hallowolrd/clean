@@ -16,26 +16,38 @@ class DataLoaderBundle:
 
     client_loaders:
         每个客户端对应一个训练 DataLoader。
+        用于本地训练，可以包含随机数据增强。
+
+    client_evidence_loaders:
+        每个客户端对应一个 Fisher / K-FAC evidence DataLoader。
+        用于统计 Fisher 证据，应该来自关闭随机增强的 train_evidence_dataset。
 
     test_loader:
         服务端测试集 DataLoader。
 
     client_datasets:
-        每个客户端对应的 Subset 数据集。
+        每个客户端对应的训练 Subset 数据集。
+
+    client_evidence_datasets:
+        每个客户端对应的 evidence Subset 数据集。
 
     client_sample_counts:
         每个客户端的样本数量。
+        这里仍然按训练集 client_datasets 统计。
     """
 
     client_loaders: List[DataLoader]
+    client_evidence_loaders: List[DataLoader]
     test_loader: DataLoader
     client_datasets: List[Subset]
+    client_evidence_datasets: List[Subset]
     client_sample_counts: Dict[int, int]
 
 
 def build_dataloaders(
     cfg: Any,
     train_dataset: Dataset,
+    train_evidence_dataset: Dataset,
     test_dataset: Dataset,
     client_indices: Sequence[Sequence[int]],
 ) -> DataLoaderBundle:
@@ -44,20 +56,29 @@ def build_dataloaders(
 
     这个函数只负责：
         1. 把 train_dataset 切成多个客户端 Subset
-        2. 为每个客户端创建训练 DataLoader
-        3. 为服务端创建测试 DataLoader
+        2. 把 train_evidence_dataset 按同一份 client_indices 切成多个客户端 evidence Subset
+        3. 为每个客户端创建训练 DataLoader
+        4. 为每个客户端创建 Fisher / K-FAC evidence DataLoader
+        5. 为服务端创建测试 DataLoader
 
     不负责：
         1. 加载原始数据集
         2. 生成 Dirichlet 划分
         3. 本地训练
         4. 参数聚合
+
+    注意：
+        train_dataset:
+            用于本地训练，是否开启随机数据增强由 data/datasets.py 和配置控制。
+
+        train_evidence_dataset:
+            用于 Fisher / K-FAC evidence 统计，应该强制关闭随机数据增强。
+            这里使用和 train_dataset 完全相同的 client_indices，保证 evidence 样本归属不变。
     """
     batch_size = int(cfg.batch_size)
     test_batch_size = int(cfg.test_batch_size)
     num_workers = int(cfg.num_workers)
     seed = int(cfg.seed)
-
     pin_memory = _infer_pin_memory(cfg)
 
     client_datasets = build_client_datasets(
@@ -65,9 +86,24 @@ def build_dataloaders(
         client_indices=client_indices,
     )
 
+    # Fisher / K-FAC evidence 使用同一份客户端划分索引，
+    # 但底层 dataset 换成关闭随机数据增强的 train_evidence_dataset。
+    client_evidence_datasets = build_client_datasets(
+        train_dataset=train_evidence_dataset,
+        client_indices=client_indices,
+    )
+
     client_loaders = build_client_train_loaders(
         cfg=cfg,
         client_datasets=client_datasets,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        seed=seed,
+    )
+
+    client_evidence_loaders = build_client_evidence_loaders(
+        client_evidence_datasets=client_evidence_datasets,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -89,8 +125,10 @@ def build_dataloaders(
 
     return DataLoaderBundle(
         client_loaders=client_loaders,
+        client_evidence_loaders=client_evidence_loaders,
         test_loader=test_loader,
         client_datasets=client_datasets,
+        client_evidence_datasets=client_evidence_datasets,
         client_sample_counts=client_sample_counts,
     )
 
@@ -103,6 +141,12 @@ def build_client_datasets(
     根据 client_indices 创建客户端 Subset。
 
     每个客户端只看到自己对应的训练样本。
+
+    这个函数同时用于：
+        1. 普通训练 train_dataset
+        2. Fisher / K-FAC evidence train_evidence_dataset
+
+    二者使用同一份 client_indices，保证客户端数据划分完全一致。
     """
     client_datasets: List[Subset] = []
 
@@ -137,7 +181,6 @@ def build_client_train_loaders(
     每个客户端使用不同的 generator seed，避免所有客户端 shuffle 顺序完全一致。
     """
     client_loaders: List[DataLoader] = []
-
     drop_last = bool(_cfg_get(cfg, "drop_last", False))
     persistent_workers = num_workers > 0
 
@@ -155,10 +198,51 @@ def build_client_train_loaders(
             generator=generator,
             persistent_workers=persistent_workers,
         )
-
         client_loaders.append(loader)
 
     return client_loaders
+
+
+def build_client_evidence_loaders(
+    client_evidence_datasets: Sequence[Dataset],
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    seed: int,
+) -> List[DataLoader]:
+    """
+    为每个客户端创建 Fisher / K-FAC evidence DataLoader。
+
+    和训练 DataLoader 的区别：
+        1. shuffle=False，保证 evidence 统计顺序稳定。
+        2. drop_last=False，保证客户端所有 evidence 样本都参与 Fisher 统计。
+        3. dataset 应该来自 train_evidence_dataset，其 transform 已经关闭随机数据增强。
+
+    注意：
+        model.eval() 只能关闭 Dropout / BN 这类模型训练态行为，
+        不能关闭 torchvision 的 RandomCrop / RandomHorizontalFlip。
+        因此必须在 dataset 层面单独使用无增强 transform。
+    """
+    client_evidence_loaders: List[DataLoader] = []
+    persistent_workers = num_workers > 0
+
+    for client_id, client_evidence_dataset in enumerate(client_evidence_datasets):
+        generator = build_torch_generator(seed + 100000 + client_id)
+
+        loader = DataLoader(
+            client_evidence_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+            worker_init_fn=seed_worker,
+            generator=generator,
+            persistent_workers=persistent_workers,
+        )
+        client_evidence_loaders.append(loader)
+
+    return client_evidence_loaders
 
 
 def build_test_loader(
@@ -198,12 +282,10 @@ def _infer_pin_memory(cfg: Any) -> bool:
         3. 如果 device 是 cpu，就默认关闭
     """
     explicit_pin_memory = _cfg_get(cfg, "pin_memory", None)
-
     if explicit_pin_memory is not None:
         return bool(explicit_pin_memory)
 
     device = str(_cfg_get(cfg, "device", "auto")).lower()
-
     if device == "cpu":
         return False
 

@@ -32,12 +32,24 @@ class DatasetBundle:
     """
     数据集打包结果。
 
-    这里只保存原始 train / test dataset。
+    这里只保存原始 train / evidence / test dataset。
     客户端划分和 DataLoader 构建不要放在这里。
+
+    注意：
+        train_dataset:
+            给客户端本地训练使用，可以根据配置开启数据增强。
+
+        train_evidence_dataset:
+            给 Fisher / K-FAC evidence 统计使用，强制关闭随机数据增强。
+            这样可以避免 RandomCrop / RandomHorizontalFlip 给 Fisher 证据引入额外随机扰动。
+
+        test_dataset:
+            给服务端测试使用，不使用随机增强。
     """
 
     name: str
     train_dataset: Any
+    train_evidence_dataset: Any
     test_dataset: Any
     num_classes: int
     input_shape: Tuple[int, int, int]
@@ -48,15 +60,19 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     根据配置构建数据集。
 
     输入：
-        cfg:
-            全局配置对象，需要至少包含：
-                cfg.dataset
-                cfg.data_root
+        cfg: 全局配置对象，需要至少包含：
+            cfg.dataset
+            cfg.data_root
 
     输出：
         DatasetBundle:
             train_dataset:
                 原始训练集，后续会交给 data/partition.py 划分给客户端。
+                该数据集用于本地训练，是否开启数据增强由 cfg.data_augmentation 控制。
+
+            train_evidence_dataset:
+                Fisher / K-FAC evidence 专用训练集。
+                和 train_dataset 使用同一份原始样本，但 transform 强制关闭随机增强。
 
             test_dataset:
                 服务端测试集。
@@ -78,10 +94,20 @@ def build_datasets(cfg: Any) -> DatasetBundle:
 
     info = DATASET_INFO[dataset_name]
 
+    # 本地训练 transform：是否开启数据增强由配置决定。
     train_transform = build_train_transform(
         dataset_name=dataset_name,
         use_augmentation=_cfg_get(cfg, "data_augmentation", True),
     )
+
+    # Fisher / K-FAC evidence transform：强制关闭随机数据增强。
+    # 这样训练阶段仍然可以使用 RandomCrop / RandomHorizontalFlip，
+    # 但统计 Fisher 证据时只使用 ToTensor + Normalize，保证 evidence 更稳定。
+    train_evidence_transform = build_train_transform(
+        dataset_name=dataset_name,
+        use_augmentation=False,
+    )
+
     test_transform = build_test_transform(dataset_name=dataset_name)
 
     download = bool(_cfg_get(cfg, "download_data", True))
@@ -91,6 +117,12 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             root=str(data_root),
             train=True,
             transform=train_transform,
+            download=download,
+        )
+        train_evidence_dataset = datasets.CIFAR10(
+            root=str(data_root),
+            train=True,
+            transform=train_evidence_transform,
             download=download,
         )
         test_dataset = datasets.CIFAR10(
@@ -107,6 +139,12 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             transform=train_transform,
             download=download,
         )
+        train_evidence_dataset = datasets.CIFAR100(
+            root=str(data_root),
+            train=True,
+            transform=train_evidence_transform,
+            download=download,
+        )
         test_dataset = datasets.CIFAR100(
             root=str(data_root),
             train=False,
@@ -121,6 +159,7 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     return DatasetBundle(
         name=dataset_name,
         train_dataset=train_dataset,
+        train_evidence_dataset=train_evidence_dataset,
         test_dataset=test_dataset,
         num_classes=int(info["num_classes"]),
         input_shape=tuple(info["input_shape"]),

@@ -41,10 +41,17 @@ class ServerTrainResult:
     """
     服务端完整训练结果。
 
-    round_results: 每一轮训练后的结果摘要。
-    train_state: 训练结束后的服务端状态。
-    best_acc: 历史最佳测试准确率。
-    best_round: 历史最佳准确率对应的轮数。
+    round_results:
+        每一轮训练后的结果摘要。
+
+    train_state:
+        训练结束后的服务端状态。
+
+    best_acc:
+        历史最佳测试准确率。
+
+    best_round:
+        历史最佳准确率对应的轮数。
     """
 
     round_results: List[RoundResult]
@@ -72,18 +79,18 @@ class FLServer:
     联邦学习服务端。
 
     职责：
-    1. 持有全局模型
-    2. 选择每轮参与训练的客户端
-    3. 收集客户端更新
-    4. 分别聚合 non_expert 参数和 expert 参数
-    5. 在服务器测试集上评估全局模型
+        1. 持有全局模型
+        2. 选择每轮参与训练的客户端
+        3. 收集客户端更新
+        4. 分别聚合 non_expert 参数和 expert 参数
+        5. 在服务器测试集上评估全局模型
 
     不负责：
-    1. 数据集加载
-    2. 数据划分
-    3. 具体客户端本地训练细节
-    4. 具体聚合权重算法细节
-    5. checkpoint 保存
+        1. 数据集加载
+        2. 数据划分
+        3. 具体客户端本地训练细节
+        4. 具体聚合权重算法细节
+        5. checkpoint 保存
     """
 
     def __init__(
@@ -92,6 +99,7 @@ class FLServer:
         client_loaders: Sequence[DataLoader],
         test_loader: DataLoader,
         device: torch.device | str,
+        client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
         global_model: Optional[nn.Module] = None,
     ) -> None:
         self.cfg = cfg
@@ -110,8 +118,13 @@ class FLServer:
         self.clients = build_clients(
             cfg=cfg,
             client_loaders=client_loaders,
+            # Fisher / K-FAC evidence 专用 loader。
+            # 本地训练仍然使用 client_loaders；
+            # 统计 Fisher 时由客户端使用 client_evidence_loaders。
+            client_evidence_loaders=client_evidence_loaders,
             device=self.device,
         )
+
         self.test_loader = test_loader
 
         self.aggregators = build_aggregators(cfg)
@@ -128,7 +141,6 @@ class FLServer:
             best_round=0,
             extra={},
         )
-
         self.round_results: List[RoundResult] = []
 
         self._validate_server_state()
@@ -138,13 +150,13 @@ class FLServer:
         执行完整 FL 训练流程。
 
         每一轮流程：
-        1. 选择客户端
-        2. 客户端本地训练
-        3. 聚合 non_expert 参数
-        4. 聚合 expert 参数
-        5. 更新全局模型
-        6. 在服务器测试集评估
-        7. 记录 RoundResult
+            1. 选择客户端
+            2. 客户端本地训练
+            3. 聚合 non_expert 参数
+            4. 聚合 expert 参数
+            5. 更新全局模型
+            6. 在服务器测试集评估
+            7. 记录 RoundResult
         """
         rounds = int(_cfg_get(self.cfg, "rounds", 1))
         frac = float(_cfg_get(self.cfg, "frac", 1.0))
@@ -243,7 +255,6 @@ class FLServer:
                         global_model=self.global_model,
                         round_id=round_id,
                     )
-
                     client_updates.extend(single_client_updates)
 
                     if not progress_bar.disable:
@@ -281,7 +292,6 @@ class FLServer:
                     eval_result=eval_result,
                     aggregation_info=aggregation_info,
                 )
-
                 self.round_results.append(round_result)
 
                 avg_train_loss = round_result.aggregation_info.get(
@@ -341,12 +351,12 @@ class FLServer:
         聚合客户端更新。
 
         聚合顺序：
-        1. non_expert 参数
-        2. expert 参数
+            1. non_expert 参数
+            2. expert 参数
 
         这样可以让二者使用不同聚合器：
-        non_expert: sample_weighted / uniform
-        expert: uniform / sample_weighted / 后续 Fisher / Bayes
+            non_expert: sample_weighted / uniform
+            expert: uniform / sample_weighted / 后续 Fisher / Bayes
         """
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
@@ -392,20 +402,17 @@ class FLServer:
         在服务器测试集上评估全局模型。
 
         注意：
-        测试集只在服务器使用。
-        不参与客户端训练。
-        不参与参数聚合。
+            测试集只在服务器使用。
+            不参与客户端训练。
+            不参与参数聚合。
         """
         self.global_model.to(self.device)
-
         result = evaluate(
             model=self.global_model,
             data_loader=self.test_loader,
             device=self.device,
         )
-
         self.global_model.to("cpu")
-
         return result
 
     def build_round_result(
@@ -541,11 +548,11 @@ class FLServer:
         这部分只写 train.log，不打印到控制台。
 
         当前记录：
-        1. 本轮整体 train/test 指标
-        2. 本轮选择的客户端
-        3. non_expert / expert 分别用的聚合方法
-        4. non_expert / expert 每个客户端的聚合权重
-        5. 每个客户端样本数、本地 train_loss/train_acc、expert_usage
+            1. 本轮整体 train/test 指标
+            2. 本轮选择的客户端
+            3. non_expert / expert 分别用的聚合方法
+            4. non_expert / expert 每个客户端的聚合权重
+            5. 每个客户端样本数、本地 train_loss/train_acc、expert_usage
         """
         logging_cfg = _cfg_get(self.cfg, "logging", {})
 
@@ -619,13 +626,13 @@ class FLServer:
         从 ClientUpdate 中提取轻量客户端诊断信息。
 
         保留：
-        1. num_samples
-        2. metrics: train_loss / train_acc / num_batches
-        3. expert_usage: 每个 expert 的激活次数与比例
+            1. num_samples
+            2. metrics: train_loss / train_acc / num_batches
+            3. expert_usage: 每个 expert 的激活次数与比例
 
         不保留：
-        1. model_delta
-        2. expert_kfac 原始矩阵
+            1. model_delta
+            2. expert_kfac 原始矩阵
 
         这样日志和 summary.json 不会被大对象撑爆。
         """
@@ -633,7 +640,6 @@ class FLServer:
 
         for update in client_updates:
             extra = dict(update.extra or {})
-
             diagnostics[int(update.client_id)] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
@@ -652,8 +658,8 @@ class FLServer:
         写入 non_expert / expert 聚合摘要。
 
         输出示例：
-        [Agg][non_expert] round=1 method=uniform clients=10 params=121 weights=uniform(each=0.1000)
-        [Agg][expert] round=1 method=fisher_kfac_expert clients=10 params=16 weights={0:0.0812,1:0.1033,...}
+            [Agg][non_expert] round=1 method=uniform clients=10 params=121 weights=uniform(each=0.1000)
+            [Agg][expert] round=1 method=fisher_kfac_expert clients=10 params=16 weights={0:0.0812,1:0.1033,...}
         """
         logging_cfg = _cfg_get(self.cfg, "logging", {})
         compact_uniform_weights = _cfg_get_bool(
@@ -667,7 +673,6 @@ class FLServer:
                 round_result=round_result,
                 group_name=group_name,
             )
-
             if agg_info is None:
                 continue
 
@@ -696,17 +701,16 @@ class FLServer:
         写入每个客户端的一行诊断信息。
 
         每行包含：
-        1. 客户端样本数
-        2. 客户端本地 train_loss / train_acc
-        3. non_expert 聚合权重
-        4. expert 聚合权重
-        5. expert_usage
+            1. 客户端样本数
+            2. 客户端本地 train_loss / train_acc
+            3. non_expert 聚合权重
+            4. expert 聚合权重
+            5. expert_usage
         """
         client_diagnostics = round_result.aggregation_info.get(
             "client_diagnostics",
             {},
         )
-
         if not isinstance(client_diagnostics, Mapping):
             return
 
@@ -730,6 +734,7 @@ class FLServer:
 
         for client_id in round_result.selected_clients:
             client_id = int(client_id)
+
             item = self._get_client_diagnostic(
                 client_diagnostics,
                 client_id,
@@ -744,8 +749,8 @@ class FLServer:
                 continue
 
             metrics = item.get("metrics", {}) or {}
-            num_samples = item.get("num_samples", "unknown")
 
+            num_samples = item.get("num_samples", "unknown")
             train_loss = self._format_metric(
                 metrics.get("train_loss", None),
                 fmt=".4f",
@@ -802,7 +807,6 @@ class FLServer:
         方便日志打印。
         """
         summary = round_result.aggregation_info.get(group_name, None)
-
         if summary is None:
             return None
 
@@ -847,6 +851,7 @@ class FLServer:
         )
 
         weights = None
+
         for weight_key in (
             "weights",
             "client_weights",
@@ -882,11 +887,12 @@ class FLServer:
         只写入 train.log，不打印到控制台。
 
         原理：
-        utils/logging.py 的 TeeStream 会在 sys.stdout 上保存 log_file。
-        如果当前确实处于 tee_output_to_file() 环境中，就直接写 log_file。
-        如果没有使用 tee，则退化为普通 print，避免信息丢失。
+            utils/logging.py 的 TeeStream 会在 sys.stdout 上保存 log_file。
+            如果当前确实处于 tee_output_to_file() 环境中，就直接写 log_file。
+            如果没有使用 tee，则退化为普通 print，避免信息丢失。
         """
         stdout = sys.stdout
+
         log_file = getattr(stdout, "log_file", None)
         lock = getattr(stdout, "lock", None)
 
@@ -964,7 +970,6 @@ class FLServer:
             return "{}"
 
         numeric_items = []
-
         for key, value in weights.items():
             try:
                 client_id = int(key)
@@ -986,7 +991,6 @@ class FLServer:
             f"{client_id}:{weight_value:.4f}"
             for client_id, weight_value in numeric_items
         )
-
         return "{" + body + "}"
 
     @staticmethod
@@ -1106,7 +1110,6 @@ class FLServer:
         )
         active_experts = expert_usage.get("active_experts", "unknown")
         total_activations = expert_usage.get("total_activations", "unknown")
-
         expert_counts = expert_usage.get("expert_counts", None)
         expert_fraction = expert_usage.get("expert_fraction", None)
         dead_experts = expert_usage.get("dead_experts", [])
@@ -1137,7 +1140,6 @@ class FLServer:
             return "none"
 
         items = []
-
         for key, item_value in value.items():
             try:
                 items.append((int(key), int(item_value)))
@@ -1153,7 +1155,6 @@ class FLServer:
             f"{key}:{item_value}"
             for key, item_value in items
         )
-
         return "{" + body + "}"
 
     @staticmethod
@@ -1172,7 +1173,6 @@ class FLServer:
             return "none"
 
         items = []
-
         for key, item_value in value.items():
             try:
                 items.append((int(key), float(item_value)))
@@ -1188,7 +1188,6 @@ class FLServer:
             f"{key}:{item_value:.{precision}f}"
             for key, item_value in items
         )
-
         return "{" + body + "}"
 
     @staticmethod
@@ -1201,10 +1200,11 @@ class FLServer:
         把日志字段压成一行，避免 train.log 被超长对象刷屏。
         """
         text = repr(value)
+
         if len(text) <= max_chars:
             return text
 
-        return text[:max_chars] + "...<truncated>"
+        return text[:max_chars] + "..."
 
     def _validate_server_state(self) -> None:
         """
@@ -1241,15 +1241,21 @@ def build_server(
     client_loaders: Sequence[DataLoader],
     test_loader: DataLoader,
     device: torch.device | str,
+    client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
 ) -> FLServer:
     """
     构建 FLServer。
 
     train.py 后面可以直接调用这个函数。
+
+    client_evidence_loaders:
+        Fisher / K-FAC evidence 专用 loader。
+        如果为 None，后续 client.py 里会回退到普通 train_loader。
     """
     return FLServer(
         cfg=cfg,
         client_loaders=client_loaders,
+        client_evidence_loaders=client_evidence_loaders,
         test_loader=test_loader,
         device=device,
     )
@@ -1260,10 +1266,10 @@ def resolve_device(cfg: Any) -> torch.device:
     根据 cfg.device 解析训练设备。
 
     支持：
-    auto
-    cpu
-    cuda
-    mps
+        auto
+        cpu
+        cuda
+        mps
     """
     device_name = str(_cfg_get(cfg, "device", "auto")).lower().strip()
 
@@ -1279,13 +1285,11 @@ def resolve_device(cfg: Any) -> torch.device:
     if device_name == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("配置 device=cuda，但当前环境 CUDA 不可用。")
-
         return torch.device("cuda")
 
     if device_name == "mps":
         if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
             raise RuntimeError("配置 device=mps，但当前环境 MPS 不可用。")
-
         return torch.device("mps")
 
     if device_name == "cpu":
@@ -1334,8 +1338,10 @@ def _cfg_get_bool(
 
     if isinstance(value, str):
         normalized = value.strip().lower()
+
         if normalized in {"1", "true", "yes", "y", "on"}:
             return True
+
         if normalized in {"0", "false", "no", "n", "off"}:
             return False
 
