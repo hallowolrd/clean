@@ -27,8 +27,8 @@ kfac:
   model_selection: final_step
 
   # 先用于 smoke test，确认稳定后可以改大，比如 200 / 500 / 2000
-  server_steps: 200
-  server_lr: 0.01
+  server_steps: 300
+  server_lr: 0.003
 
   # Adam-like 服务端优化器参数，对齐 FedFisher 作者实践设置
   adam_beta1: 0.9
@@ -36,11 +36,11 @@ kfac:
   adam_eps: 0.01
 
   # paper-like 默认不加 damping 软正则
-  damping: 0.0
-  use_damping: false
+  damping: 0.01
+  use_damping: true
 
   # K-FAC 统计过滤与 fallback
-  min_count: 1
+  min_count: 512
   fallback: none
   include_bias: true
 

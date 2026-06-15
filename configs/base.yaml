@@ -14,7 +14,7 @@ data_root: ./datasets
 # =========================
 
 # 客户端数量
-num_clients: 10
+num_clients: 5
 
 # Dirichlet non-IID 划分参数
 # alpha 越小，客户端数据越不均衡
@@ -25,10 +25,10 @@ alpha: 0.1
 frac: 1.0
 
 # 联邦训练轮数
-rounds: 100
+rounds: 5
 
 # 每个客户端每轮本地训练 epoch 数
-local_epochs: 1
+local_epochs: 30
 
 
 # =========================
@@ -56,7 +56,7 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每个样本路由激活的 expert 数量
-topk: 2
+topk: 1
 
 
 # =========================
@@ -65,17 +65,17 @@ topk: 2
 
 optimizer:
   # 当前支持 sgd / adam / adamw
-  type: adam
+  type: sgd
 
   # 学习率
-  lr: 0.0005
+  lr: 0.01
 
   # SGD momentum
   # 当前 optimizer.type=adam 时这个字段不会被 Adam 使用
-  momentum: 0.0
+  momentum: 0.9
 
   # 权重衰减
-  weight_decay: 0.0000
+  weight_decay: 0.0005
 
 
 # =========================
@@ -99,7 +99,7 @@ agg:
 # =========================
 
 # 随机种子
-seed: 3
+seed: 0
 
 # 设备选择
 # auto 表示代码里自动选择 cuda 或 cpu
