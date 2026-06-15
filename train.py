@@ -1,11 +1,185 @@
 from __future__ import annotations
 
+# ============================================================
+# 注意：
+# 下面这一段必须放在 import torch 之前。
+#
+# 原因：
+# 1. CUBLAS_WORKSPACE_CONFIG 必须在 CUDA / cuBLAS 初始化前设置。
+# 2. PYTHONHASHSEED 必须在 Python 解释器启动前生效。
+#
+# 所以如果当前进程的 PYTHONHASHSEED 和配置文件里的 seed 不一致，
+# 这里会自动重新执行一次当前 Python 命令。
+# ============================================================
+
+import os
+import sys
+from pathlib import Path
+
+
+def _get_cli_arg_value(name: str) -> str | None:
+    """
+    从命令行参数中读取指定参数值。
+
+    支持两种写法：
+        1. --config configs/uniform.yaml
+        2. --config=configs/uniform.yaml
+    """
+    prefix = name + "="
+    argv = sys.argv
+
+    for idx, arg in enumerate(argv):
+        if arg == name and idx + 1 < len(argv):
+            return argv[idx + 1]
+
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+
+    return None
+
+
+def _clean_simple_yaml_value(value: str) -> str:
+    """
+    清理简单 YAML 标量值。
+
+    这里只服务于启动早期读取 seed / include，
+    不替代项目里的正式 load_config。
+    """
+    value = value.strip()
+
+    # 去掉简单引号
+    if len(value) >= 2:
+        if (value[0] == value[-1]) and value[0] in {"'", '"'}:
+            value = value[1:-1]
+
+    return value.strip()
+
+
+def _read_top_level_scalar_from_yaml_like_file(
+    path: Path,
+    key: str,
+    visited: set[Path] | None = None,
+) -> str | None:
+    """
+    在 import torch 之前，轻量读取 YAML 文件里的顶层简单标量。
+
+    目的：
+        - 提前读取 seed，让 PYTHONHASHSEED 可以跟随训练 seed。
+        - 支持你的配置风格：xxx.yaml 里 include: base.yaml。
+
+    注意：
+        - 这不是完整 YAML 解析器；
+        - 只用于启动阶段读取 seed / include；
+        - 正式配置仍然由 utils.config.load_config() 读取。
+    """
+    if visited is None:
+        visited = set()
+
+    path = path.resolve()
+
+    if path in visited:
+        return None
+
+    visited.add(path)
+
+    if not path.exists():
+        return None
+
+    include_path: Path | None = None
+    local_value: str | None = None
+
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            # 去掉行内注释。这里足够处理当前配置里的 seed / include。
+            line = raw_line.split("#", 1)[0].strip()
+
+            if not line:
+                continue
+
+            if ":" not in line:
+                continue
+
+            left, right = line.split(":", 1)
+            name = left.strip()
+            value = _clean_simple_yaml_value(right)
+
+            if name == "include":
+                include_path = (path.parent / value).resolve()
+                continue
+
+            if name == key:
+                local_value = value
+                continue
+
+    # 当前配置里的 seed 优先级高于 include 里的 seed。
+    if local_value is not None:
+        return local_value
+
+    if include_path is not None:
+        return _read_top_level_scalar_from_yaml_like_file(
+            path=include_path,
+            key=key,
+            visited=visited,
+        )
+
+    return None
+
+
+def _prepare_deterministic_env_before_torch() -> None:
+    """
+    在 torch / CUDA 初始化前准备确定性相关环境变量。
+
+    CUBLAS_WORKSPACE_CONFIG:
+        控制 cuBLAS 矩阵乘法的确定性。
+        如果用户已经手动设置了 :16:8 或其他合法值，这里不覆盖。
+
+    PYTHONHASHSEED:
+        让 Python hash 随机种子跟随配置文件里的 seed。
+        该变量必须在解释器启动前生效，所以必要时自动 re-exec 一次。
+    """
+    # cuBLAS 确定性配置。显存不紧张时优先使用 :4096:8。
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    config_arg = _get_cli_arg_value("--config")
+    config_seed = None
+
+    if config_arg is not None:
+        config_seed = _read_top_level_scalar_from_yaml_like_file(
+            path=Path(config_arg),
+            key="seed",
+        )
+
+    # 正常情况下 base.yaml 或当前配置文件里有 seed。
+    # 如果读取失败，就退回到已有 PYTHONHASHSEED；再没有就用 0。
+    target_hash_seed = str(
+        config_seed
+        if config_seed is not None
+        else os.environ.get("PYTHONHASHSEED", "0")
+    )
+
+    current_hash_seed = os.environ.get("PYTHONHASHSEED")
+    already_reexec = os.environ.get("CLEAN_REEXEC_FOR_PYTHONHASHSEED") == "1"
+
+    if current_hash_seed != target_hash_seed:
+        os.environ["PYTHONHASHSEED"] = target_hash_seed
+
+        # PYTHONHASHSEED 必须在 Python 解释器启动前生效。
+        # 当前进程已经启动了，所以这里自动重启一次当前命令。
+        if not already_reexec:
+            os.environ["CLEAN_REEXEC_FOR_PYTHONHASHSEED"] = "1"
+            os.execvpe(
+                sys.executable,
+                [sys.executable] + sys.argv,
+                os.environ,
+            )
+
+
+_prepare_deterministic_env_before_torch()
+
 import argparse
 import csv
 import json
-import os
 import traceback
-from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -53,7 +227,6 @@ def main() -> int:
         - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
     """
     args = parse_args()
-
     cfg = load_config(args.config)
 
     set_seed(
@@ -292,8 +465,7 @@ def save_round_results_csv(
             row = {
                 "round_id": int(item.round_id),
                 "selected_clients": " ".join(
-                    str(client_id)
-                    for client_id in item.selected_clients
+                    str(client_id) for client_id in item.selected_clients
                 ),
                 "avg_train_loss": aggregation_info.get(
                     "avg_train_loss",
@@ -307,6 +479,7 @@ def save_round_results_csv(
                 "test_acc": float(item.test_acc),
                 "best_acc": float(item.best_acc),
             }
+
             writer.writerow(row)
 
 

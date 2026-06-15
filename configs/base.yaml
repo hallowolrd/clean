@@ -42,7 +42,13 @@ batch_size: 64
 test_batch_size: 64
 
 # DataLoader 使用的子进程数量
-num_workers: 2
+#
+# 复现实验建议先使用 0：
+#   1. 避免多进程 DataLoader 带来的额外随机性排查成本；
+#   2. 更容易验证同 seed 下结果是否完全一致。
+#
+# 如果后面确认 num_workers=0 可复现，再为了速度改回 2。
+num_workers: 0
 
 
 # =========================
@@ -100,6 +106,13 @@ agg:
 
 # 随机种子
 seed: 0
+
+# 是否开启 PyTorch 确定性模式
+#
+# train.py 会根据这个配置调用 set_seed(..., deterministic=True)。
+# 配合 train.py 顶部的 PYTHONHASHSEED / CUBLAS_WORKSPACE_CONFIG 处理，
+# 可以增强同 seed 下的实验复现性。
+deterministic: true
 
 # 设备选择
 # auto 表示代码里自动选择 cuda 或 cpu

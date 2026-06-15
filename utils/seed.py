@@ -8,6 +8,33 @@ import numpy as np
 import torch
 
 
+def disable_tf32() -> None:
+    """
+    关闭 TF32，减少 Ampere 及以后 NVIDIA GPU 上的数值差异。
+
+    说明：
+        1. torch.backends.cuda.matmul.allow_tf32
+           控制 Linear / matmul / bmm 等矩阵乘法是否允许 TF32。
+
+        2. torch.backends.cudnn.allow_tf32
+           控制 cuDNN 卷积是否允许 TF32。
+
+        3. torch.set_float32_matmul_precision("highest")
+           是 PyTorch 2.x 的补充设置，表示 float32 矩阵乘法尽量使用更高精度路径。
+
+    注意：
+        关闭 TF32 会让训练稍慢一点，但更适合做可复现实验。
+    """
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+
+
 def set_seed(
     seed: int,
     deterministic: bool = True,
@@ -41,8 +68,20 @@ def set_seed(
     if seed < 0:
         raise ValueError(f"seed 必须是非负整数，当前值：{seed}")
 
-    # 固定 Python hash 随机性
+    # 固定 Python hash 随机性。
+    #
+    # 注意：
+    #     PYTHONHASHSEED 严格来说需要在 Python 解释器启动前设置才完全生效。
+    #     train.py 顶部已经在 import torch 前根据配置文件 seed 做了提前设置和必要重启。
+    #     这里保留是为了记录当前运行环境，并作为兜底。
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # cuBLAS 确定性配置兜底。
+    #
+    # 注意：
+    #     CUBLAS_WORKSPACE_CONFIG 也应该尽量在 import torch 前设置。
+    #     train.py 顶部已经提前设置，这里只是兜底，避免其他入口漏掉。
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     # 固定 Python / NumPy 随机性
     random.seed(seed)
@@ -53,6 +92,10 @@ def set_seed(
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    # 关闭 TF32，避免 Ampere 及以后 GPU 上使用低精度 Tensor Core 路径。
+    # 这会让训练稍慢一点，但数值更稳定，更适合做可重复实验。
+    disable_tf32()
+
     # 控制 cudnn 行为
     torch.backends.cudnn.deterministic = deterministic
 
@@ -61,8 +104,9 @@ def set_seed(
     else:
         torch.backends.cudnn.benchmark = benchmark
 
-    # PyTorch 确定性算法开关
+    # PyTorch 确定性算法开关。
     # warn_only=True 可以避免部分算子不支持确定性时直接崩掉。
+    # 如果后面想做更严格的 bitwise 复现，可以再改成 warn_only=False。
     torch.use_deterministic_algorithms(
         deterministic,
         warn_only=True,
