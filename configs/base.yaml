@@ -25,7 +25,7 @@ alpha: 0.1
 frac: 1.0
 
 # 联邦训练轮数
-rounds: 5
+rounds: 10
 
 # 每个客户端每轮本地训练 epoch 数
 local_epochs: 30
@@ -48,7 +48,7 @@ test_batch_size: 64
 #   2. 更容易验证同 seed 下结果是否完全一致。
 #
 # 如果后面确认 num_workers=0 可复现，再为了速度改回 2。
-num_workers: 0
+num_workers: 2
 
 
 # =========================
