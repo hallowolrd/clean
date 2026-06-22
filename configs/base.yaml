@@ -25,10 +25,10 @@ alpha: 0.1
 frac: 1.0
 
 # 联邦训练轮数
-rounds: 10
+rounds: 100
 
 # 每个客户端每轮本地训练 epoch 数
-local_epochs: 30
+local_epochs: 10
 
 
 # =========================
