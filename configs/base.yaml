@@ -14,7 +14,7 @@ data_root: ./datasets
 # =========================
 
 # 客户端数量
-num_clients: 20
+num_clients: 5
 
 # Dirichlet non-IID 划分参数
 # alpha 越小，客户端数据越不均衡
@@ -62,7 +62,20 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每个样本路由激活的 expert 数量
-topk: 1
+topk: 2
+
+# Router 负载均衡系数
+#
+# 作用：
+#   在客户端本地训练时加入 router aux_loss，
+#   用来缓解 top2 退化成固定专家对的问题。
+#
+# 注意：
+#   1. 该 loss 只参与客户端本地训练；
+#   2. 不参与 Fisher / K-FAC evidence 统计；
+#   3. 建议先用 0.001，若专家仍长期塌缩，再尝试 0.003。
+#   4. 设为 0.0 表示关闭负载均衡。
+router_balance_coef: 0.001
 
 
 # =========================

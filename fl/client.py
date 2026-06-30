@@ -160,6 +160,7 @@ class FLClient:
             device=self.device,
             local_epochs=local_epochs,
             grad_clip=grad_clip,
+            cfg=self.cfg,
         )
 
         # ------------------------------------------------------------
@@ -288,24 +289,35 @@ def train_local_model(
     device: torch.device,
     local_epochs: int,
     grad_clip: Optional[float] = None,
+    cfg: Any = None,
 ) -> ClientTrainStats:
     """
     训练一个客户端本地模型。
 
-    这里的训练 loss 只有 CrossEntropyLoss。
+    默认训练目标是 CrossEntropyLoss。
 
-    明确不加入：
-        1. aux_loss
-        2. router balance
-        3. entropy regularization
-        4. expert diversity
-        5. router consistency
-        6. proximal loss
+    如果配置中设置：
+        router_balance_coef > 0
+
+    则在本地训练阶段额外加入模型返回的 router aux_loss：
+
+        loss = CE_loss + router_balance_coef * aux_loss
+
+    注意：
+        1. 这里的 aux_loss 只影响客户端本地训练。
+        2. K-FAC evidence 统计阶段不在这里执行，因此不会把 router balance loss 混进 Fisher / K-FAC 统计。
+        3. 日志里的 avg_loss 仍然记录 CE_loss，方便和旧实验对比。
     """
     if local_epochs <= 0:
         raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
 
     model.train()
+
+    router_balance_coef = 0.0
+    if cfg is not None:
+        router_balance_coef = float(_cfg_get(cfg, "router_balance_coef", 0.0))
+
+    use_router_balance = router_balance_coef > 0.0
 
     total_loss = 0.0
     total_correct = 0
@@ -321,10 +333,39 @@ def train_local_model(
 
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(images)
-            logits = extract_logits(outputs)
+            # ------------------------------------------------------------
+            # 只有启用 router_balance_coef 时，才要求模型返回 router_info。
+            # 这样 router_balance_coef=0.0 时，旧实验路径保持不变。
+            # ------------------------------------------------------------
+            if use_router_balance:
+                outputs = model(
+                    images,
+                    return_router_info=True,
+                )
+            else:
+                outputs = model(images)
 
-            loss = criterion(logits, targets)
+            logits = extract_logits(outputs)
+            ce_loss = criterion(logits, targets)
+
+            loss = ce_loss
+
+            # ------------------------------------------------------------
+            # 弱负载均衡：
+            #     resnet_sparse_moe_head 在 return_router_info=True 时，
+            #     router_info["aux_loss"] 已经包含 Switch-style load balance loss。
+            #
+            # 这里不重新实现 aux_loss，只按配置系数加到本地训练 loss 中。
+            # ------------------------------------------------------------
+            if use_router_balance:
+                router_info = extract_router_info(outputs)
+
+                if router_info is not None:
+                    aux_loss = router_info.get("aux_loss", None)
+
+                    if aux_loss is not None:
+                        loss = ce_loss + router_balance_coef * aux_loss
+
             loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
@@ -337,7 +378,10 @@ def train_local_model(
 
             batch_size = int(targets.size(0))
 
-            total_loss += float(loss.item()) * batch_size
+            # 注意：
+            #     这里继续记录 CE loss，而不是 CE + aux_loss。
+            #     这样 train_loss 和旧实验保持可比。
+            total_loss += float(ce_loss.item()) * batch_size
             total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
             total_samples += batch_size
             total_batches += 1
