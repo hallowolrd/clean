@@ -14,7 +14,7 @@ data_root: ./datasets
 # =========================
 
 # 客户端数量
-num_clients: 20
+num_clients: 5
 
 # Dirichlet non-IID 划分参数
 # alpha 越小，客户端数据越不均衡
@@ -81,7 +81,7 @@ optimizer:
   momentum: 0.9
 
   # 权重衰减
-  weight_decay: 0.0005
+  weight_decay: 0.000
 
 
 # =========================

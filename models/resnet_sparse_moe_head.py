@@ -26,7 +26,12 @@ class BasicBlock(nn.Module):
     CIFAR 风格 ResNet BasicBlock。
 
     结构：
-        Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN -> Residual -> ReLU
+        Conv3x3 -> ReLU -> Conv3x3 -> Residual -> ReLU
+
+    说明：
+        这是 FedFisher 对齐版 no-BN block。
+        不使用 BatchNorm，避免 non-IID FL 中 BN running_mean /
+        running_var 在客户端聚合后产生统计失配。
 
     这个 block 比 torchvision 默认 ResNet 更适合 CIFAR 小图，
     因为前面的 stem 不会过早大幅下采样。
@@ -50,7 +55,10 @@ class BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm2d(out_channels)
+
+        # FedFisher 对齐版：不使用 BatchNorm。
+        # 保留 bn1 名字并设为 Identity，避免改动 forward 逻辑。
+        self.bn1 = nn.Identity()
 
         self.conv2 = nn.Conv2d(
             out_channels,
@@ -60,11 +68,15 @@ class BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # FedFisher 对齐版：不使用 BatchNorm。
+        # 保留 bn2 名字并设为 Identity，避免改动 forward 逻辑。
+        self.bn2 = nn.Identity()
 
         self.relu = nn.ReLU(inplace=True)
 
         # 当通道数或空间尺寸变化时，用 1x1 Conv 对齐残差分支。
+        # FedFisher 对齐版：shortcut 中同样不使用 BatchNorm。
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -75,7 +87,6 @@ class BasicBlock(nn.Module):
                     stride=stride,
                     bias=False,
                 ),
-                nn.BatchNorm2d(out_channels),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -100,6 +111,7 @@ class ResNetBackbone(nn.Module):
     - 对 CIFAR10 / CIFAR100 这类 32x32 小图，stem 使用 stride=1。
     - 对 TinyImageNet 这类更大图，stem 使用 stride=2。
     - 最后通过 AdaptiveAvgPool2d(1) 得到单个全局特征向量。
+    - FedFisher 对齐版不使用 BatchNorm。
     """
 
     def __init__(
@@ -120,7 +132,7 @@ class ResNetBackbone(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(64),
+            # FedFisher 对齐版：stem 中不使用 BatchNorm。
             nn.ReLU(inplace=True),
         )
 
@@ -451,7 +463,7 @@ class ResNetSparseMoEHead(nn.Module):
         """
         初始化 Linear 层。
 
-        Conv / BN 使用 PyTorch 默认初始化也能跑；
+        no-BN 版本中，卷积层使用 PyTorch 默认初始化；
         这里额外对 Linear 做 Xavier 初始化，让 router 和 expert 更稳定一点。
         """
         for module in self.modules():
