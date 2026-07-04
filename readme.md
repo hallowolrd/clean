@@ -10,8 +10,8 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/fisher_kfac_expert.yaml
 
 python tools/plot_compare_test_acc.py \
   --runs \
-  uniform=outputs/cifar10_c20_a0p1_resnet_sparse_moe_head_e4_top1_r200_ep5_neuniform_exuniform_s0/results.csv \
-  kfac=outputs/cifar10_c20_a0p1_resnet_sparse_moe_head_e4_top1_r200_ep5_neuniform_exfisher_kfac_expert_s0/results.csv \
+  uniform=outputs/cifar10_c5_a0p1_resnet_sparse_moe_head_e4_top1_r200_ep5_neuniform_exuniform_s0_v6/results.csv \
+  kfac=outputs/cifar10_c5_a0p1_resnet_sparse_moe_head_e4_top1_r200_ep5_neuniform_exfisher_kfac_expert_s0_v9/results.csv \
   --window 5 \
   --hide-raw \
-  --out outputs/c20_200x5.png
+  --out outputs/c5_200x5_nobn.png

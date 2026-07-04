@@ -62,7 +62,7 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每个样本路由激活的 expert 数量
-topk: 1
+topk: 2
 
 
 # =========================
@@ -81,7 +81,7 @@ optimizer:
   momentum: 0.9
 
   # 权重衰减
-  weight_decay: 0.000
+  weight_decay: 0.0005
 
 
 # =========================
