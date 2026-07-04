@@ -62,7 +62,7 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每个样本路由激活的 expert 数量
-topk: 2
+topk: 1
 
 
 # =========================
@@ -92,7 +92,7 @@ agg:
   # 非专家参数聚合方法
   # 包括 backbone / router / classifier / shared layers
   non_expert:
-    method: sample_weighted
+    method: uniform
 
   # 专家参数聚合方法
   # 包括 MoE experts

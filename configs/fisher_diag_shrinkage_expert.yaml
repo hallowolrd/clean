@@ -1,0 +1,91 @@
+# 继承项目中的公共实验配置。
+# base.yaml 中已经定义的数据集、联邦训练、本地优化器、日志和 checkpoint 等配置，
+# 这里不重复填写，只覆盖本方法真正需要修改或新增的部分。
+include: base.yaml
+
+# ============================================================
+# 聚合方法
+# ============================================================
+agg:
+  # 非专家参数（backbone、router、classifier、shared layers 等）
+  # 仍然使用普通 uniform 聚合。
+  # base.yaml 中该项为 sample_weighted，因此这里必须显式覆盖。
+  non_expert:
+    method: uniform
+
+  # 仅 expert 参数使用新增的：
+  # 路由比例加权聚合 + diagonal Fisher 稳定收缩。
+  expert:
+    method: fisher_diag_shrinkage_expert
+
+# ============================================================
+# Expert diagonal empirical Fisher 配置
+# ============================================================
+fisher_diag:
+  # 显式开启客户端 Fisher 采集。
+  # 当前 client.py 在 expert 方法匹配时也会自动采集；保留该项可使配置意图更清楚。
+  collect: true
+
+  # Fisher 在本地训练全部完成后额外采集。
+  # 采集过程只执行 forward + backward，不执行 optimizer.step()。
+  fisher_timing: after_train
+
+  # Fisher 采集时使用 eval 模式：
+  # 关闭 Dropout 随机性，BatchNorm 使用已有 running statistics。
+  model_mode: eval
+
+  # 最多使用多少个 evidence batch。
+  # 0 表示完整遍历无数据增强的 evidence_loader。
+  max_batches: 0
+
+  # expert 至少被路由到这么多个 evidence 样本，
+  # 才上传该 expert 的 diagonal Fisher。
+  min_count: 1
+
+  # ----------------------------------------------------------
+  # Expert-specific 客户端权重
+  #
+  #   rho_{i,e} = n_i * (u_{i,e})^beta
+  #
+  # 其中：
+  #   n_i     为客户端训练样本数；
+  #   u_{i,e} 为客户端上传的 expert 路由比例；
+  #   u_{i,e} = routed_samples_{i,e} / evidence_samples_i。
+  # ----------------------------------------------------------
+  beta: 1.0
+
+  # 服务器 expert 更新步长 eta_s。
+  # 当前稳定实现要求 0 < server_lr <= 1，避免相对原始聚合 delta 放大。
+  server_lr: 1.0
+
+  # Fisher 收缩强度 lambda：
+  #
+  #   scale = 1 / (1 + lambda * normalized_fisher)
+  #
+  # lambda=0 时，方法严格退化为按 n_i * u_{i,e}^beta
+  # 加权的普通 routing-aware expert 聚合。
+  shrinkage_lambda: 1.0
+
+  # Fisher 均值归一化中的数值稳定项：
+  #
+  #   normalized_fisher = fisher / (mean_fisher + eps)
+  eps: 1.0e-12
+
+  # usage <= min_usage 的客户端不参与对应 expert 的聚合。
+  # 设为 0.0 表示只排除完全没有路由到该 expert 的客户端。
+  min_usage: 0.0
+
+  # 检查路由比例是否位于 [0, 1] 时允许的浮点误差。
+  usage_tolerance: 1.0e-6
+
+  # 某个 expert 本轮没有任何有效客户端时，保留旧全局 expert 参数。
+  fallback: keep_global
+
+# ============================================================
+# 日志统计覆盖
+# ============================================================
+logging:
+  # base.yaml 默认会在本地训练后额外使用 train_loader 统计一次 expert usage。
+  # 新方法已经在无增强的 Fisher evidence pass 中同步得到 expert_usage，
+  # 聚合器也只读取 expert_fisher_diag 中的 usage，因此关闭旧统计以避免重复遍历。
+  collect_expert_usage: false

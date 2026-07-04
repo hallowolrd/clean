@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from aggregation.base import Aggregator, get_aggregation_method
+from aggregation.fisher_diag_shrinkage_expert import (
+    FisherDiagShrinkageExpertAggregator,
+)
 from aggregation.fisher_kfac_expert import FisherKFACExpertAggregator
 from aggregation.sample_weighted import SampleWeightedAggregator
 from aggregation.uniform import UniformAggregator
@@ -36,22 +39,22 @@ def build_aggregator(
     根据聚合方法名称创建单个聚合器。
 
     参数：
-        cfg:
-            全局配置对象。
-
-        method:
-            聚合方法名称。
-            当前支持：
-                uniform
-                sample_weighted
-                fisher_kfac_expert
-
-        param_group_name:
-            当前聚合器负责的参数组。
-            当前支持：
-                non_expert
-                expert
+    cfg:
+        全局配置对象。
+    method:
+        聚合方法名称。
+        当前支持：
+            uniform
+            sample_weighted
+            fisher_kfac_expert
+            fisher_diag_shrinkage_expert
+    param_group_name:
+        当前聚合器负责的参数组。
+        当前支持：
+            non_expert
+            expert
     """
+
     method = str(method).lower()
 
     if param_group_name not in {"non_expert", "expert"}:
@@ -81,9 +84,23 @@ def build_aggregator(
             param_group_name=param_group_name,
         )
 
+    # 新增方法只负责 expert 参数。
+    # non_expert 参数仍由配置中的 uniform 聚合器处理。
+    if method == "fisher_diag_shrinkage_expert":
+        if param_group_name != "expert":
+            raise ValueError(
+                "fisher_diag_shrinkage_expert 只能用于 expert 参数聚合。"
+            )
+
+        return FisherDiagShrinkageExpertAggregator(
+            cfg=cfg,
+            param_group_name=param_group_name,
+        )
+
     raise ValueError(
         f"不支持的聚合方法：{method}。"
-        "当前支持：uniform, sample_weighted, fisher_kfac_expert"
+        "当前支持：uniform, sample_weighted, fisher_kfac_expert, "
+        "fisher_diag_shrinkage_expert"
     )
 
 
@@ -92,12 +109,12 @@ def build_aggregators(cfg: Any) -> AggregatorBundle:
     根据配置创建非专家参数聚合器和专家参数聚合器。
 
     配置格式：
-        agg:
-          non_expert:
-            method: sample_weighted
 
-          expert:
-            method: uniform
+    agg:
+      non_expert:
+        method: sample_weighted
+      expert:
+        method: uniform
 
     返回：
         AggregatorBundle(
@@ -105,10 +122,12 @@ def build_aggregators(cfg: Any) -> AggregatorBundle:
             expert=...,
         )
     """
+
     non_expert_method = get_aggregation_method(
         cfg=cfg,
         param_group_name="non_expert",
     )
+
     expert_method = get_aggregation_method(
         cfg=cfg,
         param_group_name="expert",
@@ -139,6 +158,7 @@ def build_non_expert_aggregator(cfg: Any) -> Aggregator:
     一般 server.py 里更推荐直接用 build_aggregators()。
     这个函数主要用于测试或调试。
     """
+
     method = get_aggregation_method(
         cfg=cfg,
         param_group_name="non_expert",
@@ -158,6 +178,7 @@ def build_expert_aggregator(cfg: Any) -> Aggregator:
     一般 server.py 里更推荐直接用 build_aggregators()。
     这个函数主要用于测试或调试。
     """
+
     method = get_aggregation_method(
         cfg=cfg,
         param_group_name="expert",
