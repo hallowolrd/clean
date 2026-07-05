@@ -62,7 +62,7 @@ model: resnet_sparse_moe_head
 num_experts: 4
 
 # 每个样本路由激活的 expert 数量
-topk: 2
+topk: 1
 
 # Switch Transformer 风格辅助负载均衡损失的权重。
 # 客户端本地训练目标：
