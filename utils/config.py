@@ -27,6 +27,7 @@ SUPPORTED_AGG_METHODS = {
     "uniform",
     "sample_weighted",
     "fisher_kfac_expert",
+    "fisher_diag_shrinkage_expert",
 }
 
 

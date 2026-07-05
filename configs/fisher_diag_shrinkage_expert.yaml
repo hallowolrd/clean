@@ -64,7 +64,7 @@ fisher_diag:
   #
   # lambda=0 时，方法严格退化为按 n_i * u_{i,e}^beta
   # 加权的普通 routing-aware expert 聚合。
-  shrinkage_lambda: 1.0
+  shrinkage_lambda: 0.2
 
   # Fisher 均值归一化中的数值稳定项：
   #
