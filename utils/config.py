@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional
@@ -12,7 +13,6 @@ import yaml
 # 可扩展的合法取值注册区
 # =========================
 # 后续新增数据集、模型、聚合算法时，优先改这里。
-
 SUPPORTED_DATASETS = {
     "cifar10",
     "cifar100",
@@ -42,13 +42,13 @@ class ConfigNode:
     轻量级配置对象。
 
     支持两种读取方式：
-        cfg.dataset
-        cfg.agg.non_expert.method
-        cfg.agg.expert.method
+    cfg.dataset
+    cfg.agg.non_expert.method
+    cfg.agg.expert.method
 
     也支持路径读取：
-        cfg.get("agg.non_expert.method", "sample_weighted")
-        cfg.get("agg.expert.method", "uniform")
+    cfg.get("agg.non_expert.method", "sample_weighted")
+    cfg.get("agg.expert.method", "uniform")
     """
 
     def __init__(self, data: Mapping[str, Any]):
@@ -74,9 +74,9 @@ class ConfigNode:
         按路径读取配置。
 
         示例：
-            cfg.get("agg.non_expert.method", "sample_weighted")
-            cfg.get("agg.expert.method", "uniform")
-            cfg.get("checkpoint.enabled", True)
+        cfg.get("agg.non_expert.method", "sample_weighted")
+        cfg.get("agg.expert.method", "uniform")
+        cfg.get("checkpoint.enabled", True)
         """
         current: Any = self
 
@@ -139,6 +139,7 @@ def load_config(config_path: str | Path) -> ConfigNode:
     raw_cfg = _load_yaml_with_include(config_path)
     raw_cfg = _apply_defaults(raw_cfg)
     raw_cfg = _finalize_run_info(raw_cfg)
+
     _validate_config(raw_cfg)
 
     return ConfigNode(raw_cfg)
@@ -152,7 +153,7 @@ def save_config(
     保存最终配置。
 
     一般用于保存：
-        outputs/<run_name>/config_used.yaml
+    outputs/<run_name>/config_used.yaml
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,12 +197,12 @@ def _load_yaml_with_include(
     读取 yaml，并处理 include。
 
     支持：
-        include: base.yaml
+    include: base.yaml
 
     也支持：
-        include:
-          - base.yaml
-          - model/resnet.yaml
+    include:
+      - base.yaml
+      - model/resnet.yaml
 
     子配置会覆盖 base 配置。
     """
@@ -238,10 +239,12 @@ def _load_yaml_with_include(
 
     for include_file in include_files:
         include_path = (config_path.parent / include_file).resolve()
+
         base_cfg = _load_yaml_with_include(
             include_path,
             stack=stack + [config_path],
         )
+
         merged_cfg = _deep_merge(merged_cfg, base_cfg)
 
     # 当前配置覆盖 include 进来的配置。
@@ -307,6 +310,10 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("model", "resnet_switch_moe")
     cfg.setdefault("num_experts", 4)
     cfg.setdefault("topk", 2)
+
+    # Switch Transformer 风格辅助负载均衡损失系数。
+    # 0.0 表示关闭；base.yaml 中可统一覆盖为 0.01。
+    cfg.setdefault("load_balance_loss_weight", 0.0)
 
     # 优化器配置
     cfg.setdefault("optimizer", {})
@@ -441,6 +448,7 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
         run_name = _safe_name(raw_run_name)
 
     output_dir = Path(cfg.get("output_dir", "outputs"))
+
     unique_name = bool(cfg.get("run", {}).get("unique_name", True))
     overwrite = bool(cfg.get("run", {}).get("overwrite", False))
 
@@ -485,9 +493,11 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     seed = _safe_name(cfg.get("seed", "seed"))
 
     agg_cfg = cfg.get("agg", {})
+
     non_expert_method = _safe_name(
         agg_cfg.get("non_expert", {}).get("method", "non_expert")
     )
+
     expert_method = _safe_name(
         agg_cfg.get("expert", {}).get("method", "expert")
     )
@@ -512,15 +522,14 @@ def _safe_name(value: Any) -> str:
     把任意值转换成适合做文件夹名的字符串。
 
     示例：
-        0.1 -> 0p1
-        cuda:0 -> cuda_0
+    0.1 -> 0p1
+    cuda:0 -> cuda_0
     """
     text = str(value).strip()
     text = text.replace(".", "p")
     text = text.replace("-", "m")
     text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
     text = re.sub(r"_+", "_", text)
-
     return text.strip("_")
 
 
@@ -529,9 +538,9 @@ def _make_unique_run_name(run_name: str, output_dir: Path) -> str:
     如果输出目录已存在，自动追加版本号。
 
     示例：
-        exp
-        exp_v2
-        exp_v3
+    exp
+    exp_v2
+    exp_v3
     """
     candidate = run_name
     index = 2
@@ -563,6 +572,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     后面新增 Fisher / history / Bayes 时，可以继续拆出新的 validate 函数。
     """
     dataset = cfg.get("dataset")
+
     if dataset not in SUPPORTED_DATASETS:
         raise ConfigError(
             f"不支持的数据集：{dataset}。"
@@ -570,6 +580,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model = cfg.get("model")
+
     if model not in SUPPORTED_MODELS:
         raise ConfigError(
             f"不支持的模型：{model}。"
@@ -608,11 +619,39 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"topk={cfg['topk']}, num_experts={cfg['num_experts']}"
         )
 
+    # Switch Transformer 风格负载均衡损失系数必须是有限的非负数。
+    raw_load_balance_loss_weight = cfg.get(
+        "load_balance_loss_weight",
+        0.0,
+    )
+
+    try:
+        load_balance_loss_weight = float(raw_load_balance_loss_weight)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "load_balance_loss_weight 必须是数值，"
+            f"当前值：{raw_load_balance_loss_weight!r}"
+        ) from exc
+
+    if not math.isfinite(load_balance_loss_weight):
+        raise ConfigError(
+            "load_balance_loss_weight 必须是有限数值，"
+            f"当前值：{load_balance_loss_weight}"
+        )
+
+    if load_balance_loss_weight < 0.0:
+        raise ConfigError(
+            "load_balance_loss_weight 必须大于等于 0，"
+            f"当前值：{load_balance_loss_weight}"
+        )
+
     frac = float(cfg.get("frac"))
+
     if not (0.0 < frac <= 1.0):
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
     alpha = float(cfg.get("alpha"))
+
     if alpha <= 0:
         raise ConfigError(f"alpha 必须大于 0，当前值：{alpha}")
 
@@ -640,10 +679,12 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     lr = float(optimizer_cfg.get("lr"))
+
     if lr <= 0:
         raise ConfigError(f"optimizer.lr 必须大于 0，当前值：{lr}")
 
     weight_decay = float(optimizer_cfg.get("weight_decay"))
+
     if weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
@@ -660,6 +701,7 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError("kfac 必须是 dict。")
 
     weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
+
     if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
         raise ConfigError(
             f"不支持的 kfac.weight_mode：{weight_mode}。"
@@ -667,6 +709,7 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
+
     if solve_scope not in {"per_layer", "global_expert"}:
         raise ConfigError(
             f"不支持的 kfac.solve_scope：{solve_scope}。"
@@ -674,6 +717,7 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
+
     if solve_mode not in {"cg", "gd", "adam"}:
         raise ConfigError(
             f"不支持的 kfac.solve_mode：{solve_mode}。"
@@ -693,12 +737,14 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     server_steps = int(kfac_cfg.get("server_steps", 5))
+
     if server_steps < 0:
         raise ConfigError(
             f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
         )
 
     server_lr = float(kfac_cfg.get("server_lr", 0.01))
+
     if server_lr <= 0:
         raise ConfigError(
             f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
@@ -718,36 +764,42 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
+
     if adam_eps <= 0:
         raise ConfigError(
             f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
         )
 
     cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
+
     if cg_tol < 0:
         raise ConfigError(
             f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
         )
 
     damping = float(kfac_cfg.get("damping", 0.0))
+
     if damping < 0:
         raise ConfigError(
             f"kfac.damping 不能小于 0，当前值：{damping}"
         )
 
     min_count = int(kfac_cfg.get("min_count", 1))
+
     if min_count <= 0:
         raise ConfigError(
             f"kfac.min_count 必须大于 0，当前值：{min_count}"
         )
 
     max_batches = int(kfac_cfg.get("max_batches", 0))
+
     if max_batches < 0:
         raise ConfigError(
             f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
         )
 
     fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
+
     if fallback not in {"none", "sample_weighted"}:
         raise ConfigError(
             f"不支持的 kfac.fallback：{fallback}。"
@@ -755,12 +807,14 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
+
     if fisher_timing != "after_train":
         raise ConfigError(
             f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
         )
 
     model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
+
     if model_mode not in {"eval", "train"}:
         raise ConfigError(
             f"不支持的 kfac.model_mode：{model_mode}。"
@@ -768,6 +822,7 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
+
     if model_selection != "final_step":
         raise ConfigError(
             "当前主实验不支持 server validation 选 best，"
@@ -775,6 +830,7 @@ def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
         )
 
     use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
+
     if use_server_validation:
         raise ConfigError(
             "当前主实验不使用 server validation，"

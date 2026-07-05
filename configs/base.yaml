@@ -64,6 +64,13 @@ num_experts: 4
 # 每个样本路由激活的 expert 数量
 topk: 2
 
+# Switch Transformer 风格辅助负载均衡损失的权重。
+# 客户端本地训练目标：
+#   total_loss = cross_entropy
+#              + load_balance_loss_weight * aux_loss
+# 设为 0.0 表示关闭负载均衡；0.01 为当前统一使用的系数。
+load_balance_loss_weight: 0.01
+
 
 # =========================
 # 优化器配置

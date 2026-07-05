@@ -14,7 +14,8 @@ class ResNetSparseMoEHeadOutput:
     ResNetSparseMoEHead 的可选输出结构。
 
     默认训练时不需要这个结构，直接返回 logits 即可。
-    当需要分析 router / expert usage 时，可以设置 return_router_info=True。
+    当需要分析 router / expert usage，或客户端训练需要读取
+    router_info["aux_loss"] 时，可以设置 return_router_info=True。
     """
 
     logits: torch.Tensor
@@ -26,13 +27,12 @@ class BasicBlock(nn.Module):
     CIFAR 风格 ResNet BasicBlock。
 
     结构：
-        Conv3x3 -> ReLU -> Conv3x3 -> Residual -> ReLU
+    Conv3x3 -> ReLU -> Conv3x3 -> Residual -> ReLU
 
     说明：
-        这是 FedFisher 对齐版 no-BN block。
-        不使用 BatchNorm，避免 non-IID FL 中 BN running_mean /
-        running_var 在客户端聚合后产生统计失配。
-
+    这是 FedFisher 对齐版 no-BN block。
+    不使用 BatchNorm，避免 non-IID FL 中 BN running_mean /
+    running_var 在客户端聚合后产生统计失配。
     这个 block 比 torchvision 默认 ResNet 更适合 CIFAR 小图，
     因为前面的 stem 不会过早大幅下采样。
     """
@@ -102,10 +102,10 @@ class ResNetBackbone(nn.Module):
     ResNet 图像特征提取器。
 
     输入：
-        x: [B, C, H, W]
+    x: [B, C, H, W]
 
     输出：
-        feat: [B, 512]
+    feat: [B, 512]
 
     说明：
     - 对 CIFAR10 / CIFAR100 这类 32x32 小图，stem 使用 stride=1。
@@ -154,6 +154,7 @@ class ResNetBackbone(nn.Module):
         每个 stage 使用两个 BasicBlock。
         第一个 block 负责必要的下采样，第二个 block 保持尺寸。
         """
+
         return nn.Sequential(
             BasicBlock(in_channels, out_channels, stride=stride),
             BasicBlock(out_channels, out_channels, stride=1),
@@ -165,7 +166,6 @@ class ResNetBackbone(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-
         x = self.pool(x)
         x = x.flatten(1)
         return x
@@ -176,7 +176,8 @@ class ExpertFFN(nn.Module):
     单个 expert。
 
     这里 expert 内部直接输出分类 logits 的一部分：
-        feature -> Linear -> ReLU -> Linear -> num_classes
+
+    feature -> Linear -> ReLU -> Linear -> num_classes
 
     因此这个模型里“分类头”是在 expert 内部的。
     聚合 expert 参数时，会同时聚合每个 expert 的 fc1 和 fc2。
@@ -205,22 +206,27 @@ class TopKGating(nn.Module):
     标准 Top-K 路由器。
 
     输入：
-        x: [B, in_dim]
+    x: [B, in_dim]
 
     输出：
-        weights: [B, num_experts]
-            只有 top-k expert 位置非零。
-            默认保持原始 softmax 概率，不重新归一化。
-        topk_indices: [B, topk]
-            每个样本选中的 expert id。
-        router_probs: [B, num_experts]
-            softmax 后的完整路由概率。
-        router_logits: [B, num_experts]
-            router 原始 logits。
+    weights: [B, num_experts]
+        只有 top-k expert 位置非零。
+        默认保持原始 softmax 概率，不重新归一化。
+
+    topk_indices: [B, topk]
+        每个样本选中的 expert id。
+
+    router_probs: [B, num_experts]
+        softmax 后的完整路由概率。
+
+    router_logits: [B, num_experts]
+        router 原始 logits。
 
     注意：
     - 不加乘法噪声。
-    - 不加负载均衡 loss。
+    - 本模块只生成路由结果，不直接构造训练总损失。
+      Switch 风格负载均衡损失由 SparseMoEHead 计算为 aux_loss，
+      再由客户端训练代码按 load_balance_loss_weight 加入总损失。
     - 不加 router entropy / diversity / consistency 正则。
     """
 
@@ -255,7 +261,9 @@ class TopKGating(nn.Module):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.dim() != 2:
-            raise ValueError(f"TopKGating 期望输入为 [B, D]，当前 shape={tuple(x.shape)}")
+            raise ValueError(
+                f"TopKGating 期望输入为 [B, D]，当前 shape={tuple(x.shape)}"
+            )
 
         router_logits = self.gate(x)
         router_probs = F.softmax(router_logits.float(), dim=-1)
@@ -284,10 +292,10 @@ class SparseMoEHead(nn.Module):
     稀疏 MoE 分类头。
 
     输入：
-        x: [B, feat_dim]
+    x: [B, feat_dim]
 
     输出：
-        logits: [B, num_classes]
+    logits: [B, num_classes]
 
     计算方式：
     1. router 为每个样本选择 top-k 个 expert。
@@ -322,7 +330,7 @@ class SparseMoEHead(nn.Module):
         )
 
         # 这个命名很重要：
-        # 参数名会包含 moe_head.experts.<expert_id>....
+        # 参数名会包含 moe_head.experts.....
         # 这样现有 param_groups / K-FAC 逻辑更容易识别 expert 参数。
         self.experts = nn.ModuleList(
             [
@@ -341,7 +349,9 @@ class SparseMoEHead(nn.Module):
         return_router_info: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if x.dim() != 2:
-            raise ValueError(f"SparseMoEHead 期望输入为 [B, D]，当前 shape={tuple(x.shape)}")
+            raise ValueError(
+                f"SparseMoEHead 期望输入为 [B, D]，当前 shape={tuple(x.shape)}"
+            )
 
         weights, topk_indices, router_probs, router_logits = self.gating(x)
 
@@ -363,8 +373,8 @@ class SparseMoEHead(nn.Module):
 
             expert_input = x[token_mask]
             expert_output = expert(expert_input)
-
             selected_weights = weights[token_mask, expert_id]
+
             logits[token_mask] = logits[token_mask] + (
                 expert_output * selected_weights.unsqueeze(-1)
             )
@@ -372,7 +382,10 @@ class SparseMoEHead(nn.Module):
         if not return_router_info:
             return logits
 
-        # 以下信息只用于诊断，不参与训练 loss。
+        # 计算路由诊断信息和 Switch Transformer 风格辅助负载均衡损失。
+        # 当客户端配置 load_balance_loss_weight > 0 时，client.py 会把
+        # router_info["aux_loss"] 加入本地训练目标；其余字段继续用于
+        # expert usage、Fisher/K-FAC 采集和日志诊断。
         expert_one_hot = F.one_hot(
             topk_indices,
             num_classes=self.num_experts,
@@ -381,8 +394,17 @@ class SparseMoEHead(nn.Module):
         expert_counts = expert_one_hot.sum(dim=(0, 1))
         sample_expert_counts = expert_one_hot.sum(dim=1)
 
+        # f_e：当前 batch 中 expert e 的实际路由占比。
+        # top-k 情况下用 B * topk 归一化，因此所有 expert 的 density 之和为 1。
         density = expert_counts / max(float(batch_size * self.topk), 1.0)
+
+        # P_e：router 分配给 expert e 的平均 softmax 概率。
+        # 该项保留梯度，使 aux_loss 能够更新 router。
         density_proxy = router_probs.mean(dim=0)
+
+        # Switch Transformer 风格辅助负载均衡损失：
+        #   L_aux = num_experts * sum_e(f_e * P_e)
+        # density 来自离散 top-k 选择；梯度通过 density_proxy 回传到 router。
         aux_loss = self.num_experts * torch.sum(
             density.to(router_probs.device) * density_proxy
         )
@@ -392,9 +414,11 @@ class SparseMoEHead(nn.Module):
             "expert_counts": expert_counts.to(x.device),
             "sample_expert_counts": sample_expert_counts.to(x.device),
             "selected_experts": topk_indices,
-            "topk_probs": torch.gather(router_probs, dim=1, index=topk_indices).to(
-                dtype=x.dtype
-            ),
+            "topk_probs": torch.gather(
+                router_probs,
+                dim=1,
+                index=topk_indices,
+            ).to(dtype=x.dtype),
             "router_probs": router_probs.to(dtype=x.dtype),
             "router_logits": router_logits.to(dtype=x.dtype),
         }
@@ -407,11 +431,12 @@ class ResNetSparseMoEHead(nn.Module):
     ResNet + Sparse MoE Head 分类模型。
 
     整体结构：
-        image
-          -> ResNetBackbone
-          -> global feature [B, 512]
-          -> SparseMoEHead
-          -> logits [B, num_classes]
+
+    image
+    -> ResNetBackbone
+    -> global feature [B, 512]
+    -> SparseMoEHead
+    -> logits [B, num_classes]
 
     和当前 resnet_switch_moe 的主要区别：
     - 这个模型没有 Transformer block。
@@ -466,6 +491,7 @@ class ResNetSparseMoEHead(nn.Module):
         no-BN 版本中，卷积层使用 PyTorch 默认初始化；
         这里额外对 Linear 做 Xavier 初始化，让 router 和 expert 更稳定一点。
         """
+
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -520,8 +546,8 @@ def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
     """
 
     model_cfg = _cfg_get(cfg, "model_cfg", {})
-
     input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
+
     if input_shape is None:
         input_shape = (3, 32, 32)
 
@@ -590,5 +616,4 @@ def _cfg_get(
 
     if hasattr(cfg, "get"):
         return cfg.get(key, default)
-
     return getattr(cfg, key, default)

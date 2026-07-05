@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 
 from dataclasses import dataclass
 
@@ -32,19 +33,27 @@ class ClientTrainStats:
     客户端本地训练统计结果。
 
     avg_loss:
-        本地训练平均 loss。
+        本地训练平均分类损失，即 CrossEntropyLoss。
+        保持原有 train_loss 字段的语义不变。
     train_acc:
         本地训练准确率，百分比形式。
     num_samples:
         本地训练样本数。
     num_batches:
         本地训练 batch 数。
+    avg_aux_loss:
+        未乘 load_balance_loss_weight 的平均 Switch 风格负载均衡损失。
+    avg_objective_loss:
+        实际执行 backward 的平均总损失：
+        CrossEntropyLoss + load_balance_loss_weight * aux_loss。
     """
 
     avg_loss: float
     train_acc: float
     num_samples: int
     num_batches: int
+    avg_aux_loss: float = 0.0
+    avg_objective_loss: float = 0.0
 
     def to_metrics(self) -> Dict[str, float]:
         """
@@ -52,9 +61,13 @@ class ClientTrainStats:
         """
 
         return {
+            # 保持原有字段与含义不变：train_loss 仍然表示分类损失。
             "train_loss": float(self.avg_loss),
             "train_acc": float(self.train_acc),
             "num_batches": float(self.num_batches),
+            # 新增负载均衡相关诊断值。
+            "train_aux_loss": float(self.avg_aux_loss),
+            "train_objective_loss": float(self.avg_objective_loss),
         }
 
 
@@ -159,6 +172,28 @@ class FLClient:
         local_epochs = int(_cfg_get(self.cfg, "local_epochs", 1))
         grad_clip = _get_grad_clip(self.cfg)
 
+        # 从 base.yaml 根级字段读取统一的 Switch 风格负载均衡系数。
+        # 设为 0.0 时完全保持原来的纯 CrossEntropyLoss 训练流程。
+        load_balance_loss_weight = float(
+            _cfg_get(
+                self.cfg,
+                "load_balance_loss_weight",
+                0.0,
+            )
+        )
+
+        if not math.isfinite(load_balance_loss_weight):
+            raise ValueError(
+                "load_balance_loss_weight 必须是有限数值，"
+                f"当前值：{load_balance_loss_weight}"
+            )
+
+        if load_balance_loss_weight < 0.0:
+            raise ValueError(
+                "load_balance_loss_weight 不能小于 0，"
+                f"当前值：{load_balance_loss_weight}"
+            )
+
         stats = train_local_model(
             model=local_model,
             train_loader=self.train_loader,
@@ -167,6 +202,7 @@ class FLClient:
             device=self.device,
             local_epochs=local_epochs,
             grad_clip=grad_clip,
+            load_balance_loss_weight=load_balance_loss_weight,
         )
 
         # ------------------------------------------------------------
@@ -333,6 +369,9 @@ class FLClient:
                     if grad_clip is not None
                     else None
                 ),
+                "load_balance_loss_weight": float(
+                    load_balance_loss_weight
+                ),
                 "expert_usage": expert_usage,
                 "expert_fisher_diag": expert_fisher_diag,
                 "expert_fisher_diag_summary": expert_fisher_diag_summary,
@@ -363,27 +402,52 @@ def train_local_model(
     device: torch.device,
     local_epochs: int,
     grad_clip: Optional[float] = None,
+    load_balance_loss_weight: float = 0.0,
 ) -> ClientTrainStats:
     """
     训练一个客户端本地模型。
 
-    这里的训练 loss 只有 CrossEntropyLoss。
+    当 load_balance_loss_weight > 0 时，本地训练目标为：
 
-    明确不加入：
-    1. aux_loss
-    2. router balance
-    3. entropy regularization
-    4. expert diversity
-    5. router consistency
-    6. proximal loss
+        objective_loss
+            = task_loss
+            + load_balance_loss_weight * aux_loss
+
+    其中：
+    - task_loss 是原有的 CrossEntropyLoss；
+    - aux_loss 是模型返回的 Switch Transformer 风格负载均衡损失；
+    - load_balance_loss_weight=0 时，完全退化为原来的纯分类训练流程。
+
+    注意：
+    负载均衡损失只用于客户端正常本地训练。
+    本地训练结束后的 Fisher / K-FAC evidence 统计仍然只使用 criterion，
+    不会把 aux_loss 混入 Fisher 定义。
     """
 
     if local_epochs <= 0:
         raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
 
+    if not math.isfinite(load_balance_loss_weight):
+        raise ValueError(
+            "load_balance_loss_weight 必须是有限数值，"
+            f"当前值：{load_balance_loss_weight}"
+        )
+
+    if load_balance_loss_weight < 0.0:
+        raise ValueError(
+            "load_balance_loss_weight 不能小于 0，"
+            f"当前值：{load_balance_loss_weight}"
+        )
+
+    use_load_balance = load_balance_loss_weight > 0.0
+
     model.train()
 
-    total_loss = 0.0
+    # 分类损失、辅助损失和实际反向传播目标分别统计，
+    # 避免改变原有 train_loss 的含义。
+    total_task_loss = 0.0
+    total_aux_loss = 0.0
+    total_objective_loss = 0.0
     total_correct = 0
     total_samples = 0
     total_batches = 0
@@ -396,11 +460,79 @@ def train_local_model(
 
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(images)
-            logits = extract_logits(outputs)
-            loss = criterion(logits, targets)
+            if use_load_balance:
+                # 启用负载均衡时必须请求 router_info，
+                # 当前 resnet_sparse_moe_head 会在其中返回 aux_loss。
+                try:
+                    outputs = model(
+                        images,
+                        return_router_info=True,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "load_balance_loss_weight > 0 时，模型必须支持 "
+                        "model(images, return_router_info=True)。"
+                    ) from exc
+            else:
+                # 权重为 0 时保持原来的前向路径。
+                outputs = model(images)
 
-            loss.backward()
+            logits = extract_logits(outputs)
+            task_loss = criterion(logits, targets)
+
+            if use_load_balance:
+                router_info = extract_router_info(outputs)
+
+                if router_info is None:
+                    raise RuntimeError(
+                        "已启用负载均衡，但模型输出中没有 router_info。"
+                    )
+
+                aux_loss = router_info.get("aux_loss", None)
+
+                if aux_loss is None:
+                    raise RuntimeError(
+                        "已启用负载均衡，但 router_info 中没有 aux_loss。"
+                    )
+
+                if not torch.is_tensor(aux_loss):
+                    raise TypeError(
+                        "router_info['aux_loss'] 必须是 Tensor，"
+                        f"当前类型：{type(aux_loss).__name__}"
+                    )
+
+                if aux_loss.numel() != 1:
+                    raise ValueError(
+                        "router_info['aux_loss'] 必须是标量 Tensor，"
+                        f"当前 shape={tuple(aux_loss.shape)}"
+                    )
+
+                if not torch.isfinite(aux_loss).all():
+                    raise FloatingPointError(
+                        "router aux_loss 出现 NaN 或 Inf。"
+                    )
+
+                if not aux_loss.requires_grad:
+                    raise RuntimeError(
+                        "router aux_loss 不包含梯度。请检查模型中是否对 "
+                        "router_probs 或 aux_loss 调用了 detach()。"
+                    )
+
+                objective_loss = (
+                    task_loss
+                    + load_balance_loss_weight * aux_loss
+                )
+            else:
+                # 使用同设备、同 dtype 的零标量，便于统一统计。
+                aux_loss = task_loss.new_zeros(())
+                objective_loss = task_loss
+
+            if not torch.isfinite(objective_loss).all():
+                raise FloatingPointError(
+                    "客户端本地训练 objective_loss 出现 NaN 或 Inf。"
+                )
+
+            objective_loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -412,7 +544,15 @@ def train_local_model(
 
             batch_size = int(targets.size(0))
 
-            total_loss += float(loss.item()) * batch_size
+            total_task_loss += (
+                float(task_loss.detach().item()) * batch_size
+            )
+            total_aux_loss += (
+                float(aux_loss.detach().item()) * batch_size
+            )
+            total_objective_loss += (
+                float(objective_loss.detach().item()) * batch_size
+            )
             total_correct += int(
                 logits.argmax(dim=1).eq(targets).sum().item()
             )
@@ -422,14 +562,18 @@ def train_local_model(
     if total_samples <= 0:
         raise ValueError("客户端本地训练没有处理任何样本。")
 
-    avg_loss = total_loss / total_samples
+    avg_task_loss = total_task_loss / total_samples
+    avg_aux_loss = total_aux_loss / total_samples
+    avg_objective_loss = total_objective_loss / total_samples
     train_acc = 100.0 * total_correct / total_samples
 
     return ClientTrainStats(
-        avg_loss=avg_loss,
+        avg_loss=avg_task_loss,
         train_acc=train_acc,
         num_samples=total_samples,
         num_batches=total_batches,
+        avg_aux_loss=avg_aux_loss,
+        avg_objective_loss=avg_objective_loss,
     )
 
 
