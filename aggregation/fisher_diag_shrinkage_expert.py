@@ -17,32 +17,49 @@ from utils.state_dict_ops import (
 
 
 @dataclass(frozen=True)
-class _ExpertClientEntry:
+class _DeltaClientEntry:
     """
-    某个客户端参与某个 expert 聚合时所需的轻量信息。
+    某个客户端参与某个 expert delta 聚合时所需的信息。
 
     update:
         客户端上传的 ClientUpdate。
-    usage:
-        客户端上传的路由比例：
+    train_usage:
+        本地训练过程中 expert e 的真实路由比例：
 
-            u_{i,e} = routed_samples_{i,e} / num_evidence_samples_i
+            u_train_{i,e}
+                = train_routed_samples_{i,e}
+                  / num_processed_training_samples_i
 
-        对 top-k 路由，所有 expert 的 usage 之和约等于 k，
-        而不是 1；单个 expert 的 usage 通常位于 [0, 1]。
+        该统计来自产生本轮 local model delta 的同一训练轨迹。
     raw_weight:
-        当前客户端对 expert e 的未归一化有效权重：
+        客户端对 expert e 的未归一化 delta 权重：
 
-            rho_{i,e} = n_i * (u_{i,e}) ** beta
-
-    fisher_diag:
-        客户端上传的 expert diagonal empirical Fisher 字典。
-        key 必须与 model_delta / global_state 的完整参数名一致。
+            rho_delta_{i,e}
+                = n_i * (u_train_{i,e}) ** beta
     """
 
     update: ClientUpdate
-    usage: float
+    train_usage: float
     raw_weight: float
+
+
+@dataclass(frozen=True)
+class _FisherClientEntry:
+    """
+    某个客户端参与某个 expert diagonal Fisher 聚合时所需的信息。
+
+    update:
+        客户端上传的 ClientUpdate。
+    fisher_count:
+        训练完成后的 Fisher evidence pass 中，路由到 expert e 的样本数。
+        它只用于构造 Fisher 聚合权重，不参与 expert delta 聚合。
+    fisher_diag:
+        客户端上传的 expert diagonal empirical Fisher 字典。
+        key 必须与 global_state 中的完整参数名一致。
+    """
+
+    update: ClientUpdate
+    fisher_count: int
     fisher_diag: Mapping[str, torch.Tensor]
 
 
@@ -52,47 +69,59 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
 
     该聚合器只负责 expert 参数，不负责 non-expert 参数。
     non-expert 参数应继续由 server 中独立的 non_expert aggregator 聚合，
-    例如配置为 uniform：
+    例如配置为：
 
         agg.non_expert.method = "uniform"
         agg.expert.method = "fisher_diag_shrinkage_expert"
 
     ------------------------------------------------------------------
-    一、客户端权重
+    一、使用训练阶段 usage 聚合 expert delta
     ------------------------------------------------------------------
 
-    对客户端 i 和 expert e，客户端上传路由比例：
+    对客户端 i 和 expert e，客户端上传训练阶段路由比例：
 
-        u_{i,e} = c_{i,e} / m_i
+        u_train_{i,e}
+            = train_routed_samples_{i,e}
+              / num_processed_training_samples_i
 
-    其中 c_{i,e} 是 evidence 数据中路由到 expert e 的样本数，
-    m_i 是 Fisher evidence 样本总数。
+    服务端计算 expert-specific delta 权重：
 
-    服务端计算 expert-specific 有效权重：
+        rho_delta_{i,e}
+            = n_i * (u_train_{i,e}) ** beta
 
-        rho_{i,e} = n_i * (u_{i,e}) ** beta
+        alpha_delta_{i,e}
+            = rho_delta_{i,e} / sum_j rho_delta_{j,e}
+
+        Delta_e
+            = sum_i alpha_delta_{i,e} * Delta_{i,e}
 
     其中 n_i 使用 ClientUpdate.num_samples，也就是客户端训练集样本数。
-    beta 默认等于 1。
 
     ------------------------------------------------------------------
-    二、普通 expert delta 聚合
+    二、使用 Fisher routed count 聚合 diagonal Fisher
     ------------------------------------------------------------------
 
-        alpha_{i,e} = rho_{i,e} / sum_k rho_{k,e}
+    客户端上传的 diagonal Fisher 已经按该 expert 的 Fisher routed count
+    做过条件平均：
 
-        Delta_e = sum_i alpha_{i,e} * Delta_{i,e}
+        f_{i,e}
+            = 1 / c_fisher_{i,e}
+              * sum_s grad_{theta_{i,e}}(loss_s) ** 2
 
-    Fisher 不参与“哪个客户端占多少权重”的决定；客户端权重只由
-    样本量和路由比例决定。
+    服务端直接使用 Fisher evidence count 构造权重：
+
+        alpha_fisher_{i,e}
+            = c_fisher_{i,e} / sum_j c_fisher_{j,e}
+
+        f_bar_e
+            = sum_i alpha_fisher_{i,e} * f_{i,e}
+
+    这等价于把所有有效客户端路由到 expert e 的 Fisher evidence 样本
+    合并后求平均。服务端不要再次除以 routed count。
 
     ------------------------------------------------------------------
-    三、Fisher 聚合与稳定收缩
+    三、Fisher 稳定收缩
     ------------------------------------------------------------------
-
-    使用与 expert delta 完全相同的 alpha_{i,e} 聚合 Fisher：
-
-        f_bar_e = sum_i alpha_{i,e} * f_{i,e}
 
     对整个 expert 的所有参数统一计算 Fisher 均值：
 
@@ -105,32 +134,38 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
         theta_e^{t+1}
             = theta_e^t + server_lr * scale_e * Delta_e
 
-    当 Fisher 非负、lambda >= 0 且 0 < server_lr <= 1 时：
+    当某个 expert 有有效训练 delta、但本轮没有有效 Fisher 时，
+    退化为不执行收缩的 routing-aware delta 更新：
 
-        0 < scale_e <= 1
-
-    因此该方法不会把任何参数维度的原始聚合更新放大，只会保留或压缩。
+        theta_e^{t+1}
+            = theta_e^t + server_lr * Delta_e
 
     ------------------------------------------------------------------
     四、客户端上传格式
     ------------------------------------------------------------------
 
-    本文件与修改后的 fl/client.py 和 fl/fisher_diag.py 对应，读取：
+    本文件读取：
 
-        update.extra["expert_fisher_diag"] = {
+        update.extra["train_expert_usage"] = {
             "expert_usage": {
-                expert_id: usage,
+                expert_id: train_usage,
                 ...
             },
+            ...
+        }
+
+        update.extra["expert_fisher_diag"] = {
+            "expert_routed_samples": {
+                expert_id: fisher_count,
+                ...
+            },
+            "valid_fisher_experts": [...],
             "diag": {
                 "moe_head.experts.0.fc1.weight": Tensor,
                 ...
             },
             ...
         }
-
-    注意：diag 中的 Fisher 已经由客户端按该 expert 的 routed samples
-    做过条件平均。服务端不要再次除以 routed count。
     """
 
     @property
@@ -148,12 +183,19 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
 
         注意：
         这里返回的权重不是实际的 expert-specific 权重。
-        真正用于每个 expert 的权重是：
 
-            rho_{i,e} = n_i * usage_{i,e} ** beta
+        真正用于每个 expert 的 delta 权重是：
 
-        因为不同 expert 的 usage 不同，不可能用一套全局 weights 完整表示。
-        每个 expert 的真实权重会写入 diagnostics["expert_weights"]。
+            rho_delta_{i,e}
+                = n_i * train_usage_{i,e} ** beta
+
+        真正用于每个 expert 的 Fisher 权重是：
+
+            rho_fisher_{i,e}
+                = fisher_routed_count_{i,e}
+
+        因为不同 expert 的两套权重都不同，不可能用一套全局 weights
+        完整表示。真实权重会写入 diagnostics。
         """
 
         return build_sample_weights(client_updates)
@@ -180,9 +222,9 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
         base_state:
             上一步 non-expert 聚合完成后的完整 state_dict。
             本聚合器会克隆它，并且只覆盖 expert 参数，因此不会破坏
-            已经完成的 uniform non-expert 聚合结果。
+            已经完成的 non-expert 聚合结果。
         strict:
-            True 时，缺失 Fisher payload、缺失参数、shape 不一致等问题
+            True 时，缺失必要 payload、缺失参数、shape 不一致等问题
             直接报错；False 时跳过对应无效客户端。
         """
 
@@ -205,8 +247,15 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
             )
         )
         eps = float(_cfg_get(self.cfg, "fisher_diag.eps", 1.0e-12))
+
+        # 保留原有 min_usage 配置名以兼容当前配置文件；
+        # 在新逻辑中它只用于过滤训练阶段的 expert usage。
         min_usage = float(
-            _cfg_get(self.cfg, "fisher_diag.min_usage", 0.0)
+            _cfg_get(
+                self.cfg,
+                "fisher_diag.min_train_usage",
+                _cfg_get(self.cfg, "fisher_diag.min_usage", 0.0),
+            )
         )
         usage_tolerance = float(
             _cfg_get(
@@ -214,6 +263,9 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
                 "fisher_diag.usage_tolerance",
                 1.0e-6,
             )
+        )
+        min_fisher_count = int(
+            _cfg_get(self.cfg, "fisher_diag.min_count", 1)
         )
         fallback = str(
             _cfg_get(
@@ -230,6 +282,7 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
             eps=eps,
             min_usage=min_usage,
             usage_tolerance=usage_tolerance,
+            min_fisher_count=min_fisher_count,
             fallback=fallback,
         )
 
@@ -244,7 +297,7 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
         if not expert_param_names:
             raise ValueError(
                 "param_names 中没有可识别的 expert 参数；"
-                "请检查参数名是否包含 experts.<id>。"
+                "请检查参数名是否包含 experts.。"
             )
 
         # server 先完成 non-expert 聚合，再把结果作为 base_state 传进来。
@@ -260,8 +313,8 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
             new_state_dict = clone_state_dict(base_state)
 
         # AggregationResult.weights 只能存一套客户端权重。
-        # 这里沿用项目现有 K-FAC aggregator 的兼容做法，放样本数权重；
-        # 每个 expert 的真实路由权重放到 diagnostics 中。
+        # 这里继续放样本数权重以兼容项目公共接口；
+        # 每个 expert 的 delta / Fisher 真实权重放到 diagnostics 中。
         compatibility_weights = normalize_weights(
             self.compute_weights(client_updates)
         )
@@ -276,18 +329,28 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
             "shrinkage_lambda": shrinkage_lambda,
             "eps": eps,
             "min_usage": min_usage,
+            "min_fisher_count": min_fisher_count,
             "fallback": fallback,
+            "delta_weight_source": "train_expert_usage",
+            "fisher_weight_source": "expert_routed_samples",
             "weights_note": (
                 "AggregationResult.weights 是接口兼容用的样本数权重；"
-                "真实 expert-specific 权重见 expert_weights。"
+                "真实 expert-specific delta / Fisher 权重分别见 "
+                "delta_weights 和 fisher_weights。"
             ),
+            # 保留 expert_weights 作为旧日志兼容字段，内容等同于 delta_weights。
             "expert_weights": {},
+            "delta_weights": {},
+            "fisher_weights": {},
             "expert_stats": {},
             "skipped_experts": [],
         }
 
         for expert_id, names in sorted(expert_param_names.items()):
-            entries = _collect_expert_entries(
+            # 两类 entry 独立收集：
+            # - delta entry 只依赖训练阶段 usage 和 model_delta；
+            # - Fisher entry 只依赖 Fisher routed count 和 Fisher tensor。
+            delta_entries = _collect_delta_entries(
                 expert_id=expert_id,
                 expert_param_names=names,
                 client_updates=client_updates,
@@ -298,54 +361,109 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
                 strict=strict,
             )
 
-            # 本轮没有任何客户端路由到该 expert。
-            # 此时不应拿未使用该 expert 的客户端做平均，而是保留旧全局 expert。
-            if not entries:
+            fisher_entries = _collect_fisher_entries(
+                expert_id=expert_id,
+                expert_param_names=names,
+                client_updates=client_updates,
+                global_state=global_state,
+                min_fisher_count=min_fisher_count,
+                strict=strict,
+            )
+
+            # 本轮没有任何客户端在训练过程中有效使用该 expert。
+            # 此时不应使用 Fisher pass 的最终路由状态凭空产生 model update。
+            if not delta_entries:
                 if fallback != "keep_global":
                     raise RuntimeError(
-                        f"expert {expert_id} 没有有效客户端，"
+                        f"expert {expert_id} 没有有效 delta 客户端，"
                         f"但 fallback={fallback} 不受支持。"
                     )
 
                 for name in names:
-                    new_state_dict[name] = global_state[name].detach().clone()
+                    new_state_dict[name] = (
+                        global_state[name].detach().clone()
+                    )
 
                 diagnostics["skipped_experts"].append(expert_id)
                 diagnostics["expert_stats"][str(expert_id)] = {
-                    "status": "kept_global_no_valid_client",
-                    "num_clients": 0,
-                    "total_raw_weight": 0.0,
+                    "status": "kept_global_no_valid_delta_client",
+                    "num_delta_clients": 0,
+                    "num_fisher_clients": len(fisher_entries),
+                    "total_delta_raw_weight": 0.0,
+                    "total_fisher_count": float(
+                        sum(
+                            entry.fisher_count
+                            for entry in fisher_entries
+                        )
+                    ),
                 }
+                diagnostics["expert_weights"][str(expert_id)] = {}
+                diagnostics["delta_weights"][str(expert_id)] = {}
+                diagnostics["fisher_weights"][str(expert_id)] = {}
                 continue
 
-            raw_weight_sum = sum(entry.raw_weight for entry in entries)
-            if not math.isfinite(raw_weight_sum) or raw_weight_sum <= 0.0:
+            delta_raw_weight_sum = sum(
+                entry.raw_weight for entry in delta_entries
+            )
+
+            if (
+                not math.isfinite(delta_raw_weight_sum)
+                or delta_raw_weight_sum <= 0.0
+            ):
                 raise ValueError(
-                    f"expert {expert_id} 的有效权重总和非法："
-                    f"{raw_weight_sum}。"
+                    f"expert {expert_id} 的 delta 有效权重总和非法："
+                    f"{delta_raw_weight_sum}。"
                 )
 
-            expert_weights = {
+            delta_weights = {
                 int(entry.update.client_id): (
-                    float(entry.raw_weight) / raw_weight_sum
+                    float(entry.raw_weight) / delta_raw_weight_sum
                 )
-                for entry in entries
+                for entry in delta_entries
             }
 
-            diagnostics["expert_weights"][str(expert_id)] = {
+            diagnostics["delta_weights"][str(expert_id)] = {
                 str(client_id): float(weight)
-                for client_id, weight in expert_weights.items()
+                for client_id, weight in delta_weights.items()
+            }
+            diagnostics["expert_weights"][str(expert_id)] = dict(
+                diagnostics["delta_weights"][str(expert_id)]
+            )
+
+            fisher_count_sum = sum(
+                entry.fisher_count for entry in fisher_entries
+            )
+
+            if fisher_entries:
+                if fisher_count_sum <= 0:
+                    raise ValueError(
+                        f"expert {expert_id} 的 Fisher routed count "
+                        f"总和非法：{fisher_count_sum}。"
+                    )
+
+                fisher_weights = {
+                    int(entry.update.client_id): (
+                        float(entry.fisher_count)
+                        / float(fisher_count_sum)
+                    )
+                    for entry in fisher_entries
+                }
+            else:
+                fisher_weights = {}
+
+            diagnostics["fisher_weights"][str(expert_id)] = {
+                str(client_id): float(weight)
+                for client_id, weight in fisher_weights.items()
             }
 
             aggregated_delta: Dict[str, torch.Tensor] = {}
-            aggregated_fisher: Dict[str, torch.Tensor] = {}
 
-            # delta 和 Fisher 必须使用同一套 alpha_{i,e}。
+            # 先独立聚合 expert delta。
             for name in names:
                 reference = global_state[name]
 
                 if not reference.is_floating_point():
-                    # 当前 expert 是 Linear 权重/偏置，正常不会进入这里。
+                    # 当前 expert 正常只有 Linear 权重/偏置。
                     # 对非浮点 buffer 不做算术，直接保留旧全局值。
                     new_state_dict[name] = reference.detach().clone()
                     continue
@@ -355,47 +473,152 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
                     dtype=torch.float32,
                     device=reference.device,
                 )
+
+                for entry in delta_entries:
+                    client_id = int(entry.update.client_id)
+                    alpha_delta = delta_weights[client_id]
+                    client_delta = (
+                        entry.update.model_delta[name]
+                        .detach()
+                        .to(
+                            device=reference.device,
+                            dtype=torch.float32,
+                        )
+                    )
+                    delta_sum.add_(
+                        client_delta,
+                        alpha=alpha_delta,
+                    )
+
+                aggregated_delta[name] = delta_sum
+
+            floating_names = [
+                name for name in names if name in aggregated_delta
+            ]
+
+            if not floating_names:
+                raise RuntimeError(
+                    f"expert {expert_id} 没有可聚合的浮点参数。"
+                )
+
+            # 有 delta、但没有合法 Fisher：
+            # 不丢掉训练产生的 expert update，直接退化为无收缩更新。
+            if not fisher_entries:
+                delta_l2_sq = 0.0
+                applied_delta_l2_sq = 0.0
+
+                for name in floating_names:
+                    reference = global_state[name]
+                    original_delta = aggregated_delta[name]
+                    applied_delta = server_lr * original_delta
+                    updated_value = (
+                        reference.detach().to(torch.float32)
+                        + applied_delta
+                    )
+                    new_state_dict[name] = updated_value.to(
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    )
+
+                    delta_l2_sq += float(
+                        original_delta
+                        .to(torch.float64)
+                        .square()
+                        .sum()
+                        .item()
+                    )
+                    applied_delta_l2_sq += float(
+                        applied_delta
+                        .to(torch.float64)
+                        .square()
+                        .sum()
+                        .item()
+                    )
+
+                original_delta_l2 = math.sqrt(
+                    max(delta_l2_sq, 0.0)
+                )
+                applied_delta_l2 = math.sqrt(
+                    max(applied_delta_l2_sq, 0.0)
+                )
+
+                diagnostics["expert_stats"][str(expert_id)] = {
+                    "status": "updated_without_valid_fisher",
+                    "num_delta_clients": len(delta_entries),
+                    "num_fisher_clients": 0,
+                    "delta_client_ids": [
+                        int(entry.update.client_id)
+                        for entry in delta_entries
+                    ],
+                    "fisher_client_ids": [],
+                    "total_delta_raw_weight": float(
+                        delta_raw_weight_sum
+                    ),
+                    "total_fisher_count": 0.0,
+                    "mean_fisher": None,
+                    "scale_min": 1.0,
+                    "scale_mean": 1.0,
+                    "scale_max": 1.0,
+                    "original_delta_l2": float(original_delta_l2),
+                    "applied_delta_l2": float(applied_delta_l2),
+                    "applied_to_original_l2_ratio": (
+                        float(applied_delta_l2 / original_delta_l2)
+                        if original_delta_l2 > 0.0
+                        else 0.0
+                    ),
+                    "client_train_usage": {
+                        str(int(entry.update.client_id)): float(
+                            entry.train_usage
+                        )
+                        for entry in delta_entries
+                    },
+                    "client_delta_raw_weights": {
+                        str(int(entry.update.client_id)): float(
+                            entry.raw_weight
+                        )
+                        for entry in delta_entries
+                    },
+                    "client_fisher_counts": {},
+                }
+                continue
+
+            aggregated_fisher: Dict[str, torch.Tensor] = {}
+
+            # Fisher 与 delta 使用独立权重：按 Fisher evidence routed count 聚合。
+            for name in floating_names:
+                reference = global_state[name]
                 fisher_sum = torch.zeros_like(
                     reference,
                     dtype=torch.float32,
                     device=reference.device,
                 )
 
-                for entry in entries:
+                for entry in fisher_entries:
                     client_id = int(entry.update.client_id)
-                    alpha = expert_weights[client_id]
-
-                    client_delta = entry.update.model_delta[name].detach().to(
-                        device=reference.device,
-                        dtype=torch.float32,
+                    alpha_fisher = fisher_weights[client_id]
+                    client_fisher = (
+                        entry.fisher_diag[name]
+                        .detach()
+                        .to(
+                            device=reference.device,
+                            dtype=torch.float32,
+                        )
                     )
-                    client_fisher = entry.fisher_diag[name].detach().to(
-                        device=reference.device,
-                        dtype=torch.float32,
+                    fisher_sum.add_(
+                        client_fisher,
+                        alpha=alpha_fisher,
                     )
-
-                    delta_sum.add_(client_delta, alpha=alpha)
-                    fisher_sum.add_(client_fisher, alpha=alpha)
 
                 # 客户端 Fisher 是逐样本梯度平方，理论上必须非负。
-                # 前面已经严格检查；这里 clamp_min 只用于消除极小数值误差。
-                aggregated_delta[name] = delta_sum
+                # 前面已经严格检查；这里 clamp_min 只消除极小数值误差。
                 aggregated_fisher[name] = fisher_sum.clamp_min(0.0)
 
-            floating_names = [
-                name
-                for name in names
-                if name in aggregated_fisher
-            ]
-            if not floating_names:
-                raise RuntimeError(
-                    f"expert {expert_id} 没有可聚合的浮点参数。"
-                )
-
             # 对“整个 expert”统一计算均值，而不是每层分别归一化。
-            # 这样能够保留 expert 内不同层之间的相对 Fisher 尺度。
+            # 这样继续保留原实现中 expert 内不同层之间的相对 Fisher 尺度。
             fisher_total = sum(
-                aggregated_fisher[name].to(torch.float64).sum()
+                aggregated_fisher[name]
+                .to(torch.float64)
+                .sum()
                 for name in floating_names
             )
             fisher_numel = sum(
@@ -436,11 +659,11 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
 
                 original_delta = aggregated_delta[name]
                 applied_delta = server_lr * scale * original_delta
-
                 updated_value = (
                     reference.detach().to(torch.float32)
                     + applied_delta
                 )
+
                 new_state_dict[name] = updated_value.to(
                     dtype=reference.dtype,
                     device=reference.device,
@@ -454,12 +677,19 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
                     scale.to(torch.float64).sum().item()
                 )
                 scale_numel += int(scale.numel())
-
                 delta_l2_sq += float(
-                    original_delta.to(torch.float64).square().sum().item()
+                    original_delta
+                    .to(torch.float64)
+                    .square()
+                    .sum()
+                    .item()
                 )
                 applied_delta_l2_sq += float(
-                    applied_delta.to(torch.float64).square().sum().item()
+                    applied_delta
+                    .to(torch.float64)
+                    .square()
+                    .sum()
+                    .item()
                 )
 
             scale_mean = scale_sum / float(scale_numel)
@@ -469,13 +699,21 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
             )
 
             diagnostics["expert_stats"][str(expert_id)] = {
-                "status": "updated",
-                "num_clients": len(entries),
-                "client_ids": [
+                "status": "updated_with_fisher_shrinkage",
+                "num_delta_clients": len(delta_entries),
+                "num_fisher_clients": len(fisher_entries),
+                "delta_client_ids": [
                     int(entry.update.client_id)
-                    for entry in entries
+                    for entry in delta_entries
                 ],
-                "total_raw_weight": float(raw_weight_sum),
+                "fisher_client_ids": [
+                    int(entry.update.client_id)
+                    for entry in fisher_entries
+                ],
+                "total_delta_raw_weight": float(
+                    delta_raw_weight_sum
+                ),
+                "total_fisher_count": float(fisher_count_sum),
                 "mean_fisher": float(mean_fisher),
                 "scale_min": float(scale_min),
                 "scale_mean": float(scale_mean),
@@ -487,15 +725,23 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
                     if original_delta_l2 > 0.0
                     else 0.0
                 ),
-                "client_usage": {
-                    str(int(entry.update.client_id)): float(entry.usage)
-                    for entry in entries
+                "client_train_usage": {
+                    str(int(entry.update.client_id)): float(
+                        entry.train_usage
+                    )
+                    for entry in delta_entries
                 },
-                "client_raw_weights": {
+                "client_delta_raw_weights": {
                     str(int(entry.update.client_id)): float(
                         entry.raw_weight
                     )
-                    for entry in entries
+                    for entry in delta_entries
+                },
+                "client_fisher_counts": {
+                    str(int(entry.update.client_id)): int(
+                        entry.fisher_count
+                    )
+                    for entry in fisher_entries
                 },
             }
 
@@ -511,7 +757,7 @@ class FisherDiagShrinkageExpertAggregator(Aggregator):
         )
 
 
-def _collect_expert_entries(
+def _collect_delta_entries(
     expert_id: int,
     expert_param_names: Sequence[str],
     client_updates: Sequence[ClientUpdate],
@@ -520,44 +766,41 @@ def _collect_expert_entries(
     min_usage: float,
     usage_tolerance: float,
     strict: bool,
-) -> List[_ExpertClientEntry]:
+) -> List[_DeltaClientEntry]:
     """
-    收集所有实际使用 expert e 且 payload 完整的客户端。
+    收集所有在本地训练期间实际使用 expert e 的客户端 delta。
 
-    usage == 0 的客户端不参与该 expert 聚合，也不要求它上传该 expert 的
-    Fisher tensor；usage > 0 时，必须同时存在该 expert 所有参数的 delta
-    和 diagonal Fisher。
+    这里仅检查：
+    1. train_expert_usage；
+    2. expert model_delta。
+
+    不要求客户端必须拥有有效 Fisher，因为新算法允许：
+    - delta 客户端集合；
+    - Fisher 客户端集合；
+
+    彼此不同。
     """
 
-    entries: List[_ExpertClientEntry] = []
+    entries: List[_DeltaClientEntry] = []
 
     for update in client_updates:
-        payload = update.extra.get("expert_fisher_diag")
+        usage_payload = update.extra.get("train_expert_usage")
 
-        if not isinstance(payload, Mapping):
+        if not isinstance(usage_payload, Mapping):
             if strict:
                 raise KeyError(
                     f"客户端 {update.client_id} 缺少 "
-                    "extra['expert_fisher_diag']。"
+                    "extra['train_expert_usage']。"
                 )
             continue
 
-        usage_map = payload.get("expert_usage")
-        fisher_diag = payload.get("diag")
+        usage_map = usage_payload.get("expert_usage")
 
         if not isinstance(usage_map, Mapping):
             if strict:
                 raise TypeError(
                     f"客户端 {update.client_id} 的 "
-                    "expert_fisher_diag['expert_usage'] 不是 Mapping。"
-                )
-            continue
-
-        if not isinstance(fisher_diag, Mapping):
-            if strict:
-                raise TypeError(
-                    f"客户端 {update.client_id} 的 "
-                    "expert_fisher_diag['diag'] 不是 Mapping。"
+                    "train_expert_usage['expert_usage'] 不是 Mapping。"
                 )
             continue
 
@@ -573,7 +816,7 @@ def _collect_expert_entries(
             if strict:
                 raise TypeError(
                     f"客户端 {update.client_id} 的 expert {expert_id} "
-                    f"usage 无法转成 float：{usage_value!r}。"
+                    f"train usage 无法转成 float：{usage_value!r}。"
                 ) from error
             continue
 
@@ -581,7 +824,7 @@ def _collect_expert_entries(
             if strict:
                 raise ValueError(
                     f"客户端 {update.client_id} 的 expert {expert_id} "
-                    f"usage 不是有限数：{usage}。"
+                    f"train usage 不是有限数：{usage}。"
                 )
             continue
 
@@ -589,18 +832,156 @@ def _collect_expert_entries(
             if strict:
                 raise ValueError(
                     f"客户端 {update.client_id} 的 expert {expert_id} "
-                    f"usage={usage} 超出合理范围 [0, 1]。"
+                    f"train usage={usage} 超出合理范围 [0, 1]。"
                 )
             continue
 
-        # 消除浮点统计中极小的负值或略大于 1 的误差。
+        # 单个 expert 的 usage 位于 [0, 1]；top-k 只影响所有 expert usage 的和。
         usage = min(max(usage, 0.0), 1.0)
 
-        # 没有路由到该 expert 的客户端不参与当前 expert 的聚合。
         if usage <= min_usage:
             continue
 
-        valid = _validate_client_expert_tensors(
+        valid = _validate_client_delta_tensors(
+            update=update,
+            expert_id=expert_id,
+            expert_param_names=expert_param_names,
+            global_state=global_state,
+            strict=strict,
+        )
+
+        if not valid:
+            continue
+
+        raw_weight = float(update.num_samples) * (usage ** beta)
+
+        if not math.isfinite(raw_weight) or raw_weight <= 0.0:
+            if strict:
+                raise ValueError(
+                    f"客户端 {update.client_id} 对 expert {expert_id} 的 "
+                    f"delta raw_weight 非法：{raw_weight}。"
+                )
+            continue
+
+        entries.append(
+            _DeltaClientEntry(
+                update=update,
+                train_usage=usage,
+                raw_weight=raw_weight,
+            )
+        )
+
+    return entries
+
+
+def _collect_fisher_entries(
+    expert_id: int,
+    expert_param_names: Sequence[str],
+    client_updates: Sequence[ClientUpdate],
+    global_state: Mapping[str, torch.Tensor],
+    min_fisher_count: int,
+    strict: bool,
+) -> List[_FisherClientEntry]:
+    """
+    收集所有对 expert e 拥有有效 diagonal Fisher 的客户端。
+
+    Fisher 权重直接由 Fisher evidence pass 中的 routed count 决定：
+
+        alpha_fisher_{i,e}
+            = c_fisher_{i,e} / sum_j c_fisher_{j,e}
+
+    count 小于 min_fisher_count 的客户端会被正常跳过；这是 evidence
+    不足，而不是 payload 错误。
+    """
+
+    entries: List[_FisherClientEntry] = []
+
+    for update in client_updates:
+        payload = update.extra.get("expert_fisher_diag")
+
+        if not isinstance(payload, Mapping):
+            if strict:
+                raise KeyError(
+                    f"客户端 {update.client_id} 缺少 "
+                    "extra['expert_fisher_diag']。"
+                )
+            continue
+
+        count_map = payload.get("expert_routed_samples")
+        fisher_diag = payload.get("diag")
+
+        if not isinstance(count_map, Mapping):
+            if strict:
+                raise TypeError(
+                    f"客户端 {update.client_id} 的 "
+                    "expert_fisher_diag['expert_routed_samples'] "
+                    "不是 Mapping。"
+                )
+            continue
+
+        if not isinstance(fisher_diag, Mapping):
+            if strict:
+                raise TypeError(
+                    f"客户端 {update.client_id} 的 "
+                    "expert_fisher_diag['diag'] 不是 Mapping。"
+                )
+            continue
+
+        count_value = _mapping_get_by_int_or_str_key(
+            count_map,
+            expert_id,
+            default=0,
+        )
+
+        try:
+            fisher_count = int(count_value)
+        except (TypeError, ValueError) as error:
+            if strict:
+                raise TypeError(
+                    f"客户端 {update.client_id} 的 expert {expert_id} "
+                    f"Fisher routed count 无法转成 int：{count_value!r}。"
+                ) from error
+            continue
+
+        if fisher_count < 0:
+            if strict:
+                raise ValueError(
+                    f"客户端 {update.client_id} 的 expert {expert_id} "
+                    f"Fisher routed count 不能为负数：{fisher_count}。"
+                )
+            continue
+
+        # Fisher evidence 不足时，客户端不参与该 expert 的 Fisher 聚合。
+        if fisher_count < min_fisher_count:
+            continue
+
+        # 客户端 Fisher collector 也会在 payload 中记录有效 expert。
+        # 这里将它作为一致性检查，但兼容旧 payload 中不存在该字段的情况。
+        valid_fisher_experts = payload.get("valid_fisher_experts", None)
+        if valid_fisher_experts is not None:
+            if not isinstance(valid_fisher_experts, Sequence) or isinstance(
+                valid_fisher_experts,
+                (str, bytes),
+            ):
+                if strict:
+                    raise TypeError(
+                        f"客户端 {update.client_id} 的 "
+                        "expert_fisher_diag['valid_fisher_experts'] "
+                        "不是有效序列。"
+                    )
+                continue
+
+            valid_ids = {int(value) for value in valid_fisher_experts}
+            if expert_id not in valid_ids:
+                if strict:
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 expert {expert_id} "
+                        f"Fisher count={fisher_count}，但不在 "
+                        "valid_fisher_experts 中。"
+                    )
+                continue
+
+        valid = _validate_client_fisher_tensors(
             update=update,
             fisher_diag=fisher_diag,
             expert_id=expert_id,
@@ -608,23 +989,14 @@ def _collect_expert_entries(
             global_state=global_state,
             strict=strict,
         )
+
         if not valid:
             continue
 
-        raw_weight = float(update.num_samples) * (usage ** beta)
-        if not math.isfinite(raw_weight) or raw_weight <= 0.0:
-            if strict:
-                raise ValueError(
-                    f"客户端 {update.client_id} 对 expert {expert_id} 的 "
-                    f"raw_weight 非法：{raw_weight}。"
-                )
-            continue
-
         entries.append(
-            _ExpertClientEntry(
+            _FisherClientEntry(
                 update=update,
-                usage=usage,
-                raw_weight=raw_weight,
+                fisher_count=fisher_count,
                 fisher_diag=fisher_diag,
             )
         )
@@ -632,15 +1004,14 @@ def _collect_expert_entries(
     return entries
 
 
-def _validate_client_expert_tensors(
+def _validate_client_delta_tensors(
     update: ClientUpdate,
-    fisher_diag: Mapping[str, torch.Tensor],
     expert_id: int,
     expert_param_names: Sequence[str],
     global_state: Mapping[str, torch.Tensor],
     strict: bool,
 ) -> bool:
-    """检查客户端某个 expert 的 delta 和 Fisher 是否完整、有限且同形状。"""
+    """检查客户端某个 expert 的 delta 是否完整、有限且同形状。"""
 
     for name in expert_param_names:
         reference = global_state[name]
@@ -654,6 +1025,7 @@ def _validate_client_expert_tensors(
             return False
 
         delta = update.model_delta[name]
+
         if not torch.is_tensor(delta):
             if strict:
                 raise TypeError(
@@ -672,9 +1044,26 @@ def _validate_client_expert_tensors(
         if delta.is_floating_point() and not torch.isfinite(delta).all():
             if strict:
                 raise ValueError(
-                    f"客户端 {update.client_id} 的 delta {name} 包含 NaN/Inf。"
+                    f"客户端 {update.client_id} 的 delta {name} "
+                    "包含 NaN/Inf。"
                 )
             return False
+
+    return True
+
+
+def _validate_client_fisher_tensors(
+    update: ClientUpdate,
+    fisher_diag: Mapping[str, torch.Tensor],
+    expert_id: int,
+    expert_param_names: Sequence[str],
+    global_state: Mapping[str, torch.Tensor],
+    strict: bool,
+) -> bool:
+    """检查客户端某个 expert 的 Fisher 是否完整、有限、非负且同形状。"""
+
+    for name in expert_param_names:
+        reference = global_state[name]
 
         # 非浮点 expert buffer 不需要 Fisher，聚合时会直接保留全局值。
         if not reference.is_floating_point():
@@ -689,10 +1078,12 @@ def _validate_client_expert_tensors(
             return False
 
         fisher = fisher_diag[name]
+
         if not torch.is_tensor(fisher):
             if strict:
                 raise TypeError(
-                    f"客户端 {update.client_id} 的 Fisher {name} 不是 Tensor。"
+                    f"客户端 {update.client_id} 的 Fisher {name} "
+                    "不是 Tensor。"
                 )
             return False
 
@@ -756,6 +1147,7 @@ def _resolve_target_param_names(
     for name in names:
         if name not in global_state:
             raise KeyError(f"global_state 缺少参数：{name}")
+
         if get_expert_id_from_name(name) is None:
             raise ValueError(
                 f"参数 {name} 不属于 expert，不能交给 "
@@ -774,8 +1166,12 @@ def _group_param_names_by_expert(
 
     for name in param_names:
         expert_id = get_expert_id_from_name(name)
+
         if expert_id is None:
-            raise ValueError(f"无法从 expert 参数名解析 expert id：{name}")
+            raise ValueError(
+                f"无法从 expert 参数名解析 expert id：{name}"
+            )
+
         result.setdefault(int(expert_id), []).append(name)
 
     return result
@@ -791,10 +1187,9 @@ def _validate_base_state(
     """
 
     missing_names = [
-        name
-        for name in global_state.keys()
-        if name not in base_state
+        name for name in global_state.keys() if name not in base_state
     ]
+
     if missing_names:
         raise KeyError(
             "base_state 不是完整 state_dict，缺少参数："
@@ -817,6 +1212,7 @@ def _validate_hyperparameters(
     eps: float,
     min_usage: float,
     usage_tolerance: float,
+    min_fisher_count: int,
     fallback: str,
 ) -> None:
     """集中检查配置，避免训练若干轮后才因非法超参数失败。"""
@@ -850,7 +1246,8 @@ def _validate_hyperparameters(
 
     if not math.isfinite(min_usage) or min_usage < 0.0:
         raise ValueError(
-            "fisher_diag.min_usage 必须是非负有限数，"
+            "fisher_diag.min_train_usage / min_usage "
+            "必须是非负有限数，"
             f"当前值：{min_usage}。"
         )
 
@@ -861,6 +1258,12 @@ def _validate_hyperparameters(
         raise ValueError(
             "fisher_diag.usage_tolerance 必须是非负有限数，"
             f"当前值：{usage_tolerance}。"
+        )
+
+    if min_fisher_count <= 0:
+        raise ValueError(
+            "fisher_diag.min_count 必须大于 0，"
+            f"当前值：{min_fisher_count}。"
         )
 
     if fallback != "keep_global":
@@ -881,6 +1284,7 @@ def _mapping_get_by_int_or_str_key(
         return mapping[key]
 
     string_key = str(key)
+
     if string_key in mapping:
         return mapping[string_key]
 
@@ -903,15 +1307,19 @@ def _cfg_get(
 
     if hasattr(cfg, "get"):
         value = cfg.get(key, sentinel)
+
         if value is not sentinel:
             return value
 
     if isinstance(cfg, Mapping):
         current: Any = cfg
+
         for part in key.split("."):
             if not isinstance(current, Mapping) or part not in current:
                 return default
+
             current = current[part]
+
         return current
 
     return getattr(cfg, key, default)

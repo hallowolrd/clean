@@ -3,9 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import math
-
 from dataclasses import dataclass
-
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
@@ -38,14 +36,18 @@ class ClientTrainStats:
     train_acc:
         本地训练准确率，百分比形式。
     num_samples:
-        本地训练样本数。
+        本地训练实际处理的累计样本数。
+        当 local_epochs > 1 时，该值包含所有 local epoch。
     num_batches:
-        本地训练 batch 数。
+        本地训练实际处理的累计 batch 数。
     avg_aux_loss:
         未乘 load_balance_loss_weight 的平均 Switch 风格负载均衡损失。
     avg_objective_loss:
         实际执行 backward 的平均总损失：
         CrossEntropyLoss + load_balance_loss_weight * aux_loss。
+    train_expert_usage:
+        本地训练过程中实时累计的 expert 路由统计。
+        该统计与本轮 local model delta 的生成过程对齐。
     """
 
     avg_loss: float
@@ -54,6 +56,7 @@ class ClientTrainStats:
     num_batches: int
     avg_aux_loss: float = 0.0
     avg_objective_loss: float = 0.0
+    train_expert_usage: Optional[Dict[str, Any]] = None
 
     def to_metrics(self) -> Dict[str, float]:
         """
@@ -194,6 +197,17 @@ class FLClient:
                 f"当前值：{load_balance_loss_weight}"
             )
 
+        expert_agg_method = str(
+            _cfg_get(self.cfg, "agg.expert.method", "")
+        ).lower().strip()
+
+        # diagonal Fisher shrinkage 的 expert delta 将改为使用本地训练阶段的
+        # 真实路由 usage 聚合，因此必须在产生 local delta 的同一训练 forward 中
+        # 实时累计 expert_counts，不能再依赖训练结束后的额外前向统计。
+        collect_train_expert_usage = (
+            expert_agg_method == "fisher_diag_shrinkage_expert"
+        )
+
         stats = train_local_model(
             model=local_model,
             train_loader=self.train_loader,
@@ -203,25 +217,34 @@ class FLClient:
             local_epochs=local_epochs,
             grad_clip=grad_clip,
             load_balance_loss_weight=load_balance_loss_weight,
+            collect_train_expert_usage=collect_train_expert_usage,
+            num_experts=int(_cfg_get(self.cfg, "num_experts", 0)),
+            topk=int(_cfg_get(self.cfg, "topk", 1)),
         )
 
         # ------------------------------------------------------------
         # 可选：采集当前客户端本地模型的 expert usage。
         #
-        # 统计含义：
-        # 本地训练结束后，local_model 在该客户端自己的 train_loader 上，
-        # 每个 expert 被 top-k router 选中了多少次。
+        # diagonal Fisher shrinkage：
+        #   直接使用本地训练循环中实时累计的 train_expert_usage，
+        #   不再在训练结束后额外前向一遍 train_loader。
         #
-        # 注意：
-        # 这里仍然使用 train_loader，保持原有日志诊断语义不变。
-        # Fisher / K-FAC evidence 统计才使用 evidence_loader。
-        #
-        # topk=2 时，一个样本会贡献 2 次 expert 激活。
-        # 所以 expert_counts 的总和通常约等于 num_samples * topk。
+        # 其他聚合方法：
+        #   如果 logging.collect_expert_usage=true，仍保留原来的训练后
+        #   额外前向统计，仅作为日志诊断，保证旧实验路径不受影响。
         # ------------------------------------------------------------
-        expert_usage = None
+        expert_usage = stats.train_expert_usage
 
-        if bool(_cfg_get(self.cfg, "logging.collect_expert_usage", False)):
+        if (
+            expert_usage is None
+            and bool(
+                _cfg_get(
+                    self.cfg,
+                    "logging.collect_expert_usage",
+                    False,
+                )
+            )
+        ):
             expert_usage = collect_expert_usage(
                 model=local_model,
                 train_loader=self.train_loader,
@@ -240,8 +263,13 @@ class FLClient:
         # collect_expert_diag_fisher 内部会：
         # - 在本地训练结束后的 local_model 上采集；
         # - 使用 Linear hook 逐样本累计梯度平方；
-        # - 同时统计 expert_usage = routed_samples / evidence_samples；
+        # - 同时统计 Fisher evidence pass 的 expert routed count；
         # - 只返回 expert 参数的 diagonal Fisher。
+        #
+        # 新逻辑中：
+        # - train_expert_usage 只负责后续 expert delta 聚合；
+        # - Fisher payload 中的 expert_routed_samples 只负责 Fisher 聚合；
+        # - 两类 count 分开保存，不相加、不混用。
         #
         # 这里只负责采集和上传，不在客户端执行任何 Fisher 聚合或收缩。
         # ------------------------------------------------------------
@@ -250,10 +278,7 @@ class FLClient:
         expert_fisher_diag_timing = None
 
         should_collect_expert_fisher_diag = (
-            str(_cfg_get(self.cfg, "agg.expert.method", ""))
-            .lower()
-            .strip()
-            == "fisher_diag_shrinkage_expert"
+            expert_agg_method == "fisher_diag_shrinkage_expert"
             or bool(_cfg_get(self.cfg, "fisher_diag.collect", False))
         )
 
@@ -285,6 +310,7 @@ class FLClient:
                 device=self.device,
                 cfg=self.cfg,
             )
+
             expert_fisher_diag_summary = summarize_expert_diag_fisher(
                 expert_fisher_diag
             )
@@ -294,8 +320,7 @@ class FLClient:
         expert_kfac_timing = None
 
         should_collect_expert_kfac = (
-            str(_cfg_get(self.cfg, "agg.expert.method", "")).lower().strip()
-            == "fisher_kfac_expert"
+            expert_agg_method == "fisher_kfac_expert"
             or bool(_cfg_get(self.cfg, "kfac.collect", False))
         )
 
@@ -304,7 +329,11 @@ class FLClient:
                 _cfg_get(
                     self.cfg,
                     "kfac.fisher_timing",
-                    _cfg_get(self.cfg, "kfac.collect_timing", "after_train"),
+                    _cfg_get(
+                        self.cfg,
+                        "kfac.collect_timing",
+                        "after_train",
+                    ),
                 )
             ).lower().strip()
 
@@ -318,7 +347,7 @@ class FLClient:
             # ------------------------------------------------------------
             # Fisher / K-FAC evidence 统计使用 evidence_loader。
             #
-            # 这一步是本次修改的关键：
+            # 这一步是此前修改的关键：
             # 原代码这里使用 self.train_loader，
             # 如果 train_dataset 开启了 RandomCrop / RandomHorizontalFlip，
             # 那么统计 Fisher 时也会触发随机数据增强。
@@ -340,6 +369,7 @@ class FLClient:
                 device=self.device,
                 cfg=self.cfg,
             )
+
             expert_kfac_summary = summarize_expert_kfac(expert_kfac)
 
         local_state_cpu = state_dict_to(
@@ -372,6 +402,12 @@ class FLClient:
                 "load_balance_loss_weight": float(
                     load_balance_loss_weight
                 ),
+                # 新字段：后续 diagonal Fisher shrinkage 聚合器应读取这里，
+                # 用训练阶段 usage 计算 expert delta 的 client-expert 权重。
+                "train_expert_usage": stats.train_expert_usage,
+                # 保留原字段给 server 日志使用。
+                # diagonal Fisher shrinkage 下它与 train_expert_usage 指向
+                # 同一份训练期统计；其他方法仍可能是训练后的日志统计。
                 "expert_usage": expert_usage,
                 "expert_fisher_diag": expert_fisher_diag,
                 "expert_fisher_diag_summary": expert_fisher_diag_summary,
@@ -385,7 +421,6 @@ class FLClient:
         del local_model
         del optimizer
         del criterion
-
         gc.collect()
 
         if torch.cuda.is_available():
@@ -403,6 +438,9 @@ def train_local_model(
     local_epochs: int,
     grad_clip: Optional[float] = None,
     load_balance_loss_weight: float = 0.0,
+    collect_train_expert_usage: bool = False,
+    num_experts: int = 0,
+    topk: int = 1,
 ) -> ClientTrainStats:
     """
     训练一个客户端本地模型。
@@ -417,6 +455,11 @@ def train_local_model(
     - task_loss 是原有的 CrossEntropyLoss；
     - aux_loss 是模型返回的 Switch Transformer 风格负载均衡损失；
     - load_balance_loss_weight=0 时，完全退化为原来的纯分类训练流程。
+
+    当 collect_train_expert_usage=True 时：
+    - 每个训练 batch 使用同一次 forward 返回的 expert_counts；
+    - 在整个本地训练轨迹中累计每个 expert 的真实路由次数；
+    - 该统计用于解释并聚合本轮 local expert delta。
 
     注意：
     负载均衡损失只用于客户端正常本地训练。
@@ -439,7 +482,29 @@ def train_local_model(
             f"当前值：{load_balance_loss_weight}"
         )
 
+    if collect_train_expert_usage:
+        if num_experts <= 0:
+            raise ValueError(
+                "collect_train_expert_usage=True 时，"
+                f"num_experts 必须大于 0，当前值：{num_experts}。"
+            )
+
+        if topk <= 0:
+            raise ValueError(
+                "collect_train_expert_usage=True 时，"
+                f"topk 必须大于 0，当前值：{topk}。"
+            )
+
+        if topk > num_experts:
+            raise ValueError(
+                "topk 不能大于 num_experts，"
+                f"当前 topk={topk}, num_experts={num_experts}。"
+            )
+
     use_load_balance = load_balance_loss_weight > 0.0
+
+    # 即使关闭负载均衡，只要要统计训练阶段 usage，也必须请求 router_info。
+    need_router_info = use_load_balance or collect_train_expert_usage
 
     model.train()
 
@@ -452,17 +517,29 @@ def train_local_model(
     total_samples = 0
     total_batches = 0
 
+    train_expert_counts: Optional[torch.Tensor]
+    if collect_train_expert_usage:
+        # expert 数量通常很小，每个 batch 将 count 拷到 CPU 后累计，
+        # 避免长期占用额外 GPU buffer。
+        train_expert_counts = torch.zeros(
+            num_experts,
+            dtype=torch.float64,
+            device="cpu",
+        )
+    else:
+        train_expert_counts = None
+
     for _ in range(local_epochs):
         for batch in train_loader:
             images, targets = unpack_batch(batch)
+
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            if use_load_balance:
-                # 启用负载均衡时必须请求 router_info，
-                # 当前 resnet_sparse_moe_head 会在其中返回 aux_loss。
+            if need_router_info:
+                # 启用负载均衡或收集训练 usage 时必须请求 router_info。
                 try:
                     outputs = model(
                         images,
@@ -470,23 +547,78 @@ def train_local_model(
                     )
                 except TypeError as exc:
                     raise RuntimeError(
-                        "load_balance_loss_weight > 0 时，模型必须支持 "
+                        "当前本地训练需要 router_info，但模型不支持 "
                         "model(images, return_router_info=True)。"
                     ) from exc
             else:
-                # 权重为 0 时保持原来的前向路径。
+                # 不需要 router_info 时保持原来的前向路径。
                 outputs = model(images)
 
             logits = extract_logits(outputs)
             task_loss = criterion(logits, targets)
 
-            if use_load_balance:
+            router_info = None
+            if need_router_info:
                 router_info = extract_router_info(outputs)
 
                 if router_info is None:
                     raise RuntimeError(
-                        "已启用负载均衡，但模型输出中没有 router_info。"
+                        "当前本地训练需要 router_info，"
+                        "但模型输出中没有 router_info。"
                     )
+
+            if collect_train_expert_usage:
+                assert train_expert_counts is not None
+                assert router_info is not None
+
+                batch_expert_counts = router_info.get(
+                    "expert_counts",
+                    None,
+                )
+
+                if batch_expert_counts is None:
+                    raise RuntimeError(
+                        "收集训练 expert usage 时，"
+                        "router_info 中没有 expert_counts。"
+                    )
+
+                if not torch.is_tensor(batch_expert_counts):
+                    raise TypeError(
+                        "router_info['expert_counts'] 必须是 Tensor，"
+                        f"当前类型：{type(batch_expert_counts).__name__}"
+                    )
+
+                batch_expert_counts = (
+                    batch_expert_counts
+                    .detach()
+                    .reshape(-1)
+                    .to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    )
+                )
+
+                if batch_expert_counts.numel() != num_experts:
+                    raise ValueError(
+                        "expert_counts 长度与 num_experts 不一致："
+                        f"expected={num_experts}, "
+                        f"actual={batch_expert_counts.numel()}。"
+                    )
+
+                if not torch.isfinite(batch_expert_counts).all():
+                    raise FloatingPointError(
+                        "训练阶段 expert_counts 出现 NaN 或 Inf。"
+                    )
+
+                if torch.any(batch_expert_counts < 0):
+                    raise ValueError(
+                        "训练阶段 expert_counts 不能包含负数。"
+                    )
+
+                train_expert_counts += batch_expert_counts
+
+            if use_load_balance:
+                assert router_info is not None
 
                 aux_loss = router_info.get("aux_loss", None)
 
@@ -567,6 +699,16 @@ def train_local_model(
     avg_objective_loss = total_objective_loss / total_samples
     train_acc = 100.0 * total_correct / total_samples
 
+    train_expert_usage = None
+    if train_expert_counts is not None:
+        train_expert_usage = _build_train_expert_usage(
+            expert_counts=train_expert_counts,
+            num_processed_samples=total_samples,
+            num_batches=total_batches,
+            num_experts=num_experts,
+            topk=topk,
+        )
+
     return ClientTrainStats(
         avg_loss=avg_task_loss,
         train_acc=train_acc,
@@ -574,7 +716,124 @@ def train_local_model(
         num_batches=total_batches,
         avg_aux_loss=avg_aux_loss,
         avg_objective_loss=avg_objective_loss,
+        train_expert_usage=train_expert_usage,
     )
+
+
+def _build_train_expert_usage(
+    expert_counts: torch.Tensor,
+    num_processed_samples: int,
+    num_batches: int,
+    num_experts: int,
+    topk: int,
+) -> Dict[str, Any]:
+    """
+    将本地训练期间累计的 expert count 转成上传用统计结构。
+
+    两种比例必须区分：
+
+    expert_usage[e]
+        = expert_counts[e] / num_processed_samples
+        与 diagonal Fisher payload 中 usage 的定义一致。
+        top-k 路由下所有 expert_usage 的和应等于 topk。
+        后续算法使用该字段构造 expert delta 权重。
+
+    expert_fraction[e]
+        = expert_counts[e] / total_activations
+        所有 expert_fraction 的和为 1，仅用于日志展示。
+    """
+
+    if num_processed_samples <= 0:
+        raise ValueError(
+            "构建 train_expert_usage 时 num_processed_samples 必须大于 0。"
+        )
+
+    if num_batches <= 0:
+        raise ValueError(
+            "构建 train_expert_usage 时 num_batches 必须大于 0。"
+        )
+
+    counts = expert_counts.detach().reshape(-1).to(
+        device="cpu",
+        dtype=torch.float64,
+    )
+
+    if counts.numel() != num_experts:
+        raise ValueError(
+            "训练 expert count 数量与 num_experts 不一致："
+            f"expected={num_experts}, actual={counts.numel()}。"
+        )
+
+    if not torch.isfinite(counts).all():
+        raise FloatingPointError(
+            "训练阶段累计 expert_counts 出现 NaN 或 Inf。"
+        )
+
+    if torch.any(counts < 0):
+        raise ValueError(
+            "训练阶段累计 expert_counts 不能包含负数。"
+        )
+
+    total_activations = int(counts.sum().item())
+    expected_activations = int(num_processed_samples) * int(topk)
+
+    # 当前 SparseMoEHead 的每个样本严格选择 topk 个不同 expert，
+    # 因此训练路径中的累计激活数应与 processed_samples * topk 完全一致。
+    if total_activations != expected_activations:
+        raise RuntimeError(
+            "训练阶段 expert 路由总次数不一致："
+            f"actual={total_activations}, "
+            f"expected={expected_activations} "
+            f"(num_processed_samples={num_processed_samples}, topk={topk})。"
+        )
+
+    usage_tensor = counts / float(num_processed_samples)
+
+    if total_activations > 0:
+        fraction_tensor = counts / float(total_activations)
+    else:
+        fraction_tensor = torch.zeros_like(counts)
+
+    expert_counts_dict = {
+        int(expert_id): int(counts[expert_id].item())
+        for expert_id in range(num_experts)
+    }
+
+    expert_usage_dict = {
+        int(expert_id): float(usage_tensor[expert_id].item())
+        for expert_id in range(num_experts)
+    }
+
+    expert_fraction_dict = {
+        int(expert_id): float(fraction_tensor[expert_id].item())
+        for expert_id in range(num_experts)
+    }
+
+    dead_experts = [
+        int(expert_id)
+        for expert_id, count in expert_counts_dict.items()
+        if count <= 0
+    ]
+    active_experts = int(num_experts - len(dead_experts))
+
+    return {
+        "supported": True,
+        "source": "local_training",
+        # 保留 num_samples 字段，兼容旧日志或下游代码。
+        "num_samples": int(num_processed_samples),
+        "num_processed_samples": int(num_processed_samples),
+        "num_batches": int(num_batches),
+        "num_experts": int(num_experts),
+        "topk": int(topk),
+        "total_activations": int(total_activations),
+        "expert_counts": expert_counts_dict,
+        # 算法字段：sum(expert_usage.values()) == topk。
+        "expert_usage": expert_usage_dict,
+        # 日志字段：sum(expert_fraction.values()) == 1。
+        "expert_fraction": expert_fraction_dict,
+        "active_experts": int(active_experts),
+        "dead_experts": dead_experts,
+    }
 
 
 @torch.inference_mode()
@@ -617,7 +876,9 @@ def collect_expert_usage(
         当前模型是否支持 return_router_info=True。
 
     注意：
-        这个函数只做前向统计，不更新模型参数。
+    这个函数只做前向统计，不更新模型参数。
+    新的 diagonal Fisher shrinkage 路径不再依赖这里的训练后统计；
+    该函数仅为其他方法和旧日志路径保留。
     """
 
     max_batches = int(
@@ -740,7 +1001,6 @@ def collect_expert_usage(
         for expert_id, count in expert_counts_dict.items()
         if count <= 0
     ]
-
     active_experts = int(num_experts - len(dead_experts))
 
     return {
@@ -1017,7 +1277,7 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     支持两种写法：
 
     optimizer:
-        grad_clip: 5.0
+      grad_clip: 5.0
 
     或者：
 
@@ -1060,10 +1320,10 @@ def _cfg_get(
     """
     兼容 dict / ConfigNode / 普通对象的读取。
 
-    dict 或 ConfigNode:
+    dict 或 ConfigNode：
         cfg.get(key, default)
 
-    普通对象:
+    普通对象：
         getattr(cfg, key, default)
     """
 

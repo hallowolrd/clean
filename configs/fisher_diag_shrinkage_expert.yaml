@@ -14,7 +14,7 @@ agg:
     method: uniform
 
   # 仅 expert 参数使用新增的：
-  # 路由比例加权聚合 + diagonal Fisher 稳定收缩。
+  # 训练阶段路由 usage 加权聚合 + diagonal Fisher 稳定收缩。
   expert:
     method: fisher_diag_shrinkage_expert
 
@@ -38,19 +38,24 @@ fisher_diag:
   # 0 表示完整遍历无数据增强的 evidence_loader。
   max_batches: 0
 
-  # expert 至少被路由到这么多个 evidence 样本，
-  # 才上传该 expert 的 diagonal Fisher。
+  # expert 至少被路由到这么多个 Fisher evidence 样本，
+  # 才允许该客户端对应 expert 的 diagonal Fisher 参与服务器 Fisher 聚合。
+  # Fisher 在服务器端固定按 expert_routed_samples 加权，不使用训练 usage 权重。
   min_count: 1
 
   # ----------------------------------------------------------
-  # Expert-specific 客户端权重
+  # Expert delta 的客户端权重
   #
-  #   rho_{i,e} = n_i * (u_{i,e})^beta
+  #   rho_delta_{i,e} = n_i * (u_train_{i,e})^beta
   #
   # 其中：
-  #   n_i     为客户端训练样本数；
-  #   u_{i,e} 为客户端上传的 expert 路由比例；
-  #   u_{i,e} = routed_samples_{i,e} / evidence_samples_i。
+  #   n_i           为客户端训练样本数；
+  #   u_train_{i,e} 为本地训练过程中实时累计的 expert 路由比例；
+  #   u_train_{i,e} = train_routed_samples_{i,e}
+  #                   / processed_training_samples_i。
+  #
+  # 注意：beta 只影响 expert delta 的聚合权重；
+  # diagonal Fisher 始终按 Fisher evidence pass 的 routed count 聚合。
   # ----------------------------------------------------------
   beta: 1.0
 
@@ -62,8 +67,8 @@ fisher_diag:
   #
   #   scale = 1 / (1 + lambda * normalized_fisher)
   #
-  # lambda=0 时，方法严格退化为按 n_i * u_{i,e}^beta
-  # 加权的普通 routing-aware expert 聚合。
+  # lambda=0 时，方法严格退化为按
+  # n_i * (u_train_{i,e})^beta 加权的 routing-aware expert 聚合。
   shrinkage_lambda: 0.2
 
   # Fisher 均值归一化中的数值稳定项：
@@ -71,21 +76,24 @@ fisher_diag:
   #   normalized_fisher = fisher / (mean_fisher + eps)
   eps: 1.0e-12
 
-  # usage <= min_usage 的客户端不参与对应 expert 的聚合。
-  # 设为 0.0 表示只排除完全没有路由到该 expert 的客户端。
-  min_usage: 0.0
+  # train usage <= min_train_usage 的客户端，
+  # 不参与对应 expert 的 delta 聚合。
+  # 设为 0.0 表示只排除训练过程中完全没有路由到该 expert 的客户端。
+  min_train_usage: 0.0
 
-  # 检查路由比例是否位于 [0, 1] 时允许的浮点误差。
+  # 检查单个 expert 的训练路由比例是否位于 [0, 1] 时允许的浮点误差。
   usage_tolerance: 1.0e-6
 
-  # 某个 expert 本轮没有任何有效客户端时，保留旧全局 expert 参数。
+  # 某个 expert 本轮没有任何有效 delta 客户端时，保留旧全局 expert 参数。
+  # 如果存在有效 delta、但没有有效 Fisher，则聚合器会自动退化为
+  # 不执行 Fisher 收缩的 routing-aware delta 更新。
   fallback: keep_global
 
 # ============================================================
 # 日志统计覆盖
 # ============================================================
 logging:
-  # base.yaml 默认会在本地训练后额外使用 train_loader 统计一次 expert usage。
-  # 新方法已经在无增强的 Fisher evidence pass 中同步得到 expert_usage，
-  # 聚合器也只读取 expert_fisher_diag 中的 usage，因此关闭旧统计以避免重复遍历。
+  # diagonal Fisher shrinkage 已在本地训练循环中实时累计 train_expert_usage，
+  # 不需要训练结束后再额外遍历 train_loader 统计 usage。
+  # Fisher evidence pass 仍会独立统计 Fisher routed count，仅用于 Fisher 聚合。
   collect_expert_usage: false
