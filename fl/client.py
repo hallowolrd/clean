@@ -4,17 +4,14 @@ import copy
 import gc
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from fl.fisher_diag import (
-    collect_expert_diag_fisher,
-    summarize_expert_diag_fisher,
-)
+from fl.fisher_diag import collect_expert_diag_fisher
 from fl.kfac import collect_expert_kfac, summarize_expert_kfac
 from fl.types import ClientUpdate
 from utils.eval import extract_logits, unpack_batch
@@ -164,7 +161,6 @@ class FLClient:
 
         local_model = copy.deepcopy(global_model)
         local_model.to(self.device)
-        local_model.train()
 
         criterion = build_criterion(self.cfg)
         optimizer = build_optimizer(
@@ -185,17 +181,6 @@ class FLClient:
             )
         )
 
-        if not math.isfinite(load_balance_loss_weight):
-            raise ValueError(
-                "load_balance_loss_weight 必须是有限数值，"
-                f"当前值：{load_balance_loss_weight}"
-            )
-
-        if load_balance_loss_weight < 0.0:
-            raise ValueError(
-                "load_balance_loss_weight 不能小于 0，"
-                f"当前值：{load_balance_loss_weight}"
-            )
 
         expert_agg_method = str(
             _cfg_get(self.cfg, "agg.expert.method", "")
@@ -274,7 +259,6 @@ class FLClient:
         # 这里只负责采集和上传，不在客户端执行任何 Fisher 聚合或收缩。
         # ------------------------------------------------------------
         expert_fisher_diag = None
-        expert_fisher_diag_summary = None
         expert_fisher_diag_timing = None
 
         should_collect_expert_fisher_diag = (
@@ -311,9 +295,6 @@ class FLClient:
                 cfg=self.cfg,
             )
 
-            expert_fisher_diag_summary = summarize_expert_diag_fisher(
-                expert_fisher_diag
-            )
 
         expert_kfac = None
         expert_kfac_summary = None
@@ -410,8 +391,6 @@ class FLClient:
                 # 同一份训练期统计；其他方法仍可能是训练后的日志统计。
                 "expert_usage": expert_usage,
                 "expert_fisher_diag": expert_fisher_diag,
-                "expert_fisher_diag_summary": expert_fisher_diag_summary,
-                "expert_fisher_diag_timing": expert_fisher_diag_timing,
                 "expert_kfac": expert_kfac,
                 "expert_kfac_summary": expert_kfac_summary,
                 "expert_kfac_timing": expert_kfac_timing,
@@ -912,7 +891,7 @@ def collect_expert_usage(
             if max_batches > 0 and batch_index >= max_batches:
                 break
 
-            images, targets = unpack_batch(batch)
+            images, _ = unpack_batch(batch)
             images = images.to(device, non_blocking=True)
 
             try:
