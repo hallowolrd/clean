@@ -42,7 +42,7 @@ kfac:
   # K-FAC 统计过滤与 fallback
   min_count: 512
   fallback: none
-  include_bias: false
+  include_bias: true
 
   # Fisher/K-FAC 采集时机：本地训练完成后额外统计
   fisher_timing: after_train

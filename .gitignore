@@ -6,3 +6,5 @@ datasets/
 outputs/
 *.log
 *.xlsx
+pictures/
+outputs_bias/
