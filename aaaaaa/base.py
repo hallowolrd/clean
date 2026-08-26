@@ -3220,12 +3220,311 @@ class ResNetBackbone(nn.Module):
         return x
 
 
+class MobileNetV2NoBNConv(nn.Sequential):
+    """Conv + ReLU6 used by the no-BN MobileNetV2 variant."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        groups: int = 1,
+    ) -> None:
+        padding = (int(kernel_size) - 1) // 2
+        super().__init__(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                # BatchNorm is intentionally removed. Keep a learnable bias so
+                # the convolution is not forced to rely on a following affine norm.
+                bias=True,
+            ),
+            nn.ReLU6(inplace=True),
+        )
+
+
+class MobileNetV2NoBNInvertedResidual(nn.Module):
+    """MobileNetV2 inverted residual block with BatchNorm removed."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        expand_ratio: int,
+    ) -> None:
+        super().__init__()
+
+        if stride not in {1, 2}:
+            raise ValueError(f"MobileNetV2 stride 必须是 1 或 2，当前值：{stride}")
+
+        hidden_dim = int(round(in_channels * expand_ratio))
+        self.use_residual = stride == 1 and in_channels == out_channels
+
+        layers: List[nn.Module] = []
+        if expand_ratio != 1:
+            layers.append(
+                MobileNetV2NoBNConv(
+                    in_channels,
+                    hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                )
+            )
+
+        layers.append(
+            MobileNetV2NoBNConv(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=3,
+                stride=stride,
+                groups=hidden_dim,
+            )
+        )
+
+        # Linear bottleneck: projection has no activation after it.
+        layers.append(
+            nn.Conv2d(
+                hidden_dim,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=True,
+            )
+        )
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.block(x)
+        if self.use_residual:
+            out = x + out
+        return out
+
+
+class MobileNetV2Backbone(nn.Module):
+    """
+    Small-image-adapted MobileNetV2 backbone without BatchNorm.
+
+    Design choices for the current federated setting:
+    - BatchNorm is completely removed (the requested C scheme).
+    - 28/32px inputs use stem stride=1; larger inputs use stride=2.
+    - The standard MobileNetV2 inverted-residual stage configuration is kept.
+    - AdaptiveAvgPool2d(1) makes 28/32/64/96px inputs share one interface.
+    - Raw output dimension is 1280; SparseMoEClassifier adapts it to 512.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        image_size: int = 32,
+    ) -> None:
+        super().__init__()
+
+        stem_stride = 1 if int(image_size) <= 32 else 2
+        input_channel = 32
+        last_channel = 1280
+
+        self.stem = MobileNetV2NoBNConv(
+            in_channels,
+            input_channel,
+            kernel_size=3,
+            stride=stem_stride,
+        )
+
+        # (expand_ratio, output_channels, repeats, first_stride)
+        stage_settings = (
+            (1, 16, 1, 1),
+            (6, 24, 2, 2),
+            (6, 32, 3, 2),
+            (6, 64, 4, 2),
+            (6, 96, 3, 1),
+            (6, 160, 3, 2),
+            (6, 320, 1, 1),
+        )
+
+        blocks: List[nn.Module] = []
+        for expand_ratio, out_channels, repeats, first_stride in stage_settings:
+            for repeat_id in range(repeats):
+                stride = first_stride if repeat_id == 0 else 1
+                blocks.append(
+                    MobileNetV2NoBNInvertedResidual(
+                        in_channels=input_channel,
+                        out_channels=out_channels,
+                        stride=stride,
+                        expand_ratio=expand_ratio,
+                    )
+                )
+                input_channel = out_channels
+
+        self.blocks = nn.Sequential(*blocks)
+        self.final_conv = MobileNetV2NoBNConv(
+            input_channel,
+            last_channel,
+            kernel_size=1,
+            stride=1,
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_dim = int(last_channel)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.final_conv(x)
+        x = self.pool(x)
+        return x.flatten(1)
+
+
+class ViTTinyBlock(nn.Module):
+    """Pre-norm Transformer encoder block for the small-image ViT-Tiny."""
+
+    def __init__(
+        self,
+        embed_dim: int = 192,
+        num_heads: int = 3,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+
+        hidden_dim = int(round(embed_dim * mlp_ratio))
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(
+            normed,
+            normed,
+            normed,
+            need_weights=False,
+        )
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ViTTinyBackbone(nn.Module):
+    """
+    ViT-Tiny adapted for the small image sizes used by this project.
+
+    The Transformer scale follows the common ViT/DeiT-Tiny recipe:
+        embed_dim=192, depth=12, num_heads=3, mlp_ratio=4.
+
+    Patch size is dataset-size aware:
+        image_size <= 32 -> patch_size=4
+        image_size > 32  -> patch_size=8
+
+    The model is trained from scratch. Positional embeddings are created for
+    the fixed input resolution of each experiment, so no runtime interpolation
+    is needed for the current dataset pipeline.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        image_size: int = 32,
+        embed_dim: int = 192,
+        depth: int = 12,
+        num_heads: int = 3,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+
+        image_size = int(image_size)
+        patch_size = 4 if image_size <= 32 else 8
+        if image_size % patch_size != 0:
+            raise ValueError(
+                "ViT-Tiny 要求 image_size 能被 patch_size 整除："
+                f"image_size={image_size}, patch_size={patch_size}"
+            )
+
+        self.image_size = image_size
+        self.patch_size = int(patch_size)
+        self.embed_dim = int(embed_dim)
+        self.feat_dim = int(embed_dim)
+
+        self.patch_embed = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            padding=0,
+            bias=True,
+        )
+
+        grid_size = image_size // patch_size
+        self.num_patches = int(grid_size * grid_size)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, embed_dim)
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                ViTTinyBlock(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(
+                f"ViT-Tiny 期望输入为 [B, C, H, W]，当前 shape={tuple(x.shape)}"
+            )
+        if x.size(-2) != self.image_size or x.size(-1) != self.image_size:
+            raise ValueError(
+                "ViT-Tiny 当前实验使用固定输入尺寸："
+                f"expected={self.image_size}x{self.image_size}, "
+                f"actual={x.size(-2)}x{x.size(-1)}"
+            )
+
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+
+        cls_token = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
+        x = x + self.pos_embed
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x[:, 0]
+
+
 # -------------------------
 # Backbone builders / registry
 # -------------------------
 
 BackboneBuilder = Callable[..., nn.Module]
 DEFAULT_BACKBONE_NAME = "resnet_cifar"
+MOE_FEATURE_DIM = 512
 
 
 def build_resnet_cifar_backbone(
@@ -3240,8 +3539,34 @@ def build_resnet_cifar_backbone(
     )
 
 
+def build_mobilenet_v2_backbone(
+    *,
+    in_channels: int = 3,
+    image_size: int = 32,
+) -> MobileNetV2Backbone:
+    """Build the requested no-BN, small-image-adapted MobileNetV2."""
+    return MobileNetV2Backbone(
+        in_channels=in_channels,
+        image_size=image_size,
+    )
+
+
+def build_vit_tiny_backbone(
+    *,
+    in_channels: int = 3,
+    image_size: int = 32,
+) -> ViTTinyBackbone:
+    """Build the small-image ViT-Tiny backbone from scratch."""
+    return ViTTinyBackbone(
+        in_channels=in_channels,
+        image_size=image_size,
+    )
+
+
 BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
     DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
+    "mobilenet_v2": build_mobilenet_v2_backbone,
+    "vit_tiny": build_vit_tiny_backbone,
 }
 
 
@@ -3527,13 +3852,19 @@ class SparseMoEClassifier(nn.Module):
 
     整体结构：
         image
-          -> ResNetBackbone
-          -> global feature [B, 512]
+          -> selected backbone
+          -> backbone_adapter -> fixed feature [B, 512]
           -> SparseMoEHead
           -> logits [B, num_classes]
 
-    每个 expert 自己输出 num_classes 维 logits；router / backbone
-    属于 non-expert 参数，experts 属于 expert 参数。
+    为了让 backbone 对照实验中的 router / expert 参数规模保持一致，
+    所有 backbone 都在进入 MoE 前统一成 512 维：
+        resnet_cifar: 512 -> Identity
+        mobilenet_v2: 1280 -> Linear(1280, 512)
+        vit_tiny: 192 -> Linear(192, 512)
+
+    backbone / backbone_adapter / router 都属于 non_expert 参数；
+    只有 experts.<id> 属于 expert 参数。
     """
 
     def __init__(
@@ -3559,14 +3890,25 @@ class SparseMoEClassifier(nn.Module):
         self.image_size = int(image_size)
         self.moe_hidden_dim = int(moe_hidden_dim)
 
+        self.backbone_name = str(backbone_name).lower().strip()
         self.backbone = build_backbone(
-            backbone_name=backbone_name,
+            backbone_name=self.backbone_name,
             in_channels=in_channels,
             image_size=image_size,
         )
 
+        raw_feat_dim = int(self.backbone.feat_dim)
+        if raw_feat_dim == MOE_FEATURE_DIM:
+            # Keep the existing ResNet numerical path exactly unchanged.
+            self.backbone_adapter = nn.Identity()
+        else:
+            self.backbone_adapter = nn.Linear(
+                raw_feat_dim,
+                MOE_FEATURE_DIM,
+            )
+
         self.moe_head = SparseMoEHead(
-            in_dim=self.backbone.feat_dim,
+            in_dim=MOE_FEATURE_DIM,
             hidden_dim=moe_hidden_dim,
             num_classes=num_classes,
             num_experts=num_experts,
@@ -3595,6 +3937,7 @@ class SparseMoEClassifier(nn.Module):
         return_router_info: bool = False,
     ) -> torch.Tensor | SparseMoEClassifierOutput:
         feat = self.backbone(x)
+        feat = self.backbone_adapter(feat)
 
         if not return_router_info:
             logits = self.moe_head(
