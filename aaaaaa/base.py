@@ -248,7 +248,7 @@ SUPPORTED_DATASETS = {
 }
 
 SUPPORTED_MODELS = {
-    "resnet_sparse_moe_head",
+    "sparse_moe_classifier",
 }
 
 
@@ -353,7 +353,10 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
-    "model": "resnet_sparse_moe_head",
+    "model": "sparse_moe_classifier",
+    "model_cfg": {
+        "backbone": "resnet_cifar",
+    },
     "num_experts": 4,
     "topk": 2,
     "optimizer": {
@@ -591,7 +594,9 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("num_workers", 2)
 
     # 模型配置
-    cfg.setdefault("model", "resnet_sparse_moe_head")
+    cfg.setdefault("model", "sparse_moe_classifier")
+    cfg.setdefault("model_cfg", {})
+    cfg["model_cfg"].setdefault("backbone", "resnet_cifar")
     cfg.setdefault("num_experts", 4)
     cfg.setdefault("topk", 2)
 
@@ -760,6 +765,12 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     num_clients = _safe_name(cfg.get("num_clients", "c"))
     alpha = _safe_name(cfg.get("alpha", "iid"))
     model = _safe_name(cfg.get("model", "model"))
+    model_cfg = cfg.get("model_cfg", {})
+    backbone = _safe_name(
+        model_cfg.get("backbone", "backbone")
+        if isinstance(model_cfg, Mapping)
+        else "backbone"
+    )
     num_experts = _safe_name(cfg.get("num_experts", "e"))
     topk = _safe_name(cfg.get("topk", "topk"))
     rounds = _safe_name(cfg.get("rounds", "r"))
@@ -779,6 +790,7 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
         f"_c{num_clients}"
         f"_a{alpha}"
         f"_{model}"
+        f"_bb{backbone}"
         f"_e{num_experts}"
         f"_top{topk}"
         f"_r{rounds}"
@@ -856,6 +868,19 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             f"不支持的模型：{model}。"
             f"当前支持：{sorted(SUPPORTED_MODELS)}"
+        )
+
+    model_cfg = cfg.get("model_cfg", {})
+    if not isinstance(model_cfg, Mapping):
+        raise ConfigError("model_cfg 必须是 dict。")
+
+    backbone = str(
+        model_cfg.get("backbone", "resnet_cifar")
+    ).lower().strip()
+    if backbone not in BACKBONE_BUILDERS:
+        raise ConfigError(
+            f"不支持的 backbone：{backbone}。"
+            f"当前支持：{sorted(BACKBONE_BUILDERS.keys())}"
         )
 
     agg_cfg = cfg.get("agg", {})
@@ -3007,21 +3032,8 @@ def _infer_pin_memory(cfg: Any) -> bool:
 
 
 # ============================================================================
-# Bundled from models/resnet_sparse_moe_head.py
+# Backbone definitions and registry
 # ============================================================================
-
-
-@dataclass(frozen=True)
-class ResNetSparseMoEHeadOutput:
-    """
-    ResNetSparseMoEHead 的可选输出结构。
-
-    默认训练时不需要这个结构，直接返回 logits 即可。
-    当需要分析 router / expert usage 时，可以设置 return_router_info=True。
-    """
-
-    logits: torch.Tensor
-    router_info: Dict[str, Any]
 
 
 class BasicBlock(nn.Module):
@@ -3172,6 +3184,99 @@ class ResNetBackbone(nn.Module):
         x = self.pool(x)
         x = x.flatten(1)
         return x
+
+
+# -------------------------
+# Backbone builders / registry
+# -------------------------
+
+BackboneBuilder = Callable[..., nn.Module]
+DEFAULT_BACKBONE_NAME = "resnet_cifar"
+
+
+def build_resnet_cifar_backbone(
+    *,
+    in_channels: int = 3,
+    image_size: int = 32,
+) -> ResNetBackbone:
+    """Build the current no-BN CIFAR-style ResNet backbone."""
+    return ResNetBackbone(
+        in_channels=in_channels,
+        image_size=image_size,
+    )
+
+
+BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
+    DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
+}
+
+
+def build_backbone(
+    backbone_name: str,
+    *,
+    in_channels: int = 3,
+    image_size: int = 32,
+) -> nn.Module:
+    """
+    Build a registered backbone.
+
+    Backbone contract:
+        1. forward(x) returns a 2-D feature tensor [B, D].
+        2. the module exposes feat_dim == D.
+
+    Adding another backbone only requires its implementation, a builder, and one
+    entry in BACKBONE_BUILDERS. The existing MoE / FL aggregation code does not
+    need to change.
+    """
+    name = str(backbone_name).lower().strip()
+
+    if name not in BACKBONE_BUILDERS:
+        raise ValueError(
+            f"不支持的 backbone：{name}。"
+            f"当前支持：{sorted(BACKBONE_BUILDERS.keys())}"
+        )
+
+    backbone = BACKBONE_BUILDERS[name](
+        in_channels=int(in_channels),
+        image_size=int(image_size),
+    )
+
+    if not hasattr(backbone, "feat_dim"):
+        raise ValueError(
+            f"backbone {name!r} 缺少 feat_dim 属性，"
+            "无法确定 SparseMoEHead 的输入维度。"
+        )
+
+    feat_dim = int(getattr(backbone, "feat_dim"))
+    if feat_dim <= 0:
+        raise ValueError(
+            f"backbone {name!r} 的 feat_dim 必须大于 0，当前值：{feat_dim}"
+        )
+
+    return backbone
+
+
+def list_supported_backbones() -> List[str]:
+    """Return registered backbone names."""
+    return sorted(BACKBONE_BUILDERS.keys())
+
+
+# ============================================================================
+# Sparse MoE model
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class SparseMoEClassifierOutput:
+    """
+    SparseMoEClassifier 的可选输出结构。
+
+    默认训练时不需要这个结构，直接返回 logits 即可。
+    当需要分析 router / expert usage 时，可以设置 return_router_info=True。
+    """
+
+    logits: torch.Tensor
+    router_info: Dict[str, Any]
 
 
 class ExpertFFN(nn.Module):
@@ -3405,14 +3510,14 @@ class SparseMoEHead(nn.Module):
         return logits, router_info
 
 
-class ResNetSparseMoEHead(nn.Module):
+class SparseMoEClassifier(nn.Module):
     """
-    ResNet + Sparse MoE Head 分类模型。
+    Backbone + Sparse MoE Head 分类模型。
 
     整体结构：
         image
-          -> ResNetBackbone
-          -> global feature [B, 512]
+          -> registered backbone
+          -> global feature [B, feat_dim]
           -> SparseMoEHead
           -> logits [B, num_classes]
 
@@ -3429,6 +3534,7 @@ class ResNetSparseMoEHead(nn.Module):
         image_size: int = 32,
         moe_hidden_dim: int = 512,
         renormalize_topk_probs: bool = False,
+        backbone_name: str = DEFAULT_BACKBONE_NAME,
     ) -> None:
         super().__init__()
 
@@ -3442,7 +3548,8 @@ class ResNetSparseMoEHead(nn.Module):
         self.image_size = int(image_size)
         self.moe_hidden_dim = int(moe_hidden_dim)
 
-        self.backbone = ResNetBackbone(
+        self.backbone = build_backbone(
+            backbone_name=backbone_name,
             in_channels=in_channels,
             image_size=image_size,
         )
@@ -3475,7 +3582,7 @@ class ResNetSparseMoEHead(nn.Module):
         self,
         x: torch.Tensor,
         return_router_info: bool = False,
-    ) -> torch.Tensor | ResNetSparseMoEHeadOutput:
+    ) -> torch.Tensor | SparseMoEClassifierOutput:
         feat = self.backbone(x)
 
         if not return_router_info:
@@ -3490,23 +3597,24 @@ class ResNetSparseMoEHead(nn.Module):
             return_router_info=True,
         )
 
-        return ResNetSparseMoEHeadOutput(
+        return SparseMoEClassifierOutput(
             logits=logits,
             router_info=router_info,
         )
 
 
-def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
+def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     """
-    根据 cfg 构建 ResNetSparseMoEHead。
+    根据 cfg 构建通用 SparseMoEClassifier。
 
     推荐配置示例：
 
-    model: resnet_sparse_moe_head
+    model: sparse_moe_classifier
     num_experts: 4
     topk: 2
 
     model_cfg:
+      backbone: resnet_cifar
       in_channels: 3
       image_size: 32
       moe_hidden_dim: 512
@@ -3514,6 +3622,7 @@ def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
 
     说明：
     - num_classes 优先从 cfg.num_classes 读取。
+    - backbone 未配置时仍使用当前默认的 resnet_cifar。
     - in_channels / image_size 会优先从 cfg.input_shape 推断。
     - model_cfg 里的 in_channels / image_size 可以覆盖默认值。
     """
@@ -3537,7 +3646,7 @@ def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
         512,
     )
 
-    return ResNetSparseMoEHead(
+    return SparseMoEClassifier(
         num_classes=int(_cfg_get(cfg, "num_classes")),
         num_experts=int(_cfg_get(cfg, "num_experts", 4)),
         topk=int(_cfg_get(cfg, "topk", 2)),
@@ -3569,6 +3678,13 @@ def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
                 False,
             )
         ),
+        backbone_name=str(
+            _cfg_get(
+                model_cfg,
+                "backbone",
+                DEFAULT_BACKBONE_NAME,
+            )
+        ),
     )
 
 
@@ -3581,7 +3697,7 @@ ModelBuilder = Callable[[Any], nn.Module]
 
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
-    "resnet_sparse_moe_head": build_resnet_sparse_moe_head_from_cfg,
+    "sparse_moe_classifier": build_sparse_moe_classifier_from_cfg,
 }
 
 
@@ -3590,15 +3706,17 @@ def build_model(cfg: Any) -> nn.Module:
     根据配置创建模型。
 
     配置示例：
-        model: resnet_sparse_moe_head
+        model: sparse_moe_classifier
 
     当前支持：
-        resnet_sparse_moe_head
+        sparse_moe_classifier
 
-    后续扩展其他模型时，只需要：
-        1. 新增模型文件
-        2. 写一个 build_xxx_from_cfg(cfg)
-        3. 在 MODEL_BUILDERS 里注册
+    后续扩展其他完整模型时，只需要：
+        1. 在 base.py 中实现模型 / builder
+        2. 在 MODEL_BUILDERS 里注册
+
+    如果只是新增 backbone，则只需要修改上面的 BACKBONE_BUILDERS 区域，
+    不需要新增完整模型。
     """
     model_name = get_model_name(cfg)
 
@@ -5285,7 +5403,7 @@ def extract_router_info(outputs: Any) -> Optional[Mapping[str, Any]]:
         2. dict: outputs["router_info"]
         3. tuple/list: outputs[1] 是 router_info
 
-    当前 resnet_sparse_moe_head 在 return_router_info=True 时，
+    当前 sparse_moe_classifier 在 return_router_info=True 时，
     返回对象里包含 .router_info。
     """
     if hasattr(outputs, "router_info"):
