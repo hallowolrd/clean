@@ -3,9 +3,9 @@ from __future__ import annotations
 """Shared standalone base for federated MoE experiments.
 
 This file owns configuration, data, partitioning, models, client training,
-K-FAC collection, fixed uniform non-expert aggregation, server rounds,
-evaluation, logging, and output. Expert aggregation is injected by a
-method script and is intentionally not implemented here.
+optional method evidence hooks, fixed uniform non-expert aggregation, server
+rounds, evaluation, logging, and output. Expert-method behavior is injected by
+a method script and is intentionally not implemented here.
 """
 
 # ============================================================
@@ -154,19 +154,16 @@ def _prepare_deterministic_env_before_torch() -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     config_arg = _get_cli_arg_value("--config")
+    cli_seed = _get_cli_arg_value("--seed")
     config_seed = None
 
     if config_arg is not None:
-        config_seed = _read_top_level_scalar_from_yaml_like_file(
-            path=Path(config_arg),
-            key="seed",
-        )
+        config_seed = _read_top_level_scalar_from_yaml_like_file(path=Path(config_arg), key="seed")
 
-    # 有外部配置时读取配置 seed；没有外部配置时使用内嵌默认 seed。
     target_hash_seed = str(
-        config_seed
-        if config_seed is not None
-        else EMBEDDED_DEFAULT_SEED
+        cli_seed if cli_seed is not None else (
+            config_seed if config_seed is not None else EMBEDDED_DEFAULT_SEED
+        )
     )
 
     current_hash_seed = os.environ.get("PYTHONHASHSEED")
@@ -227,6 +224,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import yaml
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from tqdm.auto import tqdm
@@ -245,7 +243,35 @@ from tqdm.auto import tqdm
 SUPPORTED_DATASETS = {
     "cifar10",
     "cifar100",
+    "cinic10",
+    "fashionmnist",
+    "stl10",
+    "tiny-imagenet-200",
+    "femnist",
 }
+
+DATASET_ALIASES = {
+    "cifar10": "cifar10",
+    "cifar-10": "cifar10",
+    "cifar100": "cifar100",
+    "cifar-100": "cifar100",
+    "cinic10": "cinic10",
+    "cinic-10": "cinic10",
+    "fashionmnist": "fashionmnist",
+    "fashion-mnist": "fashionmnist",
+    "stl10": "stl10",
+    "stl-10": "stl10",
+    "tiny-imagenet-200": "tiny-imagenet-200",
+    "tinyimagenet200": "tiny-imagenet-200",
+    "tiny_imagenet_200": "tiny-imagenet-200",
+    "femnist": "femnist",
+}
+
+
+def normalize_dataset_name(dataset_name: str) -> str:
+    """Normalize common dataset spelling variants to one canonical name."""
+    key = str(dataset_name).strip().lower()
+    return DATASET_ALIASES.get(key, key)
 
 SUPPORTED_MODELS = {
     "sparse_moe_classifier",
@@ -399,20 +425,32 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
 
 def load_embedded_config(
     method_overrides: Mapping[str, Any] | None = None,
+    method_defaults: Mapping[str, Any] | None = None,
+    method_validator: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> ConfigNode:
     """Build the effective configuration without requiring a YAML file."""
-    raw_cfg = copy.deepcopy(EMBEDDED_BASE_CONFIG)
+    raw_cfg: Dict[str, Any] = {}
 
     if method_overrides is not None:
-        raw_cfg = _deep_merge(raw_cfg, method_overrides)
+        raw_cfg = copy.deepcopy(dict(method_overrides))
 
     raw_cfg = _apply_defaults(raw_cfg)
+    raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
+    raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
     raw_cfg = _finalize_run_info(raw_cfg)
     _validate_config(raw_cfg)
+    if method_validator is not None:
+        method_validator(raw_cfg)
     return ConfigNode(raw_cfg)
 
 
-def load_config(config_path: str | Path) -> ConfigNode:
+def load_config(
+    config_path: str | Path,
+    method_defaults: Mapping[str, Any] | None = None,
+    method_validator: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    config_overrides: Mapping[str, Any] | None = None,
+) -> ConfigNode:
     """
     读取配置文件，并返回 ConfigNode。
 
@@ -428,9 +466,12 @@ def load_config(config_path: str | Path) -> ConfigNode:
 
     raw_cfg = _load_yaml_with_include(config_path)
     raw_cfg = _apply_defaults(raw_cfg)
+    raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
+    raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
     raw_cfg = _finalize_run_info(raw_cfg)
     _validate_config(raw_cfg)
-
+    if method_validator is not None:
+        method_validator(raw_cfg)
     return ConfigNode(raw_cfg)
 
 
@@ -567,143 +608,42 @@ def _deep_merge(
     return result
 
 
+def _apply_method_defaults(
+    cfg: Dict[str, Any],
+    method_defaults: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Apply method-owned defaults while keeping explicit config values."""
+    if method_defaults is None:
+        return copy.deepcopy(cfg)
+
+    return _deep_merge(
+        base=copy.deepcopy(dict(method_defaults)),
+        override=cfg,
+    )
+
+
+def _apply_config_overrides(
+    cfg: Dict[str, Any],
+    config_overrides: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Apply highest-priority runtime overrides such as command-line values."""
+    if config_overrides is None:
+        return copy.deepcopy(cfg)
+    return _deep_merge(base=cfg, override=config_overrides)
+
+
 def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    补齐默认配置。
+    """Use EMBEDDED_BASE_CONFIG as the single shared default source."""
+    cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=cfg)
 
-    第一版只放最通用的默认值。
-    后面新增模块时，也可以在这里继续补默认值。
-    """
-    cfg = copy.deepcopy(cfg)
+    dataset_name = normalize_dataset_name(cfg["dataset"])
+    cfg["dataset"] = dataset_name
 
-    # 数据配置
-    cfg.setdefault("dataset", "cifar10")
-    cfg.setdefault("data_root", "./datasets")
-    cfg.setdefault("num_classes", _infer_num_classes(cfg["dataset"]))
+    cfg.setdefault("num_classes", _infer_num_classes(dataset_name))
 
-    # 联邦学习配置
-    cfg.setdefault("num_clients", 5)
-    cfg.setdefault("alpha", 0.1)
-    cfg.setdefault("frac", 1.0)
-    cfg.setdefault("rounds", 50)
-    cfg.setdefault("local_epochs", 5)
-
-    # dataloader 配置
-    cfg.setdefault("batch_size", 64)
-    cfg.setdefault("test_batch_size", 64)
-    cfg.setdefault("num_workers", 2)
-
-    # 模型配置
-    cfg.setdefault("model", "sparse_moe_classifier")
-    cfg.setdefault("model_cfg", {})
-    cfg["model_cfg"].setdefault("backbone", "resnet_cifar")
-    cfg.setdefault("num_experts", 4)
-    cfg.setdefault("topk", 2)
-
-    # 优化器配置
-    cfg.setdefault("optimizer", {})
-    cfg["optimizer"].setdefault("type", "sgd")
-    cfg["optimizer"].setdefault("lr", 0.01)
-    cfg["optimizer"].setdefault("momentum", 0.9)
-    cfg["optimizer"].setdefault("weight_decay", 0.0005)
-
-    # 聚合配置
-    cfg.setdefault("agg", {})
-    cfg["agg"].setdefault("non_expert", {})
-    cfg["agg"]["non_expert"].setdefault("method", "uniform")
-    cfg["agg"].setdefault("expert", {})
-    cfg["agg"]["expert"].setdefault("method", "uniform")
-
-    # K-FAC / FedFisher expert 聚合配置
-    cfg.setdefault("kfac", {})
-    cfg["kfac"].setdefault("collect", False)
-    cfg["kfac"].setdefault("weight_mode", "sample_weighted")
-    cfg["kfac"].setdefault("solve_scope", "per_layer")
-    cfg["kfac"].setdefault("solve_mode", "cg")
-    cfg["kfac"].setdefault("server_steps", 5)
-    cfg["kfac"].setdefault("server_lr", 0.01)
-    cfg["kfac"].setdefault("adam_beta1", 0.9)
-    cfg["kfac"].setdefault("adam_beta2", 0.99)
-    cfg["kfac"].setdefault("adam_eps", 0.01)
-    cfg["kfac"].setdefault("cg_tol", 1.0e-8)
-    cfg["kfac"].setdefault("damping", 0.0)
-    cfg["kfac"].setdefault("use_damping", False)
-    cfg["kfac"].setdefault("min_count", 1)
-    cfg["kfac"].setdefault("fallback", "none")
-    cfg["kfac"].setdefault("include_bias", True)
-    cfg["kfac"].setdefault("fisher_timing", "after_train")
-    cfg["kfac"].setdefault("model_mode", "eval")
-    cfg["kfac"].setdefault("max_batches", 0)
-    cfg["kfac"].setdefault("expert_name_pattern", "experts.")
-    cfg["kfac"].setdefault("use_server_validation", False)
-    cfg["kfac"].setdefault("model_selection", "final_step")
-    cfg["kfac"].setdefault("log_detail", True)
-
-    # 运行配置
-    cfg.setdefault("seed", 0)
-    cfg.setdefault("deterministic", True)
-    cfg.setdefault("device", "auto")
-    cfg.setdefault("output_dir", "outputs_bias")
-    cfg.setdefault("run_name", "auto")
-
-    # 输出目录命名策略
-    cfg.setdefault("run", {})
-    cfg["run"].setdefault("unique_name", True)
-    cfg["run"].setdefault("overwrite", False)
-
-    # 日志配置
-    cfg.setdefault("logging", {})
-    cfg["logging"].setdefault("log_every", 1)
-    cfg["logging"].setdefault("save_config", True)
-    cfg["logging"].setdefault("save_results_csv", True)
-
-    # 控制台是否显示 tqdm 进度条。
-    # 进度条只用于人看，不应该写入 train.log。
-    cfg["logging"].setdefault("progress_bar", True)
-
-    # 默认只在交互式终端显示进度条。
-    # 如果用 nohup / 重定向跑实验，建议保持 False，避免输出混乱。
-    cfg["logging"].setdefault("progress_in_non_tty", False)
-
-    # 控制台每轮短摘要。
-    # 例如：[Round 001] train_loss=... test_acc=...
-    cfg["logging"].setdefault("console_round_summary", True)
-
-    # train.log 每轮详细摘要。
-    # 例如：RoundMetrics / Clients / Agg / Client。
-    cfg["logging"].setdefault("file_round_detail", True)
-
-    # 是否记录本轮选择了哪些客户端。
-    # 输出示例：
-    # [Clients] round=1 ids=[0,4,9,6,7,3,2,8,1,5]
-    cfg["logging"].setdefault("log_round_clients", True)
-
-    # 是否在 train.log 中打印每个客户端一行诊断信息。
-    # 输出内容包括样本数、训练指标、聚合权重、expert usage。
-    cfg["logging"].setdefault("log_client_table", True)
-
-    # 是否记录客户端训练指标。
-    # 当前 server.py 的客户端表会默认包含 train_loss / train_acc。
-    # 这个开关先保留，后续如果想拆分更细日志可以继续用。
-    cfg["logging"].setdefault("log_client_metrics", True)
-
-    # 是否在 train.log 记录每个客户端的聚合权重。
-    # 对诊断 expert 聚合很重要，建议默认打开。
-    cfg["logging"].setdefault("log_agg_weights", True)
-
-    # 如果所有客户端权重近似相等，压缩显示为：
-    # weights=uniform(each=0.1000)
-    # 避免日志里出现一长串 0.10000000000000002。
-    cfg["logging"].setdefault("compact_uniform_weights", True)
-
-    # 是否在客户端本地训练结束后，额外统计 expert 使用情况。
-    # 统计结果会进入 ClientUpdate.extra["expert_usage"]。
-    cfg["logging"].setdefault("collect_expert_usage", True)
-
-    # expert usage 最多统计多少个 batch。
-    # 0 表示使用完整客户端 train_loader 统计，更准但更慢。
-    # 如果觉得慢，可以在实验配置里改成 5 或 10。
-    cfg["logging"].setdefault("expert_usage_max_batches", 0)
+    dataset_info = DATASET_INFO.get(dataset_name)
+    if dataset_info is not None:
+        cfg.setdefault("input_shape", tuple(dataset_info["input_shape"]))
 
     return cfg
 
@@ -838,15 +778,13 @@ def _make_unique_run_name(run_name: str, output_dir: Path) -> str:
 
 
 def _infer_num_classes(dataset: str) -> int:
-    """根据数据集名称推断类别数。"""
-    if dataset == "cifar10":
+    """Infer class count from the dataset registry."""
+    dataset_name = normalize_dataset_name(dataset)
+    info = DATASET_INFO.get(dataset_name)
+    if info is None:
+        # Validation will report the unsupported dataset with a clearer message.
         return 10
-
-    if dataset == "cifar100":
-        return 100
-
-    # 对未知数据集先返回 10，真正合法性检查在 _validate_config 里做。
-    return 10
+    return int(info["num_classes"])
 
 
 def _validate_config(cfg: Mapping[str, Any]) -> None:
@@ -854,9 +792,9 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     基础合法性检查。
 
     这个函数只检查通用配置。
-    后面新增 Fisher / history / Bayes 时，可以继续拆出新的 validate 函数。
+    后面新增 方法插件 / history / Bayes 时，可以继续拆出新的 validate 函数。
     """
-    dataset = cfg.get("dataset")
+    dataset = normalize_dataset_name(str(cfg.get("dataset")))
     if dataset not in SUPPORTED_DATASETS:
         raise ConfigError(
             f"不支持的数据集：{dataset}。"
@@ -873,10 +811,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
-
-    backbone = str(
-        model_cfg.get("backbone", "resnet_cifar")
-    ).lower().strip()
+    backbone = str(model_cfg.get("backbone", "resnet_cifar")).lower().strip()
     if backbone not in BACKBONE_BUILDERS:
         raise ConfigError(
             f"不支持的 backbone：{backbone}。"
@@ -954,138 +889,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     if weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 不能小于 0，当前值：{weight_decay}"
-        )
-
-    _validate_kfac_config(cfg)
-
-
-def _validate_kfac_config(cfg: Mapping[str, Any]) -> None:
-    """检查 K-FAC / FedFisher expert 聚合配置。"""
-    kfac_cfg = cfg.get("kfac", {})
-
-    if not isinstance(kfac_cfg, Mapping):
-        raise ConfigError("kfac 必须是 dict。")
-
-    weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
-    if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
-        raise ConfigError(
-            f"不支持的 kfac.weight_mode：{weight_mode}。"
-            "当前支持：routed_count, sample_weighted, uniform"
-        )
-
-    solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
-    if solve_scope not in {"per_layer", "global_expert"}:
-        raise ConfigError(
-            f"不支持的 kfac.solve_scope：{solve_scope}。"
-            "当前支持：per_layer, global_expert"
-        )
-
-    solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
-    if solve_mode not in {"cg", "gd", "adam"}:
-        raise ConfigError(
-            f"不支持的 kfac.solve_mode：{solve_mode}。"
-            "当前支持：cg, gd, adam"
-        )
-
-    if solve_scope == "global_expert" and solve_mode == "cg":
-        raise ConfigError(
-            "kfac.solve_scope=global_expert 时不建议使用 solve_mode=cg。"
-            "请使用 gd 或 adam。"
-        )
-
-    if solve_scope == "per_layer" and solve_mode in {"gd", "adam"}:
-        raise ConfigError(
-            "kfac.solve_scope=per_layer 当前只支持 solve_mode=cg。"
-            "如果要使用 gd/adam，请设置 solve_scope=global_expert。"
-        )
-
-    server_steps = int(kfac_cfg.get("server_steps", 5))
-    if server_steps < 0:
-        raise ConfigError(
-            f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
-        )
-
-    server_lr = float(kfac_cfg.get("server_lr", 0.01))
-    if server_lr <= 0:
-        raise ConfigError(
-            f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
-        )
-
-    adam_beta1 = float(kfac_cfg.get("adam_beta1", 0.9))
-    adam_beta2 = float(kfac_cfg.get("adam_beta2", 0.99))
-
-    if not (0.0 <= adam_beta1 < 1.0):
-        raise ConfigError(
-            f"kfac.adam_beta1 必须在 [0, 1) 范围内，当前值：{adam_beta1}"
-        )
-
-    if not (0.0 <= adam_beta2 < 1.0):
-        raise ConfigError(
-            f"kfac.adam_beta2 必须在 [0, 1) 范围内，当前值：{adam_beta2}"
-        )
-
-    adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
-    if adam_eps <= 0:
-        raise ConfigError(
-            f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
-        )
-
-    cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
-    if cg_tol < 0:
-        raise ConfigError(
-            f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
-        )
-
-    damping = float(kfac_cfg.get("damping", 0.0))
-    if damping < 0:
-        raise ConfigError(
-            f"kfac.damping 不能小于 0，当前值：{damping}"
-        )
-
-    min_count = int(kfac_cfg.get("min_count", 1))
-    if min_count <= 0:
-        raise ConfigError(
-            f"kfac.min_count 必须大于 0，当前值：{min_count}"
-        )
-
-    max_batches = int(kfac_cfg.get("max_batches", 0))
-    if max_batches < 0:
-        raise ConfigError(
-            f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
-        )
-
-    fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
-    if fallback not in {"none", "sample_weighted"}:
-        raise ConfigError(
-            f"不支持的 kfac.fallback：{fallback}。"
-            "当前支持：none, sample_weighted"
-        )
-
-    fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
-    if fisher_timing != "after_train":
-        raise ConfigError(
-            f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
-        )
-
-    model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
-    if model_mode not in {"eval", "train"}:
-        raise ConfigError(
-            f"不支持的 kfac.model_mode：{model_mode}。"
-            "当前支持：eval, train"
-        )
-
-    model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
-    if model_selection != "final_step":
-        raise ConfigError(
-            "当前主实验不支持 server validation 选 best，"
-            f"kfac.model_selection 必须是 final_step，当前值：{model_selection}"
-        )
-
-    use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
-    if use_server_validation:
-        raise ConfigError(
-            "当前主实验不使用 server validation，"
-            "请设置 kfac.use_server_validation=false。"
         )
 
 
@@ -2137,7 +1940,213 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
         "mean": (0.5071, 0.4867, 0.4408),
         "std": (0.2675, 0.2565, 0.2761),
     },
+    "cinic10": {
+        "num_classes": 10,
+        "input_shape": (3, 32, 32),
+        "mean": (0.47889522, 0.47227842, 0.43047404),
+        "std": (0.24205776, 0.23828046, 0.25874835),
+    },
+    "fashionmnist": {
+        "num_classes": 10,
+        "input_shape": (1, 28, 28),
+        "mean": (0.2860,),
+        "std": (0.3530,),
+    },
+    "stl10": {
+        "num_classes": 10,
+        "input_shape": (3, 96, 96),
+        "mean": (0.4467, 0.4398, 0.4066),
+        "std": (0.2603, 0.2566, 0.2713),
+    },
+    "tiny-imagenet-200": {
+        "num_classes": 200,
+        "input_shape": (3, 64, 64),
+        "mean": (0.4802, 0.4481, 0.3975),
+        "std": (0.2302, 0.2265, 0.2262),
+    },
+    "femnist": {
+        "num_classes": 62,
+        "input_shape": (1, 28, 28),
+        # LEAF FEMNIST stores pixels as [0, 1] floats. Keep that scale.
+        "mean": (0.0,),
+        "std": (1.0,),
+    },
 }
+
+
+
+class _ArrayImageDataset(Dataset):
+    """Image dataset backed by uint8 numpy arrays and integer targets."""
+
+    def __init__(
+        self,
+        data: np.ndarray,
+        targets: Sequence[int],
+        transform: Optional[Callable] = None,
+        image_mode: str = "L",
+    ) -> None:
+        if len(data) != len(targets):
+            raise ValueError(
+                f"data/targets 数量不一致：{len(data)} vs {len(targets)}"
+            )
+        self.data = data
+        self.targets = [int(target) for target in targets]
+        self.transform = transform
+        self.image_mode = str(image_mode)
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int) -> Tuple[Any, int]:
+        array = np.asarray(self.data[index], dtype=np.uint8)
+        image = Image.fromarray(array, mode=self.image_mode)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, int(self.targets[index])
+
+
+class _TinyImageNetValDataset(Dataset):
+    """Read the original Tiny-ImageNet validation layout without reorganizing files."""
+
+    def __init__(
+        self,
+        val_root: Path,
+        class_to_idx: Mapping[str, int],
+        transform: Optional[Callable] = None,
+    ) -> None:
+        annotation_path = val_root / "val_annotations.txt"
+        image_root = val_root / "images"
+        if not annotation_path.is_file() or not image_root.is_dir():
+            raise FileNotFoundError(
+                "Tiny-ImageNet validation split 缺少 val_annotations.txt 或 val/images。"
+            )
+
+        samples: List[Tuple[Path, int]] = []
+        targets: List[int] = []
+        with annotation_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                filename, wnid = parts[0], parts[1]
+                if wnid not in class_to_idx:
+                    raise ValueError(f"Tiny-ImageNet val 出现未知类别：{wnid}")
+                target = int(class_to_idx[wnid])
+                samples.append((image_root / filename, target))
+                targets.append(target)
+
+        if not samples:
+            raise ValueError("Tiny-ImageNet validation split 为空。")
+
+        self.samples = samples
+        self.targets = targets
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Tuple[Any, int]:
+        image_path, target = self.samples[index]
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, int(target)
+
+
+def _resolve_local_dataset_root(
+    data_root: Path,
+    candidates: Sequence[str],
+    required_entries: Sequence[str],
+    dataset_name: str,
+) -> Path:
+    """Resolve a manually downloaded dataset directory from common layouts."""
+    roots = [data_root]
+    roots.extend(data_root / candidate for candidate in candidates)
+
+    for root in roots:
+        if all((root / entry).exists() for entry in required_entries):
+            return root
+
+    expected = ", ".join(str(data_root / name) for name in candidates)
+    raise FileNotFoundError(
+        f"未找到 {dataset_name}。请把数据放到以下任一路径并保持标准目录结构：{expected}，"
+        f"或者让 --data-root 直接指向数据集根目录。"
+    )
+
+
+def _resolve_femnist_root(data_root: Path) -> Path:
+    """Resolve LEAF FEMNIST processed train/test JSON directories."""
+    candidates = [
+        data_root,
+        data_root / "femnist",
+        data_root / "FEMNIST",
+        data_root / "femnist" / "data",
+        data_root / "leaf" / "data" / "femnist" / "data",
+    ]
+    for root in candidates:
+        if (root / "train").is_dir() and (root / "test").is_dir():
+            return root
+    raise FileNotFoundError(
+        "未找到 LEAF FEMNIST 的 train/*.json 与 test/*.json。"
+        "请让 --data-root 指向 leaf/data/femnist/data 或其上层目录。"
+    )
+
+
+def _load_femnist_split_storage(
+    split_dir: Path,
+) -> Tuple[np.ndarray, List[int]]:
+    """Flatten all LEAF users in one split into centralized uint8 images/targets."""
+    json_files = sorted(split_dir.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"FEMNIST split 中没有 JSON 文件：{split_dir}")
+
+    total_samples = 0
+    for json_path in json_files:
+        with json_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        user_data = payload.get("user_data", {})
+        for user in payload.get("users", list(user_data.keys())):
+            entry = user_data.get(user, {})
+            total_samples += len(entry.get("y", []))
+
+    if total_samples <= 0:
+        raise ValueError(f"FEMNIST split 为空：{split_dir}")
+
+    data = np.empty((total_samples, 28, 28), dtype=np.uint8)
+    targets: List[int] = [0] * total_samples
+    offset = 0
+
+    for json_path in json_files:
+        with json_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        user_data = payload.get("user_data", {})
+        for user in payload.get("users", list(user_data.keys())):
+            entry = user_data.get(user, {})
+            xs = entry.get("x", [])
+            ys = entry.get("y", [])
+            if len(xs) != len(ys):
+                raise ValueError(
+                    f"FEMNIST user {user} 的 x/y 数量不一致：{len(xs)} vs {len(ys)}"
+                )
+            for x, y in zip(xs, ys):
+                array = np.asarray(x, dtype=np.float32)
+                if array.size != 28 * 28:
+                    raise ValueError(
+                        f"FEMNIST 样本尺寸不是 784：user={user}, size={array.size}"
+                    )
+                array = array.reshape(28, 28)
+                if float(array.max()) if array.size else 0.0 <= 1.0:
+                    array = array * 255.0
+                data[offset] = np.clip(array, 0.0, 255.0).astype(np.uint8)
+                targets[offset] = int(y)
+                offset += 1
+
+    if offset != total_samples:
+        raise RuntimeError(
+            f"FEMNIST 样本计数错误：expected={total_samples}, actual={offset}"
+        )
+    return data, targets
 
 
 @dataclass(frozen=True)
@@ -2153,8 +2162,8 @@ class DatasetBundle:
             给客户端本地训练使用，可以根据配置开启数据增强。
 
         train_evidence_dataset:
-            给 Fisher / K-FAC evidence 统计使用，强制关闭随机数据增强。
-            这样可以避免 RandomCrop / RandomHorizontalFlip 给 Fisher 证据引入额外随机扰动。
+            给 方法级 evidence 统计使用，强制关闭随机数据增强。
+            这样可以避免 RandomCrop / RandomHorizontalFlip 给 方法插件 证据引入额外随机扰动。
 
         test_dataset:
             给服务端测试使用，不使用随机增强。
@@ -2169,105 +2178,142 @@ class DatasetBundle:
 
 
 def build_datasets(cfg: Any) -> DatasetBundle:
-    """
-    根据配置构建数据集。
-
-    输入：
-        cfg: 全局配置对象，需要至少包含：
-            cfg.dataset
-            cfg.data_root
-
-    输出：
-        DatasetBundle:
-            train_dataset:
-                原始训练集，后续会交给 data/partition.py 划分给客户端。
-                该数据集用于本地训练，是否开启数据增强由 cfg.data_augmentation 控制。
-
-            train_evidence_dataset:
-                Fisher / K-FAC evidence 专用训练集。
-                和 train_dataset 使用同一份原始样本，但 transform 强制关闭随机增强。
-
-            test_dataset:
-                服务端测试集。
-
-            num_classes:
-                类别数。
-
-            input_shape:
-                输入图片形状。
-    """
-    dataset_name = str(cfg.dataset).lower()
-    data_root = Path(cfg.data_root)
+    """Build centralized train/evidence/test datasets for the configured benchmark."""
+    dataset_name = normalize_dataset_name(str(cfg.dataset))
+    data_root = Path(cfg.data_root).expanduser()
 
     if dataset_name not in DATASET_INFO:
         raise ValueError(
-            f"不支持的数据集：{dataset_name}。"
-            f"当前支持：{sorted(DATASET_INFO.keys())}"
+            f"不支持的数据集：{dataset_name}。当前支持：{sorted(DATASET_INFO.keys())}"
         )
 
     info = DATASET_INFO[dataset_name]
-
-    # 本地训练 transform：是否开启数据增强由配置决定。
     train_transform = build_train_transform(
         dataset_name=dataset_name,
-        use_augmentation=_cfg_get(cfg, "data_augmentation", True),
+        use_augmentation=bool(_cfg_get(cfg, "data_augmentation", True)),
     )
-
-    # Fisher / K-FAC evidence transform：强制关闭随机数据增强。
-    # 这样训练阶段仍然可以使用 RandomCrop / RandomHorizontalFlip，
-    # 但统计 Fisher 证据时只使用 ToTensor + Normalize，保证 evidence 更稳定。
     train_evidence_transform = build_train_transform(
         dataset_name=dataset_name,
         use_augmentation=False,
     )
-
     test_transform = build_test_transform(dataset_name=dataset_name)
-
     download = bool(_cfg_get(cfg, "download_data", True))
 
     if dataset_name == "cifar10":
         train_dataset = datasets.CIFAR10(
-            root=str(data_root),
-            train=True,
-            transform=train_transform,
-            download=download,
+            root=str(data_root), train=True, transform=train_transform, download=download
         )
         train_evidence_dataset = datasets.CIFAR10(
-            root=str(data_root),
-            train=True,
-            transform=train_evidence_transform,
-            download=download,
+            root=str(data_root), train=True, transform=train_evidence_transform, download=download
         )
         test_dataset = datasets.CIFAR10(
-            root=str(data_root),
-            train=False,
-            transform=test_transform,
-            download=download,
+            root=str(data_root), train=False, transform=test_transform, download=download
         )
 
     elif dataset_name == "cifar100":
         train_dataset = datasets.CIFAR100(
-            root=str(data_root),
-            train=True,
-            transform=train_transform,
-            download=download,
+            root=str(data_root), train=True, transform=train_transform, download=download
         )
         train_evidence_dataset = datasets.CIFAR100(
-            root=str(data_root),
-            train=True,
-            transform=train_evidence_transform,
-            download=download,
+            root=str(data_root), train=True, transform=train_evidence_transform, download=download
         )
         test_dataset = datasets.CIFAR100(
-            root=str(data_root),
-            train=False,
+            root=str(data_root), train=False, transform=test_transform, download=download
+        )
+
+    elif dataset_name == "fashionmnist":
+        train_dataset = datasets.FashionMNIST(
+            root=str(data_root), train=True, transform=train_transform, download=download
+        )
+        train_evidence_dataset = datasets.FashionMNIST(
+            root=str(data_root), train=True, transform=train_evidence_transform, download=download
+        )
+        test_dataset = datasets.FashionMNIST(
+            root=str(data_root), train=False, transform=test_transform, download=download
+        )
+
+    elif dataset_name == "stl10":
+        train_dataset = datasets.STL10(
+            root=str(data_root), split="train", transform=train_transform, download=download
+        )
+        train_evidence_dataset = datasets.STL10(
+            root=str(data_root), split="train", transform=train_evidence_transform, download=download
+        )
+        test_dataset = datasets.STL10(
+            root=str(data_root), split="test", transform=test_transform, download=download
+        )
+
+    elif dataset_name == "cinic10":
+        root = _resolve_local_dataset_root(
+            data_root=data_root,
+            candidates=("cinic10", "cinic-10", "CINIC-10"),
+            required_entries=("train", "test"),
+            dataset_name="CINIC-10",
+        )
+        train_dataset = datasets.ImageFolder(root / "train", transform=train_transform)
+        train_evidence_dataset = datasets.ImageFolder(
+            root / "train", transform=train_evidence_transform
+        )
+        test_dataset = datasets.ImageFolder(root / "test", transform=test_transform)
+
+    elif dataset_name == "tiny-imagenet-200":
+        root = _resolve_local_dataset_root(
+            data_root=data_root,
+            candidates=("tiny-imagenet-200", "tiny_imagenet_200", "TinyImageNet"),
+            required_entries=("train", "val"),
+            dataset_name="Tiny-ImageNet-200",
+        )
+        train_dataset = datasets.ImageFolder(root / "train", transform=train_transform)
+        train_evidence_dataset = datasets.ImageFolder(
+            root / "train", transform=train_evidence_transform
+        )
+
+        val_root = root / "val"
+        if (val_root / "val_annotations.txt").is_file() and (val_root / "images").is_dir():
+            test_dataset = _TinyImageNetValDataset(
+                val_root=val_root,
+                class_to_idx=train_dataset.class_to_idx,
+                transform=test_transform,
+            )
+        else:
+            # Also accept a validation split that the user has reorganized into class folders.
+            test_dataset = datasets.ImageFolder(val_root, transform=test_transform)
+
+    elif dataset_name == "femnist":
+        # Scheme A: ignore writer identity after loading, then reuse the existing
+        # centralized IID/Dirichlet partitioning code below this dataset layer.
+        root = _resolve_femnist_root(data_root)
+        train_data, train_targets = _load_femnist_split_storage(root / "train")
+        test_data, test_targets = _load_femnist_split_storage(root / "test")
+
+        train_dataset = _ArrayImageDataset(
+            data=train_data,
+            targets=train_targets,
+            transform=train_transform,
+            image_mode="L",
+        )
+        # Share the same uint8 backing array; only the transform differs.
+        train_evidence_dataset = _ArrayImageDataset(
+            data=train_data,
+            targets=train_targets,
+            transform=train_evidence_transform,
+            image_mode="L",
+        )
+        test_dataset = _ArrayImageDataset(
+            data=test_data,
+            targets=test_targets,
             transform=test_transform,
-            download=download,
+            image_mode="L",
         )
 
     else:
-        # 理论上前面已经拦住了，这里只是防御式写法。
         raise ValueError(f"未实现的数据集加载逻辑：{dataset_name}")
+
+    if len(train_dataset) != len(train_evidence_dataset):
+        raise RuntimeError(
+            "train_dataset 与 train_evidence_dataset 样本数不一致："
+            f"{len(train_dataset)} vs {len(train_evidence_dataset)}"
+        )
 
     return DatasetBundle(
         name=dataset_name,
@@ -2283,56 +2329,44 @@ def build_train_transform(
     dataset_name: str,
     use_augmentation: bool = True,
 ) -> Callable:
-    """
-    构建训练集 transform。
-
-    CIFAR 训练集默认使用：
-        RandomCrop
-        RandomHorizontalFlip
-        ToTensor
-        Normalize
-
-    如果 use_augmentation=False，则只使用：
-        ToTensor
-        Normalize
-    """
-    dataset_name = dataset_name.lower()
+    """Build dataset-aware train transforms while preserving the CIFAR path."""
+    dataset_name = normalize_dataset_name(dataset_name)
     mean, std = get_normalization_stats(dataset_name)
+    input_shape = tuple(DATASET_INFO[dataset_name]["input_shape"])
+    image_size = int(input_shape[1])
 
-    transform_list = []
+    transform_list: List[Callable] = []
 
     if use_augmentation:
-        transform_list.extend(
-            [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-            ]
-        )
+        if dataset_name in {"cifar10", "cifar100", "cinic10"}:
+            # Keep the original CIFAR augmentation exactly unchanged.
+            transform_list.extend(
+                [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()]
+            )
+        elif dataset_name == "stl10":
+            transform_list.extend(
+                [transforms.RandomCrop(96, padding=12), transforms.RandomHorizontalFlip()]
+            )
+        elif dataset_name == "tiny-imagenet-200":
+            transform_list.extend(
+                [transforms.RandomCrop(64, padding=8), transforms.RandomHorizontalFlip()]
+            )
+        elif dataset_name in {"fashionmnist", "femnist"}:
+            # Do not horizontally flip clothing/character glyphs. Translation crop only.
+            transform_list.append(transforms.RandomCrop(image_size, padding=4))
 
     transform_list.extend(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
+        [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
     )
-
     return transforms.Compose(transform_list)
 
 
 def build_test_transform(dataset_name: str) -> Callable:
-    """
-    构建测试集 transform。
-
-    测试集不使用随机增强，保证评估稳定。
-    """
-    dataset_name = dataset_name.lower()
+    """Build deterministic evaluation/evidence preprocessing."""
+    dataset_name = normalize_dataset_name(dataset_name)
     mean, std = get_normalization_stats(dataset_name)
-
     return transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
+        [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
     )
 
 
@@ -2344,7 +2378,7 @@ def get_dataset_info(dataset_name: str) -> Dict[str, Any]:
         num_classes
         input_shape
     """
-    dataset_name = dataset_name.lower()
+    dataset_name = normalize_dataset_name(dataset_name)
 
     if dataset_name not in DATASET_INFO:
         raise ValueError(
@@ -2758,8 +2792,8 @@ class DataLoaderBundle:
         用于本地训练，可以包含随机数据增强。
 
     client_evidence_loaders:
-        每个客户端对应一个 Fisher / K-FAC evidence DataLoader。
-        用于统计 Fisher 证据，应该来自关闭随机增强的 train_evidence_dataset。
+        每个客户端对应一个 方法级 evidence DataLoader。
+        用于统计 方法插件 证据，应该来自关闭随机增强的 train_evidence_dataset。
 
     test_loader:
         服务端测试集 DataLoader。
@@ -2797,7 +2831,7 @@ def build_dataloaders(
         1. 把 train_dataset 切成多个客户端 Subset
         2. 把 train_evidence_dataset 按同一份 client_indices 切成多个客户端 evidence Subset
         3. 为每个客户端创建训练 DataLoader
-        4. 为每个客户端创建 Fisher / K-FAC evidence DataLoader
+        4. 为每个客户端创建 方法级 evidence DataLoader
         5. 为服务端创建测试 DataLoader
 
     不负责：
@@ -2811,7 +2845,7 @@ def build_dataloaders(
             用于本地训练，是否开启随机数据增强由 data/datasets.py 和配置控制。
 
         train_evidence_dataset:
-            用于 Fisher / K-FAC evidence 统计，应该强制关闭随机数据增强。
+            用于 方法级 evidence 统计，应该强制关闭随机数据增强。
             这里使用和 train_dataset 完全相同的 client_indices，保证 evidence 样本归属不变。
     """
     batch_size = int(cfg.batch_size)
@@ -2825,7 +2859,7 @@ def build_dataloaders(
         client_indices=client_indices,
     )
 
-    # Fisher / K-FAC evidence 使用同一份客户端划分索引，
+    # 方法级 evidence 使用同一份客户端划分索引，
     # 但底层 dataset 换成关闭随机数据增强的 train_evidence_dataset。
     client_evidence_datasets = build_client_datasets(
         train_dataset=train_evidence_dataset,
@@ -2883,7 +2917,7 @@ def build_client_datasets(
 
     这个函数同时用于：
         1. 普通训练 train_dataset
-        2. Fisher / K-FAC evidence train_evidence_dataset
+        2. 方法级 evidence train_evidence_dataset
 
     二者使用同一份 client_indices，保证客户端数据划分完全一致。
     """
@@ -2950,11 +2984,11 @@ def build_client_evidence_loaders(
     seed: int,
 ) -> List[DataLoader]:
     """
-    为每个客户端创建 Fisher / K-FAC evidence DataLoader。
+    为每个客户端创建 方法级 evidence DataLoader。
 
     和训练 DataLoader 的区别：
         1. shuffle=False，保证 evidence 统计顺序稳定。
-        2. drop_last=False，保证客户端所有 evidence 样本都参与 Fisher 统计。
+        2. drop_last=False，保证客户端所有 evidence 样本都参与 方法插件 统计。
         3. dataset 应该来自 train_evidence_dataset，其 transform 已经关闭随机数据增强。
 
     注意：
@@ -3044,7 +3078,7 @@ class BasicBlock(nn.Module):
         Conv3x3 -> ReLU -> Conv3x3 -> Residual -> ReLU
 
     说明：
-        这是 FedFisher 对齐版 no-BN block。
+        这是 联邦专家方法 对齐版 no-BN block。
         不使用 BatchNorm，避免 non-IID FL 中 BN running_mean /
         running_var 在客户端聚合后产生统计失配。
 
@@ -3071,7 +3105,7 @@ class BasicBlock(nn.Module):
             bias=False,
         )
 
-        # FedFisher 对齐版：不使用 BatchNorm。
+        # 联邦专家方法 对齐版：不使用 BatchNorm。
         # 保留 bn1 名字并设为 Identity，避免改动 forward 逻辑。
         self.bn1 = nn.Identity()
 
@@ -3084,14 +3118,14 @@ class BasicBlock(nn.Module):
             bias=False,
         )
 
-        # FedFisher 对齐版：不使用 BatchNorm。
+        # 联邦专家方法 对齐版：不使用 BatchNorm。
         # 保留 bn2 名字并设为 Identity，避免改动 forward 逻辑。
         self.bn2 = nn.Identity()
 
         self.relu = nn.ReLU(inplace=True)
 
         # 当通道数或空间尺寸变化时，用 1x1 Conv 对齐残差分支。
-        # FedFisher 对齐版：shortcut 中同样不使用 BatchNorm。
+        # 联邦专家方法 对齐版：shortcut 中同样不使用 BatchNorm。
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -3126,7 +3160,7 @@ class ResNetBackbone(nn.Module):
     - 对 CIFAR10 / CIFAR100 这类 32x32 小图，stem 使用 stride=1。
     - 对 TinyImageNet 这类更大图，stem 使用 stride=2。
     - 最后通过 AdaptiveAvgPool2d(1) 得到单个全局特征向量。
-    - FedFisher 对齐版不使用 BatchNorm。
+    - 联邦专家方法 对齐版不使用 BatchNorm。
     """
 
     def __init__(
@@ -3147,7 +3181,7 @@ class ResNetBackbone(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            # FedFisher 对齐版：stem 中不使用 BatchNorm。
+            # 联邦专家方法 对齐版：stem 中不使用 BatchNorm。
             nn.ReLU(inplace=True),
         )
 
@@ -3217,47 +3251,24 @@ def build_backbone(
     in_channels: int = 3,
     image_size: int = 32,
 ) -> nn.Module:
-    """
-    Build a registered backbone.
-
-    Backbone contract:
-        1. forward(x) returns a 2-D feature tensor [B, D].
-        2. the module exposes feat_dim == D.
-
-    Adding another backbone only requires its implementation, a builder, and one
-    entry in BACKBONE_BUILDERS. The existing MoE / FL aggregation code does not
-    need to change.
-    """
+    """Build a registered backbone."""
     name = str(backbone_name).lower().strip()
-
     if name not in BACKBONE_BUILDERS:
         raise ValueError(
             f"不支持的 backbone：{name}。"
             f"当前支持：{sorted(BACKBONE_BUILDERS.keys())}"
         )
-
     backbone = BACKBONE_BUILDERS[name](
-        in_channels=int(in_channels),
-        image_size=int(image_size),
+        in_channels=int(in_channels), image_size=int(image_size)
     )
-
     if not hasattr(backbone, "feat_dim"):
-        raise ValueError(
-            f"backbone {name!r} 缺少 feat_dim 属性，"
-            "无法确定 SparseMoEHead 的输入维度。"
-        )
-
-    feat_dim = int(getattr(backbone, "feat_dim"))
-    if feat_dim <= 0:
-        raise ValueError(
-            f"backbone {name!r} 的 feat_dim 必须大于 0，当前值：{feat_dim}"
-        )
-
+        raise ValueError(f"backbone {name!r} 缺少 feat_dim 属性。")
+    feat_dim=int(getattr(backbone,"feat_dim"))
+    if feat_dim<=0: raise ValueError(f"backbone {name!r} 的 feat_dim 必须大于 0。")
     return backbone
 
 
 def list_supported_backbones() -> List[str]:
-    """Return registered backbone names."""
     return sorted(BACKBONE_BUILDERS.keys())
 
 
@@ -3431,7 +3442,7 @@ class SparseMoEHead(nn.Module):
 
         # 这个命名很重要：
         # 参数名会包含 moe_head.experts.<expert_id>....
-        # 这样现有 param_groups / K-FAC 逻辑更容易识别 expert 参数。
+        # 这样现有 param_groups / 方法证据 逻辑更容易识别 expert 参数。
         self.experts = nn.ModuleList(
             [
                 ExpertFFN(
@@ -3516,8 +3527,8 @@ class SparseMoEClassifier(nn.Module):
 
     整体结构：
         image
-          -> registered backbone
-          -> global feature [B, feat_dim]
+          -> ResNetBackbone
+          -> global feature [B, 512]
           -> SparseMoEHead
           -> logits [B, num_classes]
 
@@ -3605,7 +3616,7 @@ class SparseMoEClassifier(nn.Module):
 
 def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     """
-    根据 cfg 构建通用 SparseMoEClassifier。
+    根据 cfg 构建 SparseMoEClassifier。
 
     推荐配置示例：
 
@@ -3614,7 +3625,6 @@ def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     topk: 2
 
     model_cfg:
-      backbone: resnet_cifar
       in_channels: 3
       image_size: 32
       moe_hidden_dim: 512
@@ -3622,7 +3632,6 @@ def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
 
     说明：
     - num_classes 优先从 cfg.num_classes 读取。
-    - backbone 未配置时仍使用当前默认的 resnet_cifar。
     - in_channels / image_size 会优先从 cfg.input_shape 推断。
     - model_cfg 里的 in_channels / image_size 可以覆盖默认值。
     """
@@ -3711,12 +3720,10 @@ def build_model(cfg: Any) -> nn.Module:
     当前支持：
         sparse_moe_classifier
 
-    后续扩展其他完整模型时，只需要：
-        1. 在 base.py 中实现模型 / builder
-        2. 在 MODEL_BUILDERS 里注册
-
-    如果只是新增 backbone，则只需要修改上面的 BACKBONE_BUILDERS 区域，
-    不需要新增完整模型。
+    后续扩展其他模型时，只需要：
+        1. 新增模型文件
+        2. 写一个 build_xxx_from_cfg(cfg)
+        3. 在 MODEL_BUILDERS 里注册
     """
     model_name = get_model_name(cfg)
 
@@ -4179,7 +4186,7 @@ class ClientUpdate:
 
     这个结构是 client 和 server 之间的统一接口。
 
-    后面无论是 FedAvg、ExpertFedAvg、Fisher、history filter、Bayes，
+    后面无论是 FedAvg、ExpertFedAvg、方法插件、history filter、Bayes，
     都尽量往这个结构里扩展，而不是让 client.py 和 server.py 互相强耦合。
     """
 
@@ -4206,9 +4213,9 @@ class ClientUpdate:
     # 预留扩展字段
     # 后面可以放：
     # expert_usage
-    # fisher_diag
-    # expert_kfac
-    # expert_kfac_summary
+    # method-specific evidence / statistics
+    # method_evidence
+    # method_evidence_summary
     # sgld_mean
     # sgld_var
     # router_stats
@@ -4333,7 +4340,7 @@ class TrainState:
     # 后面可以放：
     # history filter state
     # bayes prior state
-    # fisher running state
+    # method-specific running state
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -4415,467 +4422,6 @@ def collect_client_metrics(
 
 
 # ============================================================================
-# Bundled from fl/kfac.py
-# ============================================================================
-
-
-KFACLayerPayload = Dict[str, Any]
-ExpertKFACPayload = Dict[str, KFACLayerPayload]
-
-
-@dataclass
-class _KFACLayerBuffer:
-    """
-    单个 expert Linear 层的 K-FAC 统计缓存。
-
-    对 Linear 层 z = W a + b：
-        A = E[a a^T]
-        B = E[delta delta^T]
-
-    注意：
-        1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
-        2. include_bias=True 时，把 bias 合并到 activation 里：
-           a_aug = [a, 1]
-           W_aug = [W, b]
-        3. B 必须用每个样本/token 的 grad_output 外积后求和，
-           不能先平均 grad_output 再外积，否则会出现梯度抵消。
-    """
-
-    module_name: str
-    module: nn.Linear
-    include_bias: bool
-    A_sum: Optional[torch.Tensor] = None
-    B_sum: Optional[torch.Tensor] = None
-    a_count: int = 0
-    b_count: int = 0
-
-    def add_activation(self, activation: torch.Tensor) -> None:
-        """累计 A_sum += a^T a。"""
-        if activation is None:
-            return
-
-        a = _flatten_last_dim(
-            tensor=activation,
-            expected_dim=self.module.in_features,
-            tensor_name=f"{self.module_name}.activation",
-        )
-
-        if a.numel() == 0 or a.size(0) <= 0:
-            return
-
-        a = a.detach().float()
-
-        if self.include_bias and self.module.bias is not None:
-            ones = torch.ones(
-                a.size(0),
-                1,
-                device=a.device,
-                dtype=a.dtype,
-            )
-            a = torch.cat([a, ones], dim=1)
-
-        A_batch = a.transpose(0, 1).matmul(a)
-
-        if self.A_sum is None:
-            self.A_sum = torch.zeros_like(A_batch)
-
-        self.A_sum.add_(A_batch)
-        self.a_count += int(a.size(0))
-
-    def add_grad_output(self, grad_output: torch.Tensor) -> None:
-        """累计 B_sum += delta^T delta。"""
-        if grad_output is None:
-            return
-
-        delta = _flatten_last_dim(
-            tensor=grad_output,
-            expected_dim=self.module.out_features,
-            tensor_name=f"{self.module_name}.grad_output",
-        )
-
-        if delta.numel() == 0 or delta.size(0) <= 0:
-            return
-
-        delta = delta.detach().float()
-        B_batch = delta.transpose(0, 1).matmul(delta)
-
-        if self.B_sum is None:
-            self.B_sum = torch.zeros_like(B_batch)
-
-        self.B_sum.add_(B_batch)
-        self.b_count += int(delta.size(0))
-
-    def to_payload(self, min_count: int) -> Optional[KFACLayerPayload]:
-        """
-        导出 A_mean / B_mean / count。
-
-        count 使用 a_count 和 b_count 的较小值。
-        正常情况下两者应该相等；如果不等，说明某些 forward 没有对应 backward，
-        这里保守使用 min，避免服务端误放大证据。
-        """
-        if self.A_sum is None or self.B_sum is None:
-            return None
-
-        if self.a_count <= 0 or self.b_count <= 0:
-            return None
-
-        count = min(int(self.a_count), int(self.b_count))
-
-        if count < int(min_count):
-            return None
-
-        A_mean = self.A_sum / float(self.a_count)
-        B_mean = self.B_sum / float(self.b_count)
-
-        if not torch.isfinite(A_mean).all():
-            return None
-
-        if not torch.isfinite(B_mean).all():
-            return None
-
-        bias_name = None
-        if self.module.bias is not None:
-            bias_name = f"{self.module_name}.bias"
-
-        return {
-            "module_name": self.module_name,
-            "weight_name": f"{self.module_name}.weight",
-            "bias_name": bias_name,
-            "A": A_mean.detach().cpu(),
-            "B": B_mean.detach().cpu(),
-            "count": int(count),
-            "a_count": int(self.a_count),
-            "b_count": int(self.b_count),
-            "include_bias": bool(self.include_bias and self.module.bias is not None),
-            "in_features": int(self.module.in_features),
-            "out_features": int(self.module.out_features),
-            "trace_A": float(torch.trace(A_mean).detach().cpu().item()),
-            "trace_B": float(torch.trace(B_mean).detach().cpu().item()),
-        }
-
-
-def collect_expert_kfac(
-    model: nn.Module,
-    train_loader: DataLoader,
-    criterion: Optional[nn.Module] = None,
-    device: torch.device | str | None = None,
-    cfg: Any = None,
-) -> ExpertKFACPayload:
-    """
-    在本地训练完成后的 local_model 上，额外跑一遍数据来采集 expert Linear 层的 K-FAC 因子。
-
-    返回格式：
-        {
-            "switch_layers.0.switch_ffn.experts.2.0": {
-                "module_name": ...,
-                "weight_name": "...weight",
-                "bias_name": "...bias",
-                "A": Tensor[in_dim(+1), in_dim(+1)],
-                "B": Tensor[out_dim, out_dim],
-                "count": int,
-                ...
-            },
-            ...
-        }
-
-    设计约束：
-        1. 只采集 module name 包含 experts. 的 nn.Linear。
-        2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
-        3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
-        4. 不修改训练逻辑，不做 optimizer.step()。
-        5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
-    """
-    if device is None:
-        device = _infer_model_device(model)
-
-    device = torch.device(device)
-
-    include_bias = bool(_cfg_get(cfg, "kfac.include_bias", True))
-    min_count = int(_cfg_get(cfg, "kfac.min_count", 1))
-    max_batches = int(_cfg_get(cfg, "kfac.max_batches", 0))
-    expert_name_pattern = str(_cfg_get(cfg, "kfac.expert_name_pattern", "experts."))
-    model_mode = str(_cfg_get(cfg, "kfac.model_mode", "eval")).lower().strip()
-    fisher_timing = str(
-        _cfg_get(
-            cfg,
-            "kfac.fisher_timing",
-            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
-        )
-    ).lower().strip()
-
-    if fisher_timing != "after_train":
-        raise ValueError(
-            "当前 collect_expert_kfac 只支持 kfac.fisher_timing=after_train。"
-            f"当前值：{fisher_timing}。"
-            "请在客户端本地训练完成后再单独采集 K-FAC。"
-        )
-
-    if min_count <= 0:
-        min_count = 1
-
-    buffers: Dict[str, _KFACLayerBuffer] = {}
-    handles = []
-
-    for module_name, module in model.named_modules():
-        if not _is_expert_linear(
-            module_name=module_name,
-            module=module,
-            expert_name_pattern=expert_name_pattern,
-        ):
-            continue
-
-        buffers[module_name] = _KFACLayerBuffer(
-            module_name=module_name,
-            module=module,
-            include_bias=include_bias,
-        )
-
-    if len(buffers) == 0:
-        return {}
-
-    for module_name, module_buffer in buffers.items():
-        module = module_buffer.module
-
-        def forward_hook(
-            layer: nn.Module,
-            inputs: tuple[torch.Tensor, ...],
-            output: torch.Tensor,
-            name: str = module_name,
-        ) -> None:
-            if len(inputs) == 0:
-                return
-
-            buffers[name].add_activation(inputs[0])
-
-        def backward_hook(
-            layer: nn.Module,
-            grad_input: tuple[Optional[torch.Tensor], ...],
-            grad_output: tuple[Optional[torch.Tensor], ...],
-            name: str = module_name,
-        ) -> None:
-            if len(grad_output) == 0:
-                return
-
-            buffers[name].add_grad_output(grad_output[0])
-
-        handles.append(module.register_forward_hook(forward_hook))
-        handles.append(module.register_full_backward_hook(backward_hook))
-
-    was_training = bool(model.training)
-    model.to(device)
-
-    if model_mode == "train":
-        model.train()
-    else:
-        model.eval()
-
-    sum_criterion = _build_sum_criterion(
-        cfg=cfg,
-        fallback_criterion=criterion,
-    )
-    sum_criterion.to(device)
-
-    model.zero_grad(set_to_none=True)
-
-    try:
-        with torch.enable_grad():
-            for batch_idx, batch in enumerate(train_loader):
-                if max_batches > 0 and batch_idx >= max_batches:
-                    break
-
-                images, targets = unpack_batch(batch)
-
-                images = images.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-
-                model.zero_grad(set_to_none=True)
-
-                outputs = model(images)
-                logits = extract_logits(outputs)
-
-                loss = sum_criterion(logits, targets)
-
-                if not torch.isfinite(loss):
-                    continue
-
-                loss.backward()
-
-                # 只采集 Fisher，不更新参数。
-                model.zero_grad(set_to_none=True)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-        model.zero_grad(set_to_none=True)
-        model.train(was_training)
-
-    payload: ExpertKFACPayload = {}
-
-    for module_name, module_buffer in buffers.items():
-        layer_payload = module_buffer.to_payload(min_count=min_count)
-
-        if layer_payload is None:
-            continue
-
-        layer_payload["fisher_timing"] = fisher_timing
-        layer_payload["collect_timing"] = fisher_timing
-        layer_payload["model_mode"] = model_mode
-        layer_payload["max_batches"] = int(max_batches)
-        layer_payload["expert_name_pattern"] = expert_name_pattern
-
-        payload[module_name] = layer_payload
-
-    return payload
-
-
-def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
-    """
-    生成轻量诊断信息，方便 client.py 或日志系统记录。
-
-    不包含 A/B tensor 本体。
-    """
-    if not payload:
-        return {
-            "num_layers": 0,
-            "total_count": 0,
-            "mean_count": 0.0,
-            "mean_trace_A": 0.0,
-            "mean_trace_B": 0.0,
-            "max_trace_A": 0.0,
-            "max_trace_B": 0.0,
-            "fisher_timing": "",
-            "model_mode": "",
-        }
-
-    counts = [int(item["count"]) for item in payload.values()]
-    trace_A = [float(item["trace_A"]) for item in payload.values()]
-    trace_B = [float(item["trace_B"]) for item in payload.values()]
-
-    fisher_timings = sorted(
-        {
-            str(item.get("fisher_timing", item.get("collect_timing", "")))
-            for item in payload.values()
-            if str(item.get("fisher_timing", item.get("collect_timing", ""))) != ""
-        }
-    )
-    model_modes = sorted(
-        {
-            str(item.get("model_mode", ""))
-            for item in payload.values()
-            if str(item.get("model_mode", "")) != ""
-        }
-    )
-
-    return {
-        "num_layers": int(len(payload)),
-        "total_count": int(sum(counts)),
-        "mean_count": float(sum(counts) / max(len(counts), 1)),
-        "mean_trace_A": float(sum(trace_A) / max(len(trace_A), 1)),
-        "mean_trace_B": float(sum(trace_B) / max(len(trace_B), 1)),
-        "max_trace_A": float(max(trace_A)),
-        "max_trace_B": float(max(trace_B)),
-        "fisher_timing": (
-            fisher_timings[0]
-            if len(fisher_timings) == 1
-            else ",".join(fisher_timings)
-        ),
-        "model_mode": (
-            model_modes[0]
-            if len(model_modes) == 1
-            else ",".join(model_modes)
-        ),
-    }
-
-
-def _is_expert_linear(
-    module_name: str,
-    module: nn.Module,
-    expert_name_pattern: str,
-) -> bool:
-    """判断一个 module 是否是 expert 内部的 Linear 层。"""
-    if not isinstance(module, nn.Linear):
-        return False
-
-    if expert_name_pattern not in module_name:
-        return False
-
-    return True
-
-
-def _flatten_last_dim(
-    tensor: torch.Tensor,
-    expected_dim: int,
-    tensor_name: str,
-) -> torch.Tensor:
-    """
-    把 Linear 的输入或 grad_output 展平成 [num_items, feature_dim]。
-
-    支持：
-        [N, D]
-        [B, N, D]
-        [B, ..., D]
-    """
-    if tensor is None:
-        raise ValueError(f"{tensor_name} 为空。")
-
-    if tensor.dim() == 0:
-        raise ValueError(f"{tensor_name} 维度错误：{tuple(tensor.shape)}")
-
-    if tensor.size(-1) != int(expected_dim):
-        raise ValueError(
-            f"{tensor_name} 最后一维不匹配："
-            f"实际={tensor.size(-1)}, 期望={expected_dim}, "
-            f"shape={tuple(tensor.shape)}"
-        )
-
-    if tensor.dim() == 1:
-        return tensor.reshape(1, -1)
-
-    return tensor.reshape(-1, tensor.size(-1))
-
-
-def _build_sum_criterion(
-    cfg: Any,
-    fallback_criterion: Optional[nn.Module] = None,
-) -> nn.Module:
-    """
-    构建 K-FAC 采集用 loss。
-
-    这里强制 reduction='sum'。
-    如果直接复用训练时 CrossEntropyLoss 的 mean reduction，
-    backward 得到的 delta 会被 batch size 缩小，K-FAC 尺度会不稳定。
-    """
-    label_smoothing = float(_cfg_get(cfg, "label_smooth", 0.0))
-
-    if isinstance(fallback_criterion, nn.CrossEntropyLoss):
-        label_smoothing = float(
-            getattr(fallback_criterion, "label_smoothing", label_smoothing)
-        )
-        ignore_index = int(getattr(fallback_criterion, "ignore_index", -100))
-        weight = getattr(fallback_criterion, "weight", None)
-
-        return nn.CrossEntropyLoss(
-            weight=weight,
-            ignore_index=ignore_index,
-            reduction="sum",
-            label_smoothing=label_smoothing,
-        )
-
-    return nn.CrossEntropyLoss(
-        reduction="sum",
-        label_smoothing=label_smoothing,
-    )
-
-
-def _infer_model_device(model: nn.Module) -> torch.device:
-    """从模型参数推断 device。"""
-    try:
-        return next(model.parameters()).device
-    except StopIteration as exc:
-        raise ValueError("模型没有参数，无法推断 device。") from exc
-
-
-# ============================================================================
 # Bundled from fl/client.py
 # ============================================================================
 
@@ -4914,6 +4460,10 @@ class ClientTrainStats:
         }
 
 
+ExpertEvidenceCollector = Callable[..., Mapping[str, Any]]
+MethodClientDiagnosticsBuilder = Callable[[ClientUpdate], Mapping[str, Any]]
+
+
 class FLClient:
     """
     联邦学习客户端。
@@ -4921,7 +4471,7 @@ class FLClient:
     职责：
         1. 接收 server 下发的 global_model
         2. 在自己的 train_loader 上本地训练
-        3. 在自己的 evidence_loader 上统计 Fisher / K-FAC evidence
+        3. 在自己的 evidence_loader 上统计 方法级 evidence
         4. 计算 local_model 相对 global_model 的参数变化量
         5. 返回 ClientUpdate
 
@@ -4938,11 +4488,12 @@ class FLClient:
         cfg: Any,
         device: torch.device | str,
         evidence_loader: Optional[DataLoader] = None,
+        expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
     ) -> None:
         self.client_id = int(client_id)
         self.train_loader = train_loader
 
-        # Fisher / K-FAC evidence 专用 loader。
+        # 方法级 evidence 专用 loader。
         # 正常情况下由 data/loaders.py 基于 train_evidence_dataset 构建，
         # 其 transform 已经关闭 RandomCrop / RandomHorizontalFlip。
         #
@@ -4956,6 +4507,7 @@ class FLClient:
 
         self.cfg = cfg
         self.device = torch.device(device)
+        self.expert_evidence_collector = expert_evidence_collector
 
         if len(self.train_loader.dataset) <= 0:
             raise ValueError(f"客户端 {self.client_id} 的数据集为空。")
@@ -4970,7 +4522,7 @@ class FLClient:
 
         注意：
             聚合时的样本数仍然按训练集 train_loader 统计。
-            evidence_loader 只是 Fisher / K-FAC 统计用，不改变客户端样本权重定义。
+            evidence_loader 只是 方法级 统计用，不改变客户端样本权重定义。
         """
         return int(len(self.train_loader.dataset))
 
@@ -5030,7 +4582,7 @@ class FLClient:
         #
         # 注意：
         #     这里仍然使用 train_loader，保持原有日志诊断语义不变。
-        #     Fisher / K-FAC evidence 统计才使用 evidence_loader。
+        #     方法级 evidence 统计才使用 evidence_loader。
         #
         #     topk=2 时，一个样本会贡献 2 次 expert 激活。
         #     所以 expert_counts 的总和通常约等于 num_samples * topk。
@@ -5044,58 +4596,20 @@ class FLClient:
                 cfg=self.cfg,
             )
 
-        expert_kfac = None
-        expert_kfac_summary = None
-        expert_kfac_timing = None
-
-        should_collect_expert_kfac = (
-            str(_cfg_get(self.cfg, "agg.expert.method", "")).lower().strip()
-            == "fisher_kfac_expert"
-            or bool(_cfg_get(self.cfg, "kfac.collect", False))
-        )
-
-        if should_collect_expert_kfac:
-            expert_kfac_timing = str(
-                _cfg_get(
-                    self.cfg,
-                    "kfac.fisher_timing",
-                    _cfg_get(self.cfg, "kfac.collect_timing", "after_train"),
-                )
-            ).lower().strip()
-
-            if expert_kfac_timing != "after_train":
-                raise ValueError(
-                    "当前 K-FAC 采集只支持 kfac.fisher_timing=after_train。"
-                    f"当前值：{expert_kfac_timing}。"
-                    "请不要在本地训练过程中混合统计 K-FAC。"
-                )
-
-            # ------------------------------------------------------------
-            # Fisher / K-FAC evidence 统计使用 evidence_loader。
-            #
-            # 这一步是本次修改的关键：
-            #     原代码这里使用 self.train_loader，
-            #     如果 train_dataset 开启了 RandomCrop / RandomHorizontalFlip，
-            #     那么统计 Fisher 时也会触发随机数据增强。
-            #
-            #     现在改为 self.evidence_loader。
-            #     新的 evidence_loader 来自 train_evidence_dataset，
-            #     transform 强制关闭随机数据增强，只保留 ToTensor + Normalize。
-            #
-            # 注意：
-            #     collect_expert_kfac 内部仍然会根据 kfac.model_mode 切换 eval/train。
-            #     model.eval() 只能关闭 Dropout / BN 训练态行为，
-            #     不能关闭 torchvision transform 的随机增强。
-            #     所以必须在 loader / dataset 层面单独处理。
-            # ------------------------------------------------------------
-            expert_kfac = collect_expert_kfac(
+        method_extra: Dict[str, Any] = {}
+        if self.expert_evidence_collector is not None:
+            collected_extra = self.expert_evidence_collector(
                 model=local_model,
-                train_loader=self.evidence_loader,
+                evidence_loader=self.evidence_loader,
                 criterion=criterion,
                 device=self.device,
                 cfg=self.cfg,
             )
-            expert_kfac_summary = summarize_expert_kfac(expert_kfac)
+            if collected_extra is None:
+                collected_extra = {}
+            if not isinstance(collected_extra, Mapping):
+                raise TypeError("expert_evidence_collector 必须返回 Mapping 或 None。")
+            method_extra.update(dict(collected_extra))
 
         local_state_cpu = state_dict_to(
             local_model.state_dict(),
@@ -5121,9 +4635,7 @@ class FLClient:
                 "local_epochs": int(local_epochs),
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
                 "expert_usage": expert_usage,
-                "expert_kfac": expert_kfac,
-                "expert_kfac_summary": expert_kfac_summary,
-                "expert_kfac_timing": expert_kfac_timing,
+                **method_extra,
             },
         )
 
@@ -5403,7 +4915,7 @@ def extract_router_info(outputs: Any) -> Optional[Mapping[str, Any]]:
         2. dict: outputs["router_info"]
         3. tuple/list: outputs[1] 是 router_info
 
-    当前 sparse_moe_classifier 在 return_router_info=True 时，
+    当前 resnet_sparse_moe_head 在 return_router_info=True 时，
     返回对象里包含 .router_info。
     """
     if hasattr(outputs, "router_info"):
@@ -5524,6 +5036,7 @@ def build_clients(
     client_loaders: Sequence[DataLoader],
     device: torch.device | str,
     client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
+    expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
 ) -> List[FLClient]:
     """
     根据客户端 DataLoader 列表创建 FLClient 列表。
@@ -5539,7 +5052,7 @@ def build_clients(
             本地训练使用的设备。
 
         client_evidence_loaders:
-            每个客户端对应一个 Fisher / K-FAC evidence DataLoader。
+            每个客户端对应一个 方法级 evidence DataLoader。
             如果为 None，则每个客户端回退使用自己的 train_loader。
     """
     if client_evidence_loaders is not None and len(client_evidence_loaders) != len(client_loaders):
@@ -5564,6 +5077,7 @@ def build_clients(
                 evidence_loader=evidence_loader,
                 cfg=cfg,
                 device=device,
+                expert_evidence_collector=expert_evidence_collector,
             )
         )
 
@@ -6043,6 +5557,8 @@ class FLServer:
         device: torch.device | str,
         expert_aggregator_builder: ExpertAggregatorBuilder,
         client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
+        expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+        method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
         global_model: Optional[nn.Module] = None,
     ) -> None:
         self.cfg = cfg
@@ -6061,14 +5577,16 @@ class FLServer:
         self.clients = build_clients(
             cfg=cfg,
             client_loaders=client_loaders,
-            # Fisher / K-FAC evidence 专用 loader。
+            # 方法级 evidence 专用 loader。
             # 本地训练仍然使用 client_loaders；
-            # 统计 Fisher 时由客户端使用 client_evidence_loaders。
+            # 统计 方法插件 时由客户端使用 client_evidence_loaders。
             client_evidence_loaders=client_evidence_loaders,
             device=self.device,
+            expert_evidence_collector=expert_evidence_collector,
         )
 
         self.test_loader = test_loader
+        self.method_client_diagnostics_builder = method_client_diagnostics_builder
 
         self.aggregators = build_aggregators(
             cfg=cfg,
@@ -6393,7 +5911,7 @@ class FLServer:
         full_aggregation_info["avg_train_acc"] = avg_train_acc
 
         # 保存每个客户端的轻量诊断信息。
-        # 注意：这里不保存 model_delta，也不保存 expert_kfac 原始矩阵，
+        # 注意：这里不保存 model_delta，也不保存 method_evidence 原始矩阵，
         # 避免 summary.json / train.log 过大。
         full_aggregation_info["client_diagnostics"] = (
             self._build_client_diagnostics(client_updates)
@@ -6566,31 +6084,23 @@ class FLServer:
         self,
         client_updates: Sequence[ClientUpdate],
     ) -> Dict[int, Dict[str, Any]]:
-        """
-        从 ClientUpdate 中提取轻量客户端诊断信息。
-
-        保留：
-            1. num_samples
-            2. metrics: train_loss / train_acc / num_batches
-            3. expert_usage: 每个 expert 的激活次数与比例
-
-        不保留：
-            1. model_delta
-            2. expert_kfac 原始矩阵
-
-        这样日志和 summary.json 不会被大对象撑爆。
-        """
+        """从 ClientUpdate 中提取公共及方法插件提供的轻量诊断信息。"""
         diagnostics: Dict[int, Dict[str, Any]] = {}
-
         for update in client_updates:
             extra = dict(update.extra or {})
-            diagnostics[int(update.client_id)] = {
+            client_diag: Dict[str, Any] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
                 "expert_usage": extra.get("expert_usage", None),
-                "expert_kfac_summary": extra.get("expert_kfac_summary", None),
             }
-
+            if self.method_client_diagnostics_builder is not None:
+                method_diag = self.method_client_diagnostics_builder(update)
+                if method_diag is None:
+                    method_diag = {}
+                if not isinstance(method_diag, Mapping):
+                    raise TypeError("method_client_diagnostics_builder 必须返回 Mapping 或 None。")
+                client_diag.update(dict(method_diag))
+            diagnostics[int(update.client_id)] = client_diag
         return diagnostics
 
     def _write_aggregation_info_to_log(
@@ -6603,7 +6113,7 @@ class FLServer:
 
         输出示例：
             [Agg][non_expert] round=1 method=uniform clients=10 params=121 weights=uniform(each=0.1000)
-            [Agg][expert] round=1 method=fisher_kfac_expert clients=10 params=16 weights={0:0.0812,1:0.1033,...}
+            [Agg][expert] round=1 method=<method> clients=10 params=16 weights={0:0.0812,1:0.1033,...}
         """
         logging_cfg = _cfg_get(self.cfg, "logging", {})
         compact_uniform_weights = _cfg_get_bool(
@@ -7187,6 +6697,8 @@ def build_server(
     device: torch.device | str,
     expert_aggregator_builder: ExpertAggregatorBuilder,
     client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
+    expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+    method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
 ) -> FLServer:
     """
     构建 FLServer。
@@ -7194,7 +6706,7 @@ def build_server(
     train.py 后面可以直接调用这个函数。
 
     client_evidence_loaders:
-        Fisher / K-FAC evidence 专用 loader。
+        方法级 evidence 专用 loader。
         如果为 None，后续 client.py 里会回退到普通 train_loader。
     """
     return FLServer(
@@ -7204,6 +6716,8 @@ def build_server(
         test_loader=test_loader,
         device=device,
         expert_aggregator_builder=expert_aggregator_builder,
+        expert_evidence_collector=expert_evidence_collector,
+        method_client_diagnostics_builder=method_client_diagnostics_builder,
     )
 
 
@@ -7279,30 +6793,78 @@ def _cfg_get_bool(
 # ============================================================================
 
 
-def parse_args() -> argparse.Namespace:
-    """
-    解析命令行参数。
-    """
-    parser = argparse.ArgumentParser(
-        description="FL + MoE training entrypoint"
-    )
+MethodCliArgumentRegistrar = Callable[[argparse.ArgumentParser], None]
+MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help=(
-            "可选的外部配置文件路径；省略时使用三个脚本内嵌的原实验配置。"
-        ),
-    )
 
+def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
+    parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
+    parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
+    parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument("--num-clients", type=int, default=None)
+    parser.add_argument("--alpha", type=float, default=None)
+    parser.add_argument("--frac", type=float, default=None)
+    parser.add_argument("--rounds", type=int, default=None)
+    parser.add_argument("--local-epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--test-batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--backbone", choices=list_supported_backbones(), default=None)
+    parser.add_argument("--num-experts", type=int, default=None)
+    parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
+    if method_cli_argument_registrar is not None:
+        method_cli_argument_registrar(parser)
     return parser.parse_args()
+
+
+def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    top_level={
+        "data_root":"data_root","num_clients":"num_clients","alpha":"alpha","frac":"frac",
+        "rounds":"rounds","local_epochs":"local_epochs","batch_size":"batch_size",
+        "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
+        "topk":"topk","seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
+    }
+    for arg_name,config_key in top_level.items():
+        value=getattr(args,arg_name,None)
+        if value is not None: overrides[config_key]=value
+    dataset=getattr(args,"dataset",None)
+    if dataset is not None:
+        dataset = normalize_dataset_name(dataset)
+        overrides["dataset"]=dataset
+        overrides["num_classes"]=_infer_num_classes(dataset)
+        info=DATASET_INFO.get(dataset)
+        if info is not None:
+            overrides["input_shape"]=tuple(info["input_shape"])
+    backbone=getattr(args,"backbone",None)
+    if backbone is not None: overrides.setdefault("model_cfg",{})["backbone"]=backbone
+    opt={}
+    for an,ck in (("optimizer_type","type"),("lr","lr"),("momentum","momentum"),("weight_decay","weight_decay")):
+        v=getattr(args,an,None)
+        if v is not None: opt[ck]=v
+    if opt: overrides["optimizer"]=opt
+    return overrides
 
 
 def main(
     expert_aggregator_builder: ExpertAggregatorBuilder,
     embedded_method_config: Mapping[str, Any],
     expert_method_name: str,
+    method_config_defaults: Mapping[str, Any] | None = None,
+    method_config_validator: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+    method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
+    method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None,
+    method_cli_overrides_builder: Optional[MethodCliOverridesBuilder] = None,
 ) -> int:
     """
     训练入口。
@@ -7318,11 +6880,14 @@ def main(
         - 普通 print / 报错信息会写入控制台和 train.log。
         - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
     """
-    args = parse_args()
+    args = parse_args(method_cli_argument_registrar=method_cli_argument_registrar)
+    config_overrides = build_common_cli_overrides(args)
+    if method_cli_overrides_builder is not None:
+        config_overrides = _deep_merge(base=config_overrides, override=dict(method_cli_overrides_builder(args) or {}))
     cfg = (
-        load_config(args.config)
+        load_config(args.config, method_defaults=method_config_defaults, method_validator=method_config_validator, config_overrides=config_overrides)
         if args.config is not None
-        else load_embedded_config(embedded_method_config)
+        else load_embedded_config(embedded_method_config, method_defaults=method_config_defaults, method_validator=method_config_validator, config_overrides=config_overrides)
     )
 
     configured_non_expert_method = str(
@@ -7365,6 +6930,8 @@ def main(
                 run_dir=run_dir,
                 expert_aggregator_builder=expert_aggregator_builder,
                 expert_method_name=expert_method_name,
+                expert_evidence_collector=expert_evidence_collector,
+                method_client_diagnostics_builder=method_client_diagnostics_builder,
             )
         except Exception:
             print()
@@ -7381,6 +6948,8 @@ def run_training(
     run_dir: Path,
     expert_aggregator_builder: ExpertAggregatorBuilder,
     expert_method_name: str,
+    expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+    method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
 ) -> int:
     """
     实际训练流程。
@@ -7452,7 +7021,7 @@ def run_training(
     loader_bundle = build_dataloaders(
         cfg=cfg,
         train_dataset=dataset_bundle.train_dataset,
-        # Fisher / K-FAC evidence 专用数据集。
+        # 方法级 evidence 专用数据集。
         # 它和 train_dataset 使用同一份原始样本，
         # 但 transform 在 data/datasets.py 中强制关闭随机数据增强。
         train_evidence_dataset=dataset_bundle.train_evidence_dataset,
@@ -7463,12 +7032,14 @@ def run_training(
     server = build_server(
         cfg=cfg,
         client_loaders=loader_bundle.client_loaders,
-        # Fisher / K-FAC evidence 专用 loader。
-        # 训练仍然走 client_loaders，统计 Fisher 时走 client_evidence_loaders。
+        # 方法级 evidence 专用 loader。
+        # 训练仍然走 client_loaders，统计 方法插件 时走 client_evidence_loaders。
         client_evidence_loaders=loader_bundle.client_evidence_loaders,
         test_loader=loader_bundle.test_loader,
         device=device,
         expert_aggregator_builder=expert_aggregator_builder,
+        expert_evidence_collector=expert_evidence_collector,
+        method_client_diagnostics_builder=method_client_diagnostics_builder,
     )
 
     train_result = server.train()

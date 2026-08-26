@@ -47,10 +47,638 @@ EMBEDDED_METHOD_CONFIG = {
     },
 }
 
+METHOD_CONFIG_DEFAULTS = {
+    "kfac": {
+        "collect": False,
+        "weight_mode": "sample_weighted",
+        "solve_scope": "per_layer",
+        "solve_mode": "cg",
+        "server_steps": 5,
+        "server_lr": 0.01,
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.99,
+        "adam_eps": 0.01,
+        "cg_tol": 1.0e-8,
+        "damping": 0.0,
+        "use_damping": False,
+        "min_count": 1,
+        "fallback": "none",
+        "include_bias": True,
+        "fisher_timing": "after_train",
+        "model_mode": "eval",
+        "max_batches": 0,
+        "expert_name_pattern": "experts.",
+        "use_server_validation": False,
+        "model_selection": "final_step",
+        "log_detail": True,
+    },
+}
+
+import argparse
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+unpack_batch = base.unpack_batch
+extract_logits = base.extract_logits
+ConfigError = base.ConfigError
+
+
+
+# ============================================================================
+# Bundled from fl/kfac.py
+# ============================================================================
+
+
+KFACLayerPayload = Dict[str, Any]
+ExpertKFACPayload = Dict[str, KFACLayerPayload]
+
+
+@dataclass
+class _KFACLayerBuffer:
+    """
+    单个 expert Linear 层的 K-FAC 统计缓存。
+
+    对 Linear 层 z = W a + b：
+        A = E[a a^T]
+        B = E[delta delta^T]
+
+    注意：
+        1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
+        2. include_bias=True 时，把 bias 合并到 activation 里：
+           a_aug = [a, 1]
+           W_aug = [W, b]
+        3. B 必须用每个样本/token 的 grad_output 外积后求和，
+           不能先平均 grad_output 再外积，否则会出现梯度抵消。
+    """
+
+    module_name: str
+    module: nn.Linear
+    include_bias: bool
+    A_sum: Optional[torch.Tensor] = None
+    B_sum: Optional[torch.Tensor] = None
+    a_count: int = 0
+    b_count: int = 0
+
+    def add_activation(self, activation: torch.Tensor) -> None:
+        """累计 A_sum += a^T a。"""
+        if activation is None:
+            return
+
+        a = _flatten_last_dim(
+            tensor=activation,
+            expected_dim=self.module.in_features,
+            tensor_name=f"{self.module_name}.activation",
+        )
+
+        if a.numel() == 0 or a.size(0) <= 0:
+            return
+
+        a = a.detach().float()
+
+        if self.include_bias and self.module.bias is not None:
+            ones = torch.ones(
+                a.size(0),
+                1,
+                device=a.device,
+                dtype=a.dtype,
+            )
+            a = torch.cat([a, ones], dim=1)
+
+        A_batch = a.transpose(0, 1).matmul(a)
+
+        if self.A_sum is None:
+            self.A_sum = torch.zeros_like(A_batch)
+
+        self.A_sum.add_(A_batch)
+        self.a_count += int(a.size(0))
+
+    def add_grad_output(self, grad_output: torch.Tensor) -> None:
+        """累计 B_sum += delta^T delta。"""
+        if grad_output is None:
+            return
+
+        delta = _flatten_last_dim(
+            tensor=grad_output,
+            expected_dim=self.module.out_features,
+            tensor_name=f"{self.module_name}.grad_output",
+        )
+
+        if delta.numel() == 0 or delta.size(0) <= 0:
+            return
+
+        delta = delta.detach().float()
+        B_batch = delta.transpose(0, 1).matmul(delta)
+
+        if self.B_sum is None:
+            self.B_sum = torch.zeros_like(B_batch)
+
+        self.B_sum.add_(B_batch)
+        self.b_count += int(delta.size(0))
+
+    def to_payload(self, min_count: int) -> Optional[KFACLayerPayload]:
+        """
+        导出 A_mean / B_mean / count。
+
+        count 使用 a_count 和 b_count 的较小值。
+        正常情况下两者应该相等；如果不等，说明某些 forward 没有对应 backward，
+        这里保守使用 min，避免服务端误放大证据。
+        """
+        if self.A_sum is None or self.B_sum is None:
+            return None
+
+        if self.a_count <= 0 or self.b_count <= 0:
+            return None
+
+        count = min(int(self.a_count), int(self.b_count))
+
+        if count < int(min_count):
+            return None
+
+        A_mean = self.A_sum / float(self.a_count)
+        B_mean = self.B_sum / float(self.b_count)
+
+        if not torch.isfinite(A_mean).all():
+            return None
+
+        if not torch.isfinite(B_mean).all():
+            return None
+
+        bias_name = None
+        if self.module.bias is not None:
+            bias_name = f"{self.module_name}.bias"
+
+        return {
+            "module_name": self.module_name,
+            "weight_name": f"{self.module_name}.weight",
+            "bias_name": bias_name,
+            "A": A_mean.detach().cpu(),
+            "B": B_mean.detach().cpu(),
+            "count": int(count),
+            "a_count": int(self.a_count),
+            "b_count": int(self.b_count),
+            "include_bias": bool(self.include_bias and self.module.bias is not None),
+            "in_features": int(self.module.in_features),
+            "out_features": int(self.module.out_features),
+            "trace_A": float(torch.trace(A_mean).detach().cpu().item()),
+            "trace_B": float(torch.trace(B_mean).detach().cpu().item()),
+        }
+
+
+def collect_expert_kfac(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion: Optional[nn.Module] = None,
+    device: torch.device | str | None = None,
+    cfg: Any = None,
+) -> ExpertKFACPayload:
+    """
+    在本地训练完成后的 local_model 上，额外跑一遍数据来采集 expert Linear 层的 K-FAC 因子。
+
+    返回格式：
+        {
+            "switch_layers.0.switch_ffn.experts.2.0": {
+                "module_name": ...,
+                "weight_name": "...weight",
+                "bias_name": "...bias",
+                "A": Tensor[in_dim(+1), in_dim(+1)],
+                "B": Tensor[out_dim, out_dim],
+                "count": int,
+                ...
+            },
+            ...
+        }
+
+    设计约束：
+        1. 只采集 module name 包含 experts. 的 nn.Linear。
+        2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
+        3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
+        4. 不修改训练逻辑，不做 optimizer.step()。
+        5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
+    """
+    if device is None:
+        device = _infer_model_device(model)
+
+    device = torch.device(device)
+
+    include_bias = bool(_cfg_get(cfg, "kfac.include_bias", True))
+    min_count = int(_cfg_get(cfg, "kfac.min_count", 1))
+    max_batches = int(_cfg_get(cfg, "kfac.max_batches", 0))
+    expert_name_pattern = str(_cfg_get(cfg, "kfac.expert_name_pattern", "experts."))
+    model_mode = str(_cfg_get(cfg, "kfac.model_mode", "eval")).lower().strip()
+    fisher_timing = str(
+        _cfg_get(
+            cfg,
+            "kfac.fisher_timing",
+            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
+        )
+    ).lower().strip()
+
+    if fisher_timing != "after_train":
+        raise ValueError(
+            "当前 collect_expert_kfac 只支持 kfac.fisher_timing=after_train。"
+            f"当前值：{fisher_timing}。"
+            "请在客户端本地训练完成后再单独采集 K-FAC。"
+        )
+
+    if min_count <= 0:
+        min_count = 1
+
+    buffers: Dict[str, _KFACLayerBuffer] = {}
+    handles = []
+
+    for module_name, module in model.named_modules():
+        if not _is_expert_linear(
+            module_name=module_name,
+            module=module,
+            expert_name_pattern=expert_name_pattern,
+        ):
+            continue
+
+        buffers[module_name] = _KFACLayerBuffer(
+            module_name=module_name,
+            module=module,
+            include_bias=include_bias,
+        )
+
+    if len(buffers) == 0:
+        return {}
+
+    for module_name, module_buffer in buffers.items():
+        module = module_buffer.module
+
+        def forward_hook(
+            layer: nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            output: torch.Tensor,
+            name: str = module_name,
+        ) -> None:
+            if len(inputs) == 0:
+                return
+
+            buffers[name].add_activation(inputs[0])
+
+        def backward_hook(
+            layer: nn.Module,
+            grad_input: tuple[Optional[torch.Tensor], ...],
+            grad_output: tuple[Optional[torch.Tensor], ...],
+            name: str = module_name,
+        ) -> None:
+            if len(grad_output) == 0:
+                return
+
+            buffers[name].add_grad_output(grad_output[0])
+
+        handles.append(module.register_forward_hook(forward_hook))
+        handles.append(module.register_full_backward_hook(backward_hook))
+
+    was_training = bool(model.training)
+    model.to(device)
+
+    if model_mode == "train":
+        model.train()
+    else:
+        model.eval()
+
+    sum_criterion = _build_sum_criterion(
+        cfg=cfg,
+        fallback_criterion=criterion,
+    )
+    sum_criterion.to(device)
+
+    model.zero_grad(set_to_none=True)
+
+    try:
+        with torch.enable_grad():
+            for batch_idx, batch in enumerate(train_loader):
+                if max_batches > 0 and batch_idx >= max_batches:
+                    break
+
+                images, targets = unpack_batch(batch)
+
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                model.zero_grad(set_to_none=True)
+
+                outputs = model(images)
+                logits = extract_logits(outputs)
+
+                loss = sum_criterion(logits, targets)
+
+                if not torch.isfinite(loss):
+                    continue
+
+                loss.backward()
+
+                # 只采集 Fisher，不更新参数。
+                model.zero_grad(set_to_none=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+        model.zero_grad(set_to_none=True)
+        model.train(was_training)
+
+    payload: ExpertKFACPayload = {}
+
+    for module_name, module_buffer in buffers.items():
+        layer_payload = module_buffer.to_payload(min_count=min_count)
+
+        if layer_payload is None:
+            continue
+
+        layer_payload["fisher_timing"] = fisher_timing
+        layer_payload["collect_timing"] = fisher_timing
+        layer_payload["model_mode"] = model_mode
+        layer_payload["max_batches"] = int(max_batches)
+        layer_payload["expert_name_pattern"] = expert_name_pattern
+
+        payload[module_name] = layer_payload
+
+    return payload
+
+
+def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
+    """
+    生成轻量诊断信息，方便 client.py 或日志系统记录。
+
+    不包含 A/B tensor 本体。
+    """
+    if not payload:
+        return {
+            "num_layers": 0,
+            "total_count": 0,
+            "mean_count": 0.0,
+            "mean_trace_A": 0.0,
+            "mean_trace_B": 0.0,
+            "max_trace_A": 0.0,
+            "max_trace_B": 0.0,
+            "fisher_timing": "",
+            "model_mode": "",
+        }
+
+    counts = [int(item["count"]) for item in payload.values()]
+    trace_A = [float(item["trace_A"]) for item in payload.values()]
+    trace_B = [float(item["trace_B"]) for item in payload.values()]
+
+    fisher_timings = sorted(
+        {
+            str(item.get("fisher_timing", item.get("collect_timing", "")))
+            for item in payload.values()
+            if str(item.get("fisher_timing", item.get("collect_timing", ""))) != ""
+        }
+    )
+    model_modes = sorted(
+        {
+            str(item.get("model_mode", ""))
+            for item in payload.values()
+            if str(item.get("model_mode", "")) != ""
+        }
+    )
+
+    return {
+        "num_layers": int(len(payload)),
+        "total_count": int(sum(counts)),
+        "mean_count": float(sum(counts) / max(len(counts), 1)),
+        "mean_trace_A": float(sum(trace_A) / max(len(trace_A), 1)),
+        "mean_trace_B": float(sum(trace_B) / max(len(trace_B), 1)),
+        "max_trace_A": float(max(trace_A)),
+        "max_trace_B": float(max(trace_B)),
+        "fisher_timing": (
+            fisher_timings[0]
+            if len(fisher_timings) == 1
+            else ",".join(fisher_timings)
+        ),
+        "model_mode": (
+            model_modes[0]
+            if len(model_modes) == 1
+            else ",".join(model_modes)
+        ),
+    }
+
+
+def _is_expert_linear(
+    module_name: str,
+    module: nn.Module,
+    expert_name_pattern: str,
+) -> bool:
+    """判断一个 module 是否是 expert 内部的 Linear 层。"""
+    if not isinstance(module, nn.Linear):
+        return False
+
+    if expert_name_pattern not in module_name:
+        return False
+
+    return True
+
+
+def _flatten_last_dim(
+    tensor: torch.Tensor,
+    expected_dim: int,
+    tensor_name: str,
+) -> torch.Tensor:
+    """
+    把 Linear 的输入或 grad_output 展平成 [num_items, feature_dim]。
+
+    支持：
+        [N, D]
+        [B, N, D]
+        [B, ..., D]
+    """
+    if tensor is None:
+        raise ValueError(f"{tensor_name} 为空。")
+
+    if tensor.dim() == 0:
+        raise ValueError(f"{tensor_name} 维度错误：{tuple(tensor.shape)}")
+
+    if tensor.size(-1) != int(expected_dim):
+        raise ValueError(
+            f"{tensor_name} 最后一维不匹配："
+            f"实际={tensor.size(-1)}, 期望={expected_dim}, "
+            f"shape={tuple(tensor.shape)}"
+        )
+
+    if tensor.dim() == 1:
+        return tensor.reshape(1, -1)
+
+    return tensor.reshape(-1, tensor.size(-1))
+
+
+def _build_sum_criterion(
+    cfg: Any,
+    fallback_criterion: Optional[nn.Module] = None,
+) -> nn.Module:
+    """
+    构建 K-FAC 采集用 loss。
+
+    这里强制 reduction='sum'。
+    如果直接复用训练时 CrossEntropyLoss 的 mean reduction，
+    backward 得到的 delta 会被 batch size 缩小，K-FAC 尺度会不稳定。
+    """
+    label_smoothing = float(_cfg_get(cfg, "label_smooth", 0.0))
+
+    if isinstance(fallback_criterion, nn.CrossEntropyLoss):
+        label_smoothing = float(
+            getattr(fallback_criterion, "label_smoothing", label_smoothing)
+        )
+        ignore_index = int(getattr(fallback_criterion, "ignore_index", -100))
+        weight = getattr(fallback_criterion, "weight", None)
+
+        return nn.CrossEntropyLoss(
+            weight=weight,
+            ignore_index=ignore_index,
+            reduction="sum",
+            label_smoothing=label_smoothing,
+        )
+
+    return nn.CrossEntropyLoss(
+        reduction="sum",
+        label_smoothing=label_smoothing,
+    )
+
+
+def _infer_model_device(model: nn.Module) -> torch.device:
+    """从模型参数推断 device。"""
+    try:
+        return next(model.parameters()).device
+    except StopIteration as exc:
+        raise ValueError("模型没有参数，无法推断 device。") from exc
+
+
+
+def validate_method_config(cfg: Mapping[str, Any]) -> None:
+    """检查 K-FAC / FedFisher expert 聚合配置。"""
+    kfac_cfg = cfg.get("kfac", {})
+
+    if not isinstance(kfac_cfg, Mapping):
+        raise ConfigError("kfac 必须是 dict。")
+
+    weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
+    if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
+        raise ConfigError(
+            f"不支持的 kfac.weight_mode：{weight_mode}。"
+            "当前支持：routed_count, sample_weighted, uniform"
+        )
+
+    solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
+    if solve_scope not in {"per_layer", "global_expert"}:
+        raise ConfigError(
+            f"不支持的 kfac.solve_scope：{solve_scope}。"
+            "当前支持：per_layer, global_expert"
+        )
+
+    solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
+    if solve_mode not in {"cg", "gd", "adam"}:
+        raise ConfigError(
+            f"不支持的 kfac.solve_mode：{solve_mode}。"
+            "当前支持：cg, gd, adam"
+        )
+
+    if solve_scope == "global_expert" and solve_mode == "cg":
+        raise ConfigError(
+            "kfac.solve_scope=global_expert 时不建议使用 solve_mode=cg。"
+            "请使用 gd 或 adam。"
+        )
+
+    if solve_scope == "per_layer" and solve_mode in {"gd", "adam"}:
+        raise ConfigError(
+            "kfac.solve_scope=per_layer 当前只支持 solve_mode=cg。"
+            "如果要使用 gd/adam，请设置 solve_scope=global_expert。"
+        )
+
+    server_steps = int(kfac_cfg.get("server_steps", 5))
+    if server_steps < 0:
+        raise ConfigError(
+            f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
+        )
+
+    server_lr = float(kfac_cfg.get("server_lr", 0.01))
+    if server_lr <= 0:
+        raise ConfigError(
+            f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
+        )
+
+    adam_beta1 = float(kfac_cfg.get("adam_beta1", 0.9))
+    adam_beta2 = float(kfac_cfg.get("adam_beta2", 0.99))
+
+    if not (0.0 <= adam_beta1 < 1.0):
+        raise ConfigError(
+            f"kfac.adam_beta1 必须在 [0, 1) 范围内，当前值：{adam_beta1}"
+        )
+
+    if not (0.0 <= adam_beta2 < 1.0):
+        raise ConfigError(
+            f"kfac.adam_beta2 必须在 [0, 1) 范围内，当前值：{adam_beta2}"
+        )
+
+    adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
+    if adam_eps <= 0:
+        raise ConfigError(
+            f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
+        )
+
+    cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
+    if cg_tol < 0:
+        raise ConfigError(
+            f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
+        )
+
+    damping = float(kfac_cfg.get("damping", 0.0))
+    if damping < 0:
+        raise ConfigError(
+            f"kfac.damping 不能小于 0，当前值：{damping}"
+        )
+
+    min_count = int(kfac_cfg.get("min_count", 1))
+    if min_count <= 0:
+        raise ConfigError(
+            f"kfac.min_count 必须大于 0，当前值：{min_count}"
+        )
+
+    max_batches = int(kfac_cfg.get("max_batches", 0))
+    if max_batches < 0:
+        raise ConfigError(
+            f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
+        )
+
+    fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
+    if fallback not in {"none", "sample_weighted"}:
+        raise ConfigError(
+            f"不支持的 kfac.fallback：{fallback}。"
+            "当前支持：none, sample_weighted"
+        )
+
+    fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
+    if fisher_timing != "after_train":
+        raise ConfigError(
+            f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
+        )
+
+    model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
+    if model_mode not in {"eval", "train"}:
+        raise ConfigError(
+            f"不支持的 kfac.model_mode：{model_mode}。"
+            "当前支持：eval, train"
+        )
+
+    model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
+    if model_selection != "final_step":
+        raise ConfigError(
+            "当前主实验不支持 server validation 选 best，"
+            f"kfac.model_selection 必须是 final_step，当前值：{model_selection}"
+        )
+
+    use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
+    if use_server_validation:
+        raise ConfigError(
+            "当前主实验不使用 server validation，"
+            "请设置 kfac.use_server_validation=false。"
+        )
 
 
 
@@ -1677,6 +2305,127 @@ def _cfg_get(
     return getattr(cfg, key, default)
 
 
+def collect_method_evidence(
+    *,
+    model: nn.Module,
+    evidence_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device | str,
+    cfg: Any,
+) -> Dict[str, Any]:
+    """Collect the same post-train expert evidence previously owned by base.py."""
+    expert_kfac_timing = str(
+        _cfg_get(
+            cfg,
+            "kfac.fisher_timing",
+            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
+        )
+    ).lower().strip()
+
+    if expert_kfac_timing != "after_train":
+        raise ValueError(
+            "当前 K-FAC 采集只支持 kfac.fisher_timing=after_train。"
+            f"当前值：{expert_kfac_timing}。"
+            "请不要在本地训练过程中混合统计 K-FAC。"
+        )
+
+    expert_kfac = collect_expert_kfac(
+        model=model,
+        train_loader=evidence_loader,
+        criterion=criterion,
+        device=device,
+        cfg=cfg,
+    )
+    expert_kfac_summary = summarize_expert_kfac(expert_kfac)
+
+    return {
+        "expert_kfac": expert_kfac,
+        "expert_kfac_summary": expert_kfac_summary,
+        "expert_kfac_timing": expert_kfac_timing,
+    }
+
+
+def build_method_client_diagnostics(
+    update: ClientUpdate,
+) -> Dict[str, Any]:
+    """Expose only lightweight method diagnostics to the shared server summary."""
+    extra = dict(update.extra or {})
+    return {
+        "expert_kfac_summary": extra.get("expert_kfac_summary", None),
+    }
+
+
+
+def register_method_cli_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register Fisher/K-FAC-only command-line overrides."""
+    parser.add_argument("--server-lr", type=float, default=None)
+    parser.add_argument("--server-steps", type=int, default=None)
+    parser.add_argument(
+        "--weight-mode",
+        choices=("routed_count", "sample_weighted", "uniform"),
+        default=None,
+    )
+    parser.add_argument(
+        "--solve-scope",
+        choices=("per_layer", "global_expert"),
+        default=None,
+    )
+    parser.add_argument(
+        "--solve-mode",
+        choices=("cg", "gd", "adam"),
+        default=None,
+    )
+    parser.add_argument("--adam-beta1", type=float, default=None)
+    parser.add_argument("--adam-beta2", type=float, default=None)
+    parser.add_argument("--adam-eps", type=float, default=None)
+    parser.add_argument("--cg-tol", type=float, default=None)
+    parser.add_argument("--damping", type=float, default=None)
+    parser.add_argument("--min-count", type=int, default=None)
+    parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument(
+        "--fallback",
+        choices=("none", "sample_weighted"),
+        default=None,
+    )
+    parser.add_argument(
+        "--model-mode",
+        choices=("eval", "train"),
+        default=None,
+    )
+
+
+def build_method_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    """Map explicit Fisher CLI values to the nested kfac configuration."""
+    kfac_overrides: Dict[str, Any] = {}
+
+    mappings = (
+        ("server_lr", "server_lr"),
+        ("server_steps", "server_steps"),
+        ("weight_mode", "weight_mode"),
+        ("solve_scope", "solve_scope"),
+        ("solve_mode", "solve_mode"),
+        ("adam_beta1", "adam_beta1"),
+        ("adam_beta2", "adam_beta2"),
+        ("adam_eps", "adam_eps"),
+        ("cg_tol", "cg_tol"),
+        ("damping", "damping"),
+        ("min_count", "min_count"),
+        ("max_batches", "max_batches"),
+        ("fallback", "fallback"),
+        ("model_mode", "model_mode"),
+    )
+
+    for arg_name, config_key in mappings:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            kfac_overrides[config_key] = value
+
+    if not kfac_overrides:
+        return {}
+
+    return {"kfac": kfac_overrides}
+
+
 def build_expert_aggregator(cfg: Any) -> base.Aggregator:
     """Build the expert-only Fisher/K-FAC aggregator injected into base.py."""
     return FisherKFACExpertAggregator(
@@ -1690,6 +2439,12 @@ def main() -> int:
         expert_aggregator_builder=build_expert_aggregator,
         embedded_method_config=EMBEDDED_METHOD_CONFIG,
         expert_method_name=ALGORITHM_NAME,
+        method_config_defaults=METHOD_CONFIG_DEFAULTS,
+        method_config_validator=validate_method_config,
+        expert_evidence_collector=collect_method_evidence,
+        method_client_diagnostics_builder=build_method_client_diagnostics,
+        method_cli_argument_registrar=register_method_cli_arguments,
+        method_cli_overrides_builder=build_method_cli_overrides,
     )
 
 
