@@ -190,21 +190,57 @@ _prepare_deterministic_env_before_torch()
 
 
 # ============================================================================
-# Bundled from utils/config.py
+# Consolidated imports; keep this block after the deterministic bootstrap.
 # ============================================================================
 
+import argparse
 import copy
+import csv
+import gc
+import json
+import math
+import random
 import re
-from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+import threading
+import traceback
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    TextIO,
+    Tuple,
+)
 
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import yaml
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import datasets, transforms
+from tqdm.auto import tqdm
+
+
+# ============================================================================
+# Bundled from utils/config.py
+# ============================================================================
 
 
 # =========================
 # 可扩展的合法取值注册区
 # =========================
-# 后续新增数据集、模型、聚合算法时，优先改这里。
+# 后续新增数据集、模型时，优先改这里。
 
 SUPPORTED_DATASETS = {
     "cifar10",
@@ -212,14 +248,7 @@ SUPPORTED_DATASETS = {
 }
 
 SUPPORTED_MODELS = {
-    "resnet_switch_moe",
     "resnet_sparse_moe_head",
-}
-
-SUPPORTED_AGG_METHODS = {
-    "uniform",
-    "sample_weighted",
-    "fisher_kfac_expert",
 }
 
 
@@ -239,7 +268,7 @@ class ConfigNode:
         cfg.agg.expert.method
 
     也支持路径读取：
-        cfg.get("agg.non_expert.method", "sample_weighted")
+        cfg.get("agg.non_expert.method", "uniform")
         cfg.get("agg.expert.method", "uniform")
     """
 
@@ -266,9 +295,8 @@ class ConfigNode:
         按路径读取配置。
 
         示例：
-            cfg.get("agg.non_expert.method", "sample_weighted")
+            cfg.get("agg.non_expert.method", "uniform")
             cfg.get("agg.expert.method", "uniform")
-            cfg.get("checkpoint.enabled", True)
         """
         current: Any = self
 
@@ -362,11 +390,6 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "compact_uniform_weights": True,
         "collect_expert_usage": True,
         "expert_usage_max_batches": 0,
-    },
-    "checkpoint": {
-        "enabled": True,
-        "save_latest": True,
-        "save_best": True,
     },
 }
 
@@ -677,12 +700,6 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # 如果觉得慢，可以在实验配置里改成 5 或 10。
     cfg["logging"].setdefault("expert_usage_max_batches", 0)
 
-    # checkpoint 配置
-    cfg.setdefault("checkpoint", {})
-    cfg["checkpoint"].setdefault("enabled", True)
-    cfg["checkpoint"].setdefault("save_latest", True)
-    cfg["checkpoint"].setdefault("save_best", True)
-
     return cfg
 
 
@@ -845,16 +862,16 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     non_expert_method = agg_cfg.get("non_expert", {}).get("method")
     expert_method = agg_cfg.get("expert", {}).get("method")
 
-    if non_expert_method not in SUPPORTED_AGG_METHODS:
+    if str(non_expert_method).lower().strip() != "uniform":
         raise ConfigError(
-            f"不支持的非专家参数聚合方法：{non_expert_method}。"
-            f"当前支持：{sorted(SUPPORTED_AGG_METHODS)}"
+            "base.py 已固定 non_expert 使用 uniform 聚合，"
+            f"当前配置却是 {non_expert_method!r}。"
         )
 
-    if expert_method not in SUPPORTED_AGG_METHODS:
+    if not isinstance(expert_method, str) or not expert_method.strip():
         raise ConfigError(
-            f"不支持的专家参数聚合方法：{expert_method}。"
-            f"当前支持：{sorted(SUPPORTED_AGG_METHODS)}"
+            "agg.expert.method 必须是非空字符串。"
+            "具体专家聚合方法由启动脚本注入，base.py 不维护方法白名单。"
         )
 
     _require_positive_int(cfg, "num_classes")
@@ -1092,13 +1109,6 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
 # Bundled from utils/seed.py
 # ============================================================================
 
-import os
-import random
-from typing import Optional
-
-import numpy as np
-import torch
-
 
 def disable_tf32() -> None:
     """
@@ -1243,13 +1253,6 @@ def build_torch_generator(seed: int) -> torch.Generator:
 # ============================================================================
 # Bundled from utils/logging.py
 # ============================================================================
-
-import re
-import sys
-import threading
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Iterator, TextIO
 
 
 class TeeStream:
@@ -1415,11 +1418,6 @@ def tee_output_to_file(
 # Bundled from utils/state_dict_ops.py
 # ============================================================================
 
-import math
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
-
-import torch
-
 
 StateDict = Mapping[str, torch.Tensor]
 MutableStateDict = Dict[str, torch.Tensor]
@@ -1435,20 +1433,6 @@ def clone_state_dict(state_dict: StateDict) -> MutableStateDict:
     """
     return {
         name: tensor.detach().clone()
-        for name, tensor in state_dict.items()
-    }
-
-
-def detach_state_dict(state_dict: StateDict) -> MutableStateDict:
-    """
-    断开 state_dict 中 tensor 的计算图。
-
-    注意：
-        这里只 detach，不 clone。
-        如果需要完全独立副本，请使用 clone_state_dict。
-    """
-    return {
-        name: tensor.detach()
         for name, tensor in state_dict.items()
     }
 
@@ -1517,42 +1501,6 @@ def subtract_state_dict(
         delta[name] = local_tensor.detach() - global_tensor.detach()
 
     return delta
-
-
-def apply_delta(
-    base_state: StateDict,
-    delta: StateDict,
-    param_names: Optional[Iterable[str]] = None,
-    strict: bool = False,
-) -> MutableStateDict:
-    """
-    把 delta 加到 base_state 上。
-
-    公式：
-        new_state = base_state + delta
-
-    用途：
-        适合单个客户端更新、调试或特殊聚合。
-    """
-    new_state = clone_state_dict(base_state)
-
-    names = _resolve_param_names(
-        state_dict=base_state,
-        param_names=param_names,
-    )
-
-    for name in names:
-        if name not in delta:
-            if strict:
-                raise KeyError(f"delta 缺少参数：{name}")
-            continue
-
-        if not _is_float_tensor(new_state[name]):
-            continue
-
-        new_state[name] = new_state[name] + delta[name].to(new_state[name].device)
-
-    return new_state
 
 
 def apply_weighted_delta(
@@ -1654,221 +1602,6 @@ def apply_weighted_delta(
     return new_state
 
 
-def weighted_average_state_dicts(
-    state_dicts: Sequence[StateDict],
-    weights: Sequence[float],
-    param_names: Optional[Iterable[str]] = None,
-    strict: bool = True,
-) -> MutableStateDict:
-    """
-    对多个 state_dict 直接做加权平均。
-
-    公式：
-        avg_state = sum_i weight_i * state_i
-
-    注意：
-        联邦学习里更推荐使用：
-            global_state + 加权 delta
-
-        这个函数主要用于诊断或特殊聚合。
-    """
-    if len(state_dicts) == 0:
-        raise ValueError("state_dicts 不能为空。")
-
-    if len(state_dicts) != len(weights):
-        raise ValueError(
-            f"state_dicts 和 weights 数量不一致："
-            f"{len(state_dicts)} vs {len(weights)}"
-        )
-
-    normalized_weights = normalize_weight_list(weights)
-
-    reference_state = state_dicts[0]
-    names = _resolve_param_names(
-        state_dict=reference_state,
-        param_names=param_names,
-    )
-
-    result = clone_state_dict(reference_state)
-
-    for name in names:
-        reference_tensor = reference_state[name]
-
-        if not _is_float_tensor(reference_tensor):
-            continue
-
-        avg_tensor = torch.zeros_like(reference_tensor)
-
-        for state, weight in zip(state_dicts, normalized_weights):
-            if name not in state:
-                if strict:
-                    raise KeyError(f"某个 state_dict 缺少参数：{name}")
-                continue
-
-            if not _is_float_tensor(state[name]):
-                continue
-
-            avg_tensor = avg_tensor + float(weight) * state[name].to(reference_tensor.device)
-
-        result[name] = avg_tensor
-
-    return result
-
-
-def scale_state_dict(
-    state_dict: StateDict,
-    scale: float,
-    param_names: Optional[Iterable[str]] = None,
-) -> MutableStateDict:
-    """
-    对 state_dict 中的浮点 tensor 乘一个系数。
-    """
-    result = clone_state_dict(state_dict)
-
-    names = _resolve_param_names(
-        state_dict=state_dict,
-        param_names=param_names,
-    )
-
-    for name in names:
-        if _is_float_tensor(result[name]):
-            result[name] = result[name] * float(scale)
-
-    return result
-
-
-def add_state_dicts(
-    state_a: StateDict,
-    state_b: StateDict,
-    param_names: Optional[Iterable[str]] = None,
-    strict: bool = True,
-) -> MutableStateDict:
-    """
-    两个 state_dict 相加。
-
-    只处理浮点 tensor。
-    非浮点 tensor 保留 state_a 的值。
-    """
-    result = clone_state_dict(state_a)
-
-    names = _resolve_param_names(
-        state_dict=state_a,
-        param_names=param_names,
-    )
-
-    for name in names:
-        if name not in state_b:
-            if strict:
-                raise KeyError(f"state_b 缺少参数：{name}")
-            continue
-
-        if _is_float_tensor(result[name]) and _is_float_tensor(state_b[name]):
-            result[name] = result[name] + state_b[name].to(result[name].device)
-
-    return result
-
-
-def subtract_state_dicts(
-    state_a: StateDict,
-    state_b: StateDict,
-    param_names: Optional[Iterable[str]] = None,
-    strict: bool = True,
-) -> MutableStateDict:
-    """
-    两个 state_dict 相减。
-
-    公式：
-        result = state_a - state_b
-
-    这个函数和 subtract_state_dict 作用类似，
-    保留它是为了让命名在通用场景下更直观。
-    """
-    return subtract_state_dict(
-        local_state=state_a,
-        global_state=state_b,
-        param_names=param_names,
-        strict=strict,
-    )
-
-
-def state_dict_l2_norm(
-    state_dict: StateDict,
-    param_names: Optional[Iterable[str]] = None,
-) -> float:
-    """
-    计算 state_dict 中所有浮点 tensor 的整体 L2 norm。
-
-    用途：
-        1. 诊断客户端更新幅度
-        2. 诊断专家参数变化大小
-        3. 后面 history filter 也可能会用到
-    """
-    names = _resolve_param_names(
-        state_dict=state_dict,
-        param_names=param_names,
-    )
-
-    total = 0.0
-
-    for name in names:
-        tensor = state_dict[name]
-
-        if not _is_float_tensor(tensor):
-            continue
-
-        value = tensor.detach().float().pow(2).sum().item()
-        total += value
-
-    return math.sqrt(total)
-
-
-def state_dict_cosine_similarity(
-    state_a: StateDict,
-    state_b: StateDict,
-    param_names: Optional[Iterable[str]] = None,
-    eps: float = 1e-12,
-) -> float:
-    """
-    计算两个 state_dict 的余弦相似度。
-
-    用途：
-        后面做方向诊断、history filter 时会用到。
-    """
-    names = _resolve_param_names(
-        state_dict=state_a,
-        param_names=param_names,
-    )
-
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-
-    for name in names:
-        if name not in state_b:
-            continue
-
-        tensor_a = state_a[name]
-        tensor_b = state_b[name]
-
-        if not _is_float_tensor(tensor_a):
-            continue
-
-        if not _is_float_tensor(tensor_b):
-            continue
-
-        a = tensor_a.detach().float().reshape(-1)
-        b = tensor_b.detach().float().reshape(-1)
-
-        dot += torch.dot(a, b).item()
-        norm_a += torch.dot(a, a).item()
-        norm_b += torch.dot(b, b).item()
-
-    if norm_a <= eps or norm_b <= eps:
-        return 0.0
-
-    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b) + eps)
-
-
 def check_finite_state_dict(
     state_dict: StateDict,
     param_names: Optional[Iterable[str]] = None,
@@ -1926,59 +1659,6 @@ def normalize_weights(weights: Mapping[int, float]) -> Dict[int, float]:
         int(client_id): float(weight) / total
         for client_id, weight in weights.items()
     }
-
-
-def normalize_weight_list(weights: Sequence[float]) -> List[float]:
-    """
-    把权重列表归一化到和为 1。
-    """
-    if len(weights) == 0:
-        raise ValueError("weights 不能为空。")
-
-    total = 0.0
-
-    for weight in weights:
-        weight = float(weight)
-
-        if not math.isfinite(weight):
-            raise ValueError(f"存在非有限权重：{weight}")
-
-        if weight < 0:
-            raise ValueError(f"存在负权重：{weight}")
-
-        total += weight
-
-    if total <= 0:
-        raise ValueError(f"weights 总和必须大于 0，当前总和：{total}")
-
-    return [
-        float(weight) / total
-        for weight in weights
-    ]
-
-
-def select_state_dict(
-    state_dict: StateDict,
-    param_names: Iterable[str],
-    strict: bool = True,
-) -> MutableStateDict:
-    """
-    从 state_dict 中选出一部分参数。
-
-    用途：
-        后面可以用于单独查看专家参数或非专家参数。
-    """
-    selected: MutableStateDict = {}
-
-    for name in param_names:
-        if name not in state_dict:
-            if strict:
-                raise KeyError(f"state_dict 中不存在参数：{name}")
-            continue
-
-        selected[name] = state_dict[name].detach().clone()
-
-    return selected
 
 
 def _resolve_param_names(
@@ -2054,13 +1734,6 @@ def _get_model_delta(update: Any) -> Mapping[str, torch.Tensor]:
 # ============================================================================
 # Bundled from utils/eval.py
 # ============================================================================
-
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
 
 
 @dataclass(frozen=True)
@@ -2421,12 +2094,6 @@ def count_topk_correct(
 # Bundled from data/datasets.py
 # ============================================================================
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
-
-from torchvision import datasets, transforms
-
 
 # =========================
 # 数据集元信息注册区
@@ -2663,16 +2330,6 @@ def get_dataset_info(dataset_name: str) -> Dict[str, Any]:
     return dict(DATASET_INFO[dataset_name])
 
 
-def get_num_classes(dataset_name: str) -> int:
-    """获取数据集类别数。"""
-    return int(get_dataset_info(dataset_name)["num_classes"])
-
-
-def get_input_shape(dataset_name: str) -> Tuple[int, int, int]:
-    """获取输入图片形状。"""
-    return tuple(get_dataset_info(dataset_name)["input_shape"])
-
-
 def get_normalization_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     """
     获取数据集归一化均值和标准差。
@@ -2684,11 +2341,6 @@ def get_normalization_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple
 # ============================================================================
 # Bundled from data/partition.py
 # ============================================================================
-
-from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
-
-import numpy as np
 
 
 @dataclass(frozen=True)
@@ -3070,13 +2722,6 @@ def _validate_num_clients(num_clients: int) -> None:
 # Bundled from data/loaders.py
 # ============================================================================
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
-
-import torch
-from torch.utils.data import DataLoader, Dataset, Subset
-
-
 
 @dataclass(frozen=True)
 class DataLoaderBundle:
@@ -3362,884 +3007,8 @@ def _infer_pin_memory(cfg: Any) -> bool:
 
 
 # ============================================================================
-# Bundled from models/resnet_switch_moe.py
-# ============================================================================
-
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import resnet18, resnet34, resnet50
-
-
-@dataclass(frozen=True)
-class SwitchFeedForwardOutput:
-    """
-    Switch FFN 的输出。
-
-    hidden_states:
-        MoE FFN 输出后的 token 表示。
-
-    router_info:
-        路由诊断信息。
-        注意：这里会计算 aux_loss，但模型不会把它加进训练 loss。
-        训练代码默认仍然只使用 CrossEntropyLoss。
-    """
-
-    hidden_states: torch.Tensor
-    router_info: Dict[str, torch.Tensor]
-
-
-@dataclass(frozen=True)
-class ResNetSwitchMoEOutput:
-    """
-    ResNetSwitchMoE 的输出。
-
-    默认训练时不需要这个结构，直接返回 logits 即可。
-    当需要分析 router / expert usage 时，可以设置 return_router_info=True。
-    """
-
-    logits: torch.Tensor
-    router_info: Dict[str, Any]
-
-
-class ResNetTokenizer(nn.Module):
-    """
-    ResNet 图像 tokenizer。
-
-    作用：
-        把输入图片变成 token 序列。
-
-    对 CIFAR10 / CIFAR100：
-        输入图片形状：
-            [B, 3, 32, 32]
-
-        CIFAR-style ResNet18 输出特征图：
-            [B, 512, 4, 4]
-
-        经过 1x1 Conv 投影到 hidden_dim：
-            [B, hidden_dim, 4, 4]
-
-        flatten 后变成 token：
-            [B, 16, hidden_dim]
-
-    这里借鉴 vsmc 的结构：
-        1. 使用 ResNet 作为图像 backbone/tokenizer
-        2. 对 CIFAR 小图，把 conv1 改成 3x3 stride=1
-        3. 去掉 maxpool，避免过早下采样
-        4. 最后使用 1x1 Conv 投影到 Transformer hidden_dim
-    """
-
-    def __init__(
-        self,
-        backbone_name: str = "resnet18",
-        in_channels: int = 3,
-        hidden_dim: int = 128,
-        image_size: int = 32,
-    ) -> None:
-        super().__init__()
-
-        self.backbone_name = str(backbone_name).lower()
-        self.in_channels = int(in_channels)
-        self.hidden_dim = int(hidden_dim)
-        self.image_size = int(image_size)
-
-        backbone, backbone_out_dim = self._build_resnet_backbone(
-            backbone_name=self.backbone_name,
-            in_channels=self.in_channels,
-            image_size=self.image_size,
-        )
-
-        self.backbone = backbone
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(
-                backbone_out_dim,
-                hidden_dim,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=False,
-            ),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        self.num_image_tokens = self._infer_num_image_tokens()
-
-    @staticmethod
-    def _build_resnet_backbone(
-        backbone_name: str,
-        in_channels: int,
-        image_size: int,
-    ) -> Tuple[nn.Module, int]:
-        """
-        构建 ResNet backbone。
-
-        当前支持：
-            resnet18
-            resnet34
-            resnet50
-
-        对 CIFAR 小图：
-            conv1 = 3x3, stride=1, padding=1
-            maxpool = Identity
-
-        这样 32x32 输入经过 layer2/layer3/layer4 三次下采样后，
-        空间分辨率变成 4x4。
-        """
-        if backbone_name == "resnet18":
-            model = resnet18(weights=None)
-            out_dim = 512
-        elif backbone_name == "resnet34":
-            model = resnet34(weights=None)
-            out_dim = 512
-        elif backbone_name == "resnet50":
-            model = resnet50(weights=None)
-            out_dim = 2048
-        else:
-            raise ValueError(
-                f"不支持的 backbone_name：{backbone_name}。"
-                "当前支持：resnet18, resnet34, resnet50"
-            )
-
-        if image_size <= 32:
-            model.conv1 = nn.Conv2d(
-                in_channels,
-                64,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=False,
-            )
-            model.maxpool = nn.Identity()
-        else:
-            model.conv1 = nn.Conv2d(
-                in_channels,
-                64,
-                kernel_size=7,
-                stride=2,
-                padding=3,
-                bias=False,
-            )
-
-        backbone = nn.Sequential(
-            model.conv1,
-            model.bn1,
-            model.relu,
-            model.maxpool,
-            model.layer1,
-            model.layer2,
-            model.layer3,
-            model.layer4,
-        )
-
-        return backbone, out_dim
-
-    def _infer_num_image_tokens(self) -> int:
-        """
-        用一次 dummy forward 推断图像 token 数量。
-
-        CIFAR10 默认是：
-            [1, 3, 32, 32] -> [1, hidden_dim, 4, 4]
-            token 数量 = 4 * 4 = 16
-        """
-        was_training = self.training
-        self.eval()
-
-        with torch.no_grad():
-            x = torch.zeros(
-                1,
-                self.in_channels,
-                self.image_size,
-                self.image_size,
-            )
-            feat = self.proj(self.backbone(x))
-            num_tokens = int(feat.shape[-2] * feat.shape[-1])
-
-        if was_training:
-            self.train()
-
-        return num_tokens
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播。
-
-        输入：
-            x:
-                [B, C, H, W]
-
-        输出：
-            tokens:
-                [B, num_image_tokens, hidden_dim]
-        """
-        feat = self.backbone(x)
-        feat = self.proj(feat)
-
-        tokens = feat.flatten(2).transpose(1, 2).contiguous()
-        return tokens
-
-
-class SwitchFeedForward(nn.Module):
-    """
-    Top-k Switch Feed-Forward MoE。
-
-    这是 Transformer block 中替代普通 FFN 的 MoE 模块。
-
-    输入：
-        x: [B, N, hidden_dim]
-
-    路由流程：
-        1. router 得到每个 token 到每个 expert 的 logits
-        2. softmax 得到 router_probs
-        3. top-k 选择 expert
-        4. 被选中的 expert 处理对应 token
-        5. 用 router 权重加权 expert 输出
-
-    注意：
-        这里支持 topk=1 / topk=2 / topk>2。
-        topk=1 时就退化成标准 Switch Transformer 风格的 top-1 routing。
-
-    本文件只实现模型结构。
-    不在这里把 aux_loss 加入训练 loss。
-    不实现 router balance / entropy / diversity / consistency。
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        ffn_dim: int,
-        num_experts: int,
-        topk: int = 1,
-        dropout: float = 0.1,
-        renormalize_topk_probs: bool = False,
-    ) -> None:
-        super().__init__()
-
-        if num_experts <= 0:
-            raise ValueError(f"num_experts 必须大于 0，当前值：{num_experts}")
-
-        if topk <= 0:
-            raise ValueError(f"topk 必须大于 0，当前值：{topk}")
-
-        if topk > num_experts:
-            raise ValueError(
-                f"topk 不能大于 num_experts，当前 topk={topk}, "
-                f"num_experts={num_experts}"
-            )
-
-        self.hidden_dim = int(hidden_dim)
-        self.ffn_dim = int(ffn_dim)
-        self.num_experts = int(num_experts)
-        self.topk = int(topk)
-        self.renormalize_topk_probs = bool(renormalize_topk_probs)
-
-        self.router = nn.Linear(
-            hidden_dim,
-            num_experts,
-            bias=False,
-        )
-
-        self.experts = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(hidden_dim, ffn_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(ffn_dim, hidden_dim),
-                    nn.Dropout(dropout),
-                )
-                for _ in range(num_experts)
-            ]
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_router_info: bool = False,
-    ) -> torch.Tensor | SwitchFeedForwardOutput:
-        """
-        前向传播。
-
-        输入：
-            x:
-                [B, N, hidden_dim]
-
-        输出：
-            hidden_states:
-                [B, N, hidden_dim]
-        """
-        batch_size, num_tokens, hidden_dim = x.shape
-
-        if hidden_dim != self.hidden_dim:
-            raise ValueError(
-                f"输入 hidden_dim 不匹配：当前输入={hidden_dim}, "
-                f"模型期望={self.hidden_dim}"
-            )
-
-        x_flat = x.reshape(batch_size * num_tokens, hidden_dim)
-
-        router_logits = self.router(x_flat)
-        router_probs = F.softmax(router_logits.float(), dim=-1)
-
-        topk_probs, topk_indices = torch.topk(
-            router_probs,
-            k=self.topk,
-            dim=-1,
-        )
-
-        if self.renormalize_topk_probs:
-            topk_probs = topk_probs / topk_probs.sum(
-                dim=-1,
-                keepdim=True,
-            ).clamp_min(1e-12)
-
-        topk_probs = topk_probs.to(dtype=x.dtype)
-
-        output_flat = torch.zeros_like(x_flat)
-
-        for expert_id, expert in enumerate(self.experts):
-            selected_mask = topk_indices == expert_id
-            token_mask = selected_mask.any(dim=-1)
-
-            if not token_mask.any():
-                continue
-
-            expert_input = x_flat[token_mask]
-            expert_output = expert(expert_input)
-
-            selected_weights = (
-                topk_probs[token_mask]
-                * selected_mask[token_mask].to(dtype=topk_probs.dtype)
-            ).sum(dim=-1)
-
-            output_flat[token_mask] = (
-                output_flat[token_mask]
-                + expert_output * selected_weights.unsqueeze(-1)
-            )
-
-        output = output_flat.reshape(batch_size, num_tokens, hidden_dim)
-
-        if not return_router_info:
-            return output
-
-        router_probs_view = router_probs.reshape(
-            batch_size,
-            num_tokens,
-            self.num_experts,
-        )
-        router_logits_view = router_logits.reshape(
-            batch_size,
-            num_tokens,
-            self.num_experts,
-        )
-        topk_indices_view = topk_indices.reshape(
-            batch_size,
-            num_tokens,
-            self.topk,
-        )
-        topk_probs_view = topk_probs.reshape(
-            batch_size,
-            num_tokens,
-            self.topk,
-        )
-
-        expert_one_hot = F.one_hot(
-            topk_indices,
-            num_classes=self.num_experts,
-        ).to(dtype=torch.float32)
-
-        expert_counts = expert_one_hot.sum(dim=(0, 1))
-
-        sample_expert_counts = expert_one_hot.sum(dim=1).reshape(
-            batch_size,
-            num_tokens,
-            self.num_experts,
-        ).sum(dim=1)
-
-        density = expert_counts / max(float(batch_size * num_tokens * self.topk), 1.0)
-        density_proxy = router_probs.mean(dim=0)
-
-        aux_loss = self.num_experts * torch.sum(
-            density.to(router_probs.device) * density_proxy
-        )
-
-        router_info = {
-            "aux_loss": aux_loss,
-            "expert_counts": expert_counts.to(x.device),
-            "sample_expert_counts": sample_expert_counts.to(x.device),
-            "selected_experts": topk_indices_view,
-            "topk_probs": topk_probs_view,
-            "router_probs": router_probs_view.to(dtype=x.dtype),
-            "router_logits": router_logits_view.to(dtype=x.dtype),
-        }
-
-        return SwitchFeedForwardOutput(
-            hidden_states=output,
-            router_info=router_info,
-        )
-
-
-class SwitchTransformerBlock(nn.Module):
-    """
-    Switch Transformer Block。
-
-    结构：
-        x
-          ↓
-        LayerNorm
-          ↓
-        Multihead Self-Attention
-          ↓
-        Residual
-          ↓
-        LayerNorm
-          ↓
-        SwitchFeedForward MoE
-          ↓
-        Residual
-
-    这个 block 里没有额外的 router balance / entropy / diversity /
-    consistency 正则项。
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        ffn_dim: int,
-        num_experts: int,
-        topk: int,
-        dropout: float = 0.1,
-        renormalize_topk_probs: bool = False,
-    ) -> None:
-        super().__init__()
-
-        self.attn_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.attn_dropout = nn.Dropout(dropout)
-
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.switch_ffn = SwitchFeedForward(
-            hidden_dim=hidden_dim,
-            ffn_dim=ffn_dim,
-            num_experts=num_experts,
-            topk=topk,
-            dropout=dropout,
-            renormalize_topk_probs=renormalize_topk_probs,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_router_info: bool = False,
-    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        前向传播。
-        """
-        attn_input = self.attn_norm(x)
-        attn_output, _ = self.attn(
-            attn_input,
-            attn_input,
-            attn_input,
-            need_weights=False,
-        )
-        x = x + self.attn_dropout(attn_output)
-
-        ffn_input = self.ffn_norm(x)
-
-        if not return_router_info:
-            ffn_output = self.switch_ffn(
-                ffn_input,
-                return_router_info=False,
-            )
-            x = x + ffn_output
-            return x
-
-        ffn_result = self.switch_ffn(
-            ffn_input,
-            return_router_info=True,
-        )
-        x = x + ffn_result.hidden_states
-
-        return x, ffn_result.router_info
-
-
-class ResNetSwitchMoE(nn.Module):
-    """
-    ResNet + Switch Transformer MoE 分类模型。
-
-    整体结构：
-        image
-          ↓
-        ResNetTokenizer
-          ↓
-        image tokens
-          ↓
-        拼接 CLS token
-          ↓
-        加 position embedding
-          ↓
-        SwitchTransformerBlock × switch_layers
-          ↓
-        LayerNorm
-          ↓
-        取 CLS token
-          ↓
-        Linear classifier
-          ↓
-        logits
-
-    重要说明：
-        1. 模型内部会计算 aux_loss 作为 router 诊断信息。
-        2. 本文件不会把 aux_loss 加进训练 loss。
-        3. 本文件不实现 router balance。
-        4. 本文件不实现 entropy regularization。
-        5. 本文件不实现 expert diversity regularization。
-        6. 本文件不实现 router consistency regularization。
-        7. 默认训练时 model(x) 只返回 logits。
-    """
-
-    def __init__(
-        self,
-        num_classes: int,
-        num_experts: int = 4,
-        topk: int = 1,
-        backbone_name: str = "resnet18",
-        in_channels: int = 3,
-        image_size: int = 32,
-        hidden_dim: int = 128,
-        switch_layers: int = 2,
-        switch_heads: int = 4,
-        switch_ffn_dim: int = 256,
-        dropout: float = 0.1,
-        renormalize_topk_probs: bool = False,
-    ) -> None:
-        super().__init__()
-
-        if num_classes <= 0:
-            raise ValueError(f"num_classes 必须大于 0，当前值：{num_classes}")
-
-        if switch_layers <= 0:
-            raise ValueError(f"switch_layers 必须大于 0，当前值：{switch_layers}")
-
-        if hidden_dim % switch_heads != 0:
-            raise ValueError(
-                f"hidden_dim 必须能被 switch_heads 整除，"
-                f"当前 hidden_dim={hidden_dim}, switch_heads={switch_heads}"
-            )
-
-        self.num_classes = int(num_classes)
-        self.num_experts = int(num_experts)
-        self.topk = int(topk)
-        self.hidden_dim = int(hidden_dim)
-        self.switch_layers = int(switch_layers)
-        self.switch_heads = int(switch_heads)
-        self.switch_ffn_dim = int(switch_ffn_dim)
-
-        self.tokenizer = ResNetTokenizer(
-            backbone_name=backbone_name,
-            in_channels=in_channels,
-            hidden_dim=hidden_dim,
-            image_size=image_size,
-        )
-
-        self.num_image_tokens = int(self.tokenizer.num_image_tokens)
-        self.num_tokens = self.num_image_tokens + 1
-
-        self.cls_token = nn.Parameter(
-            torch.zeros(1, 1, hidden_dim)
-        )
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_tokens, hidden_dim)
-        )
-        self.pos_dropout = nn.Dropout(dropout)
-
-        self.blocks = nn.ModuleList(
-            [
-                SwitchTransformerBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=switch_heads,
-                    ffn_dim=switch_ffn_dim,
-                    num_experts=num_experts,
-                    topk=topk,
-                    dropout=dropout,
-                    renormalize_topk_probs=renormalize_topk_probs,
-                )
-                for _ in range(switch_layers)
-            ]
-        )
-
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-
-        self._init_extra_weights()
-
-    def _init_extra_weights(self) -> None:
-        """
-        初始化 Transformer 额外参数。
-
-        ResNet backbone 使用 torchvision 默认初始化。
-        这里主要初始化：
-            cls_token
-            pos_embed
-            Linear
-            LayerNorm
-        """
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_router_info: bool = False,
-    ) -> torch.Tensor | ResNetSwitchMoEOutput:
-        """
-        前向传播。
-
-        默认：
-            logits = model(x)
-
-        调试 router 时：
-            output = model(x, return_router_info=True)
-            logits = output.logits
-            router_info = output.router_info
-
-        注意：
-            训练代码里如果只写：
-                logits = model(x)
-                loss = CrossEntropyLoss(logits, y)
-
-            那么 aux_loss 不会参与训练。
-        """
-        tokens = self.tokenizer(x)
-
-        batch_size = tokens.shape[0]
-
-        cls_tokens = self.cls_token.expand(
-            batch_size,
-            -1,
-            -1,
-        )
-
-        tokens = torch.cat(
-            [cls_tokens, tokens],
-            dim=1,
-        )
-
-        if tokens.shape[1] != self.num_tokens:
-            raise ValueError(
-                f"token 数量不匹配：当前输入 token 数={tokens.shape[1]}, "
-                f"模型初始化 token 数={self.num_tokens}"
-            )
-
-        tokens = tokens + self.pos_embed
-        tokens = self.pos_dropout(tokens)
-
-        if not return_router_info:
-            for block in self.blocks:
-                tokens = block(
-                    tokens,
-                    return_router_info=False,
-                )
-
-            tokens = self.norm(tokens)
-            cls_feature = tokens[:, 0]
-            logits = self.classifier(cls_feature)
-
-            return logits
-
-        router_info_by_layer: List[Dict[str, torch.Tensor]] = []
-        aux_losses = []
-
-        for layer_id, block in enumerate(self.blocks):
-            tokens, layer_router_info = block(
-                tokens,
-                return_router_info=True,
-            )
-
-            layer_router_info = dict(layer_router_info)
-            layer_router_info["layer_id"] = torch.tensor(
-                layer_id,
-                device=x.device,
-            )
-
-            router_info_by_layer.append(layer_router_info)
-            aux_losses.append(layer_router_info["aux_loss"])
-
-        tokens = self.norm(tokens)
-        cls_feature = tokens[:, 0]
-        logits = self.classifier(cls_feature)
-
-        aux_loss = torch.stack(aux_losses).sum() if aux_losses else torch.tensor(
-            0.0,
-            device=x.device,
-        )
-
-        router_info = {
-            "aux_loss": aux_loss,
-            "router_info_by_layer": router_info_by_layer,
-            "expert_counts_by_layer": [
-                item["expert_counts"]
-                for item in router_info_by_layer
-            ],
-            "sample_expert_counts_by_layer": [
-                item["sample_expert_counts"]
-                for item in router_info_by_layer
-            ],
-            "selected_experts_by_layer": [
-                item["selected_experts"]
-                for item in router_info_by_layer
-            ],
-            "topk_probs_by_layer": [
-                item["topk_probs"]
-                for item in router_info_by_layer
-            ],
-            "router_probs_by_layer": [
-                item["router_probs"]
-                for item in router_info_by_layer
-            ],
-            "router_logits_by_layer": [
-                item["router_logits"]
-                for item in router_info_by_layer
-            ],
-        }
-
-        return ResNetSwitchMoEOutput(
-            logits=logits,
-            router_info=router_info,
-        )
-
-
-def build_resnet_switch_moe_from_cfg(cfg: Any) -> ResNetSwitchMoE:
-    """
-    根据 cfg 构建 ResNetSwitchMoE。
-
-    推荐配置：
-
-        model: resnet_switch_moe
-        num_experts: 4
-        topk: 2
-
-        model_cfg:
-          backbone_name: resnet18
-          hidden_dim: 128
-          switch_layers: 2
-          switch_heads: 4
-          switch_ffn_dim: 256
-          dropout: 0.1
-          renormalize_topk_probs: false
-
-    注意：
-        aux_loss 不会在模型里加入训练 loss。
-        是否使用 aux_loss 由 client/trainer 决定。
-        第一版我们不使用它。
-    """
-    model_cfg = _cfg_get(cfg, "model_cfg", {})
-
-    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
-    default_in_channels = int(input_shape[0]) if input_shape is not None else 3
-    default_image_size = int(input_shape[1]) if input_shape is not None else 32
-
-    return ResNetSwitchMoE(
-        num_classes=int(_cfg_get(cfg, "num_classes")),
-        num_experts=int(_cfg_get(cfg, "num_experts", 4)),
-        topk=int(_cfg_get(cfg, "topk", 2)),
-        backbone_name=str(
-            _cfg_get(
-                model_cfg,
-                "backbone_name",
-                "resnet18",
-            )
-        ),
-        in_channels=int(
-            _cfg_get(
-                model_cfg,
-                "in_channels",
-                default_in_channels,
-            )
-        ),
-        image_size=int(
-            _cfg_get(
-                model_cfg,
-                "image_size",
-                default_image_size,
-            )
-        ),
-        hidden_dim=int(
-            _cfg_get(
-                model_cfg,
-                "hidden_dim",
-                128,
-            )
-        ),
-        switch_layers=int(
-            _cfg_get(
-                model_cfg,
-                "switch_layers",
-                2,
-            )
-        ),
-        switch_heads=int(
-            _cfg_get(
-                model_cfg,
-                "switch_heads",
-                4,
-            )
-        ),
-        switch_ffn_dim=int(
-            _cfg_get(
-                model_cfg,
-                "switch_ffn_dim",
-                256,
-            )
-        ),
-        dropout=float(
-            _cfg_get(
-                model_cfg,
-                "dropout",
-                0.1,
-            )
-        ),
-        renormalize_topk_probs=bool(
-            _cfg_get(
-                model_cfg,
-                "renormalize_topk_probs",
-                False,
-            )
-        ),
-    )
-
-
-# ============================================================================
 # Bundled from models/resnet_sparse_moe_head.py
 # ============================================================================
-
-from dataclasses import dataclass
-from typing import Any, Dict
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -4647,12 +3416,8 @@ class ResNetSparseMoEHead(nn.Module):
           -> SparseMoEHead
           -> logits [B, num_classes]
 
-    和当前 resnet_switch_moe 的主要区别：
-    - 这个模型没有 Transformer block。
-    - 这个模型没有单独 classifier。
-    - 每个 expert 自己输出 num_classes 维 logits。
-    - router / backbone 是 non-expert 参数。
-    - experts 是 expert 参数。
+    每个 expert 自己输出 num_classes 维 logits；router / backbone
+    属于 non-expert 参数，experts 属于 expert 参数。
     """
 
     def __init__(
@@ -4811,18 +3576,11 @@ def build_resnet_sparse_moe_head_from_cfg(cfg: Any) -> ResNetSparseMoEHead:
 # Bundled from models/build.py
 # ============================================================================
 
-from typing import Any, Callable, Dict, List
-
-import torch
-import torch.nn as nn
-
-
 
 ModelBuilder = Callable[[Any], nn.Module]
 
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
-    "resnet_switch_moe": build_resnet_switch_moe_from_cfg,
     "resnet_sparse_moe_head": build_resnet_sparse_moe_head_from_cfg,
 }
 
@@ -4832,11 +3590,9 @@ def build_model(cfg: Any) -> nn.Module:
     根据配置创建模型。
 
     配置示例：
-        model: resnet_switch_moe
         model: resnet_sparse_moe_head
 
     当前支持：
-        resnet_switch_moe
         resnet_sparse_moe_head
 
     后续扩展其他模型时，只需要：
@@ -4928,34 +3684,9 @@ def summarize_model(model: nn.Module) -> Dict[str, int]:
     }
 
 
-def print_model_summary(model: nn.Module) -> None:
-    """
-    打印模型参数量摘要。
-
-    这个函数主要用于调试。
-    训练主流程里后面可以选择是否调用。
-    """
-    summary = summarize_model(model)
-
-    print(
-        "[Model] "
-        f"total_params={summary['total_params']:,} | "
-        f"trainable_params={summary['trainable_params']:,}"
-    )
-
-
 # ============================================================================
 # Bundled from models/param_groups.py
 # ============================================================================
-
-import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
-
-import torch
-
-
-StateDict = Mapping[str, torch.Tensor]
 
 
 _EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
@@ -5114,62 +3845,6 @@ def get_expert_id_from_name(name: str) -> int | None:
         return None
 
     return int(match.group(1))
-
-
-def is_expert_param_name(name: str) -> bool:
-    """
-    判断一个参数名是否属于 expert。
-    """
-    return get_expert_id_from_name(name) is not None
-
-
-def is_non_expert_param_name(name: str) -> bool:
-    """
-    判断一个参数名是否属于非 expert。
-    """
-    return not is_expert_param_name(name)
-
-
-def get_param_names(
-    groups: ParamGroups,
-    param_group_name: str,
-) -> List[str]:
-    """
-    根据参数组名称获取参数名列表。
-
-    支持：
-        all
-        non_expert
-        expert
-
-    示例：
-        get_param_names(groups, "non_expert")
-        get_param_names(groups, "expert")
-    """
-    if param_group_name == "all":
-        return list(groups.all)
-
-    if param_group_name == "non_expert":
-        return list(groups.non_expert)
-
-    if param_group_name == "expert":
-        return list(groups.expert)
-
-    raise ValueError(
-        f"不支持的参数组名称：{param_group_name}。"
-        "当前支持：all, non_expert, expert"
-    )
-
-
-def get_expert_param_names(
-    groups: ParamGroups,
-    expert_id: int,
-) -> List[str]:
-    """
-    获取某个 expert 对应的参数名列表。
-    """
-    expert_id = int(expert_id)
-    return list(groups.expert_by_id.get(expert_id, []))
 
 
 def validate_param_groups(
@@ -5347,40 +4022,6 @@ def summarize_param_groups(
     }
 
 
-def filter_names_by_prefix(
-    names: Iterable[str],
-    prefixes: Sequence[str],
-) -> List[str]:
-    """
-    按前缀筛选参数名。
-
-    这个函数不是主流程必须的，主要用于调试。
-    """
-    prefixes = tuple(prefixes)
-
-    return [
-        name
-        for name in names
-        if name.startswith(prefixes)
-    ]
-
-
-def filter_names_by_keyword(
-    names: Iterable[str],
-    keywords: Sequence[str],
-) -> List[str]:
-    """
-    按关键词筛选参数名。
-
-    这个函数不是主流程必须的，主要用于调试。
-    """
-    return [
-        name
-        for name in names
-        if any(keyword in name for keyword in keywords)
-    ]
-
-
 def _count_numel(
     state_dict: StateDict,
     names: Iterable[str],
@@ -5408,11 +4049,6 @@ def _count_numel(
 # ============================================================================
 # Bundled from fl/types.py
 # ============================================================================
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
-
-import torch
 
 
 TensorDict = Dict[str, torch.Tensor]
@@ -5481,8 +4117,7 @@ class AggregationResult:
     """
     聚合器返回给 server 的结果。
 
-    所有聚合方法都应该返回这个结构。
-    这样 server.py 不需要关心当前到底是 uniform 还是 sample_weighted。
+    所有聚合方法都应该返回这个结构，使 server 不依赖具体专家聚合算法。
     """
 
     # 聚合后的新全局模型参数
@@ -5564,8 +4199,7 @@ class TrainState:
     """
     服务端训练状态。
 
-    用于 checkpoint 保存和断点续训。
-    第一版可以先只用其中一部分字段。
+    用于记录当前轮次和历史最佳测试指标，并写入最终训练摘要。
     """
 
     # 当前已经完成的轮数
@@ -5586,7 +4220,7 @@ class TrainState:
 
     def to_dict(self) -> Dict[str, Any]:
         """
-        转成普通 dict，方便保存 checkpoint。
+        转成普通 dict，方便写入训练摘要。
         """
         return {
             "round_id": int(self.round_id),
@@ -5662,110 +4296,9 @@ def collect_client_metrics(
     }
 
 
-def collect_client_diagnostics(
-    client_updates: List[ClientUpdate],
-) -> Dict[int, Dict[str, Any]]:
-    """
-    把客户端上传结果整理成轻量诊断信息。
-
-    这个函数主要给 server.py 写日志用。
-
-    输出格式：
-        {
-            client_id: {
-                "client_id": 0,
-                "round_id": 1,
-                "num_samples": 5000,
-                "metrics": {
-                    "train_loss": ...,
-                    "train_acc": ...
-                },
-                "expert_usage": {
-                    "expert_counts": ...,
-                    "expert_fraction": ...
-                },
-                "expert_kfac_summary": ...
-            }
-        }
-
-    注意：
-        这里不会保存 model_delta，也不会保存 expert_kfac 原始矩阵。
-        原因是这些对象太大，不适合写进 summary.json 或 train.log。
-    """
-    diagnostics: Dict[int, Dict[str, Any]] = {}
-
-    for update in client_updates:
-        extra = dict(update.extra or {})
-
-        diagnostics[int(update.client_id)] = {
-            "client_id": int(update.client_id),
-            "round_id": int(update.round_id),
-            "num_samples": int(update.num_samples),
-            "metrics": dict(update.metrics or {}),
-
-            # expert_usage 是 client.py 额外采集的路由诊断信息。
-            # 例如每个 expert 被激活多少次、占比是多少。
-            "expert_usage": extra.get("expert_usage", None),
-
-            # 只保存 K-FAC 摘要，不保存原始 K-FAC 矩阵。
-            # 原始 expert_kfac 通常很大，不适合进日志。
-            "expert_kfac_summary": extra.get("expert_kfac_summary", None),
-
-            # 一些轻量训练配置也放进来，方便后续排查日志。
-            "optimizer": extra.get("optimizer", None),
-            "local_epochs": extra.get("local_epochs", None),
-            "grad_clip": extra.get("grad_clip", None),
-            "expert_kfac_timing": extra.get("expert_kfac_timing", None),
-
-            # 保留 extra_keys，方便确认客户端到底上传了哪些扩展字段。
-            "extra_keys": sorted(extra.keys()),
-        }
-
-    return diagnostics
-
-
-def get_update_client_id(update: ClientUpdate | Mapping[str, Any]) -> int:
-    """
-    兼容 ClientUpdate 和 dict，读取 client_id。
-    """
-    if isinstance(update, Mapping):
-        return int(update["client_id"])
-
-    return int(update.client_id)
-
-
-def get_update_num_samples(update: ClientUpdate | Mapping[str, Any]) -> int:
-    """
-    兼容 ClientUpdate 和 dict，读取 num_samples。
-    """
-    if isinstance(update, Mapping):
-        return int(update["num_samples"])
-
-    return int(update.num_samples)
-
-
-def get_update_model_delta(
-    update: ClientUpdate | Mapping[str, Any],
-) -> Mapping[str, torch.Tensor]:
-    """
-    兼容 ClientUpdate 和 dict，读取 model_delta。
-    """
-    if isinstance(update, Mapping):
-        return update["model_delta"]
-
-    return update.model_delta
-
-
 # ============================================================================
 # Bundled from fl/kfac.py
 # ============================================================================
-
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
 
 
 KFACLayerPayload = Dict[str, Any]
@@ -6228,17 +4761,6 @@ def _infer_model_device(model: nn.Module) -> torch.device:
 # Bundled from fl/client.py
 # ============================================================================
 
-import copy
-import gc
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-
 
 @dataclass(frozen=True)
 class ClientTrainStats:
@@ -6289,7 +4811,6 @@ class FLClient:
         1. 选择客户端
         2. 聚合参数
         3. 测试集评估
-        4. 保存 checkpoint
     """
 
     def __init__(
@@ -7035,22 +5556,13 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
 # Bundled from aggregation/base.py
 # ============================================================================
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
-
-import torch
-
-
 
 class Aggregator(ABC):
     """
     聚合器基类。
 
-    所有聚合方法都应该继承这个类，例如：
-        1. UniformAggregator
-        2. SampleWeightedAggregator
-        3. 后续 FisherAggregator
-        4. 后续 HistoryWolfAggregator
+    每个专家聚合方法在自己的启动文件中继承这个类并实现接口。
+    base.py 不维护专家聚合方法白名单。
 
     这个类只规定统一接口，不绑定具体聚合算法。
     """
@@ -7082,10 +5594,7 @@ class Aggregator(ABC):
         """
         当前聚合方法名称。
 
-        子类需要返回：
-            uniform
-            sample_weighted
-            ...
+        子类返回自己启动文件对应的方法名称。
         """
         raise NotImplementedError
 
@@ -7099,12 +5608,7 @@ class Aggregator(ABC):
 
         子类只需要实现这个函数。
 
-        例如：
-            uniform:
-                每个客户端权重相同。
-
-            sample_weighted:
-                按客户端样本数加权。
+        例如 uniform 专家聚合可以为每个客户端返回相同权重。
         """
         raise NotImplementedError
 
@@ -7240,23 +5744,6 @@ class Aggregator(ABC):
                 )
 
 
-def collect_num_samples(
-    client_updates: Sequence[ClientUpdate],
-) -> Dict[int, int]:
-    """
-    收集每个客户端的样本数。
-
-    输出：
-        {
-            client_id: num_samples
-        }
-    """
-    return {
-        int(update.client_id): int(update.num_samples)
-        for update in client_updates
-    }
-
-
 def build_uniform_weights(
     client_updates: Sequence[ClientUpdate],
 ) -> Dict[int, float]:
@@ -7301,32 +5788,6 @@ def build_sample_weights(
         weights[int(update.client_id)] = float(update.num_samples)
 
     return weights
-
-
-def get_aggregation_method(cfg: Any, param_group_name: str) -> str:
-    """
-    从配置中读取指定参数组的聚合方法。
-
-    参数：
-        param_group_name:
-            non_expert 或 expert
-
-    示例：
-        get_aggregation_method(cfg, "non_expert")
-        get_aggregation_method(cfg, "expert")
-    """
-    if param_group_name not in {"non_expert", "expert"}:
-        raise ValueError(
-            f"不支持的参数组名称：{param_group_name}。"
-            "当前支持：non_expert, expert"
-        )
-
-    return str(
-        cfg.get(
-            f"agg.{param_group_name}.method",
-            None,
-        )
-    )
 
 
 # Fixed non-expert aggregation and expert extension interface.
@@ -7399,17 +5860,6 @@ def build_aggregators(
 # Bundled from fl/server.py
 # ============================================================================
 
-import gc
-import sys
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
-
 
 @dataclass
 class ServerTrainResult:
@@ -7465,7 +5915,6 @@ class FLServer:
         2. 数据划分
         3. 具体客户端本地训练细节
         4. 具体聚合权重算法细节
-        5. checkpoint 保存
     """
 
     def __init__(
@@ -7733,9 +6182,7 @@ class FLServer:
             1. non_expert 参数
             2. expert 参数
 
-        这样可以让二者使用不同聚合器：
-            non_expert: sample_weighted / uniform
-            expert: uniform / sample_weighted / 后续 Fisher / Bayes
+        non_expert 固定使用 uniform；expert 使用启动文件注入的聚合器。
         """
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
@@ -8682,8 +7129,6 @@ def resolve_device(cfg: Any) -> torch.device:
     )
 
 
-
-
 def _cfg_get_bool(
     cfg: Any,
     key: str,
@@ -8714,15 +7159,6 @@ def _cfg_get_bool(
 # ============================================================================
 # Bundled from train.py (runtime entry and output)
 # ============================================================================
-
-import argparse
-import csv
-import json
-import traceback
-from typing import Any, Dict, List
-
-import torch
-
 
 
 def parse_args() -> argparse.Namespace:

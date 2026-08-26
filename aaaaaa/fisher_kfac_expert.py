@@ -22,7 +22,7 @@ ALGORITHM_NAME = "fisher_kfac_expert"
 EMBEDDED_METHOD_CONFIG = {
     "agg": {
         "non_expert": {"method": "uniform"},
-        "expert": {"method": "fisher_kfac_expert"},
+        "expert": {"method": ALGORITHM_NAME},
     },
     "kfac": {
         "collect": True,
@@ -87,7 +87,7 @@ class FisherKFACExpertAggregator(Aggregator):
     @property
     def method_name(self) -> str:
         """返回当前聚合方法名称。"""
-        return "fisher_kfac_expert"
+        return ALGORITHM_NAME
 
     def compute_weights(
         self,

@@ -20,7 +20,7 @@ build_uniform_weights = base.build_uniform_weights
 EMBEDDED_METHOD_CONFIG = {
     "agg": {
         "non_expert": {"method": "uniform"},
-        "expert": {"method": "uniform"},
+        "expert": {"method": ALGORITHM_NAME},
     },
 }
 
@@ -45,7 +45,7 @@ class UniformExpertAggregator(Aggregator):
     @property
     def method_name(self) -> str:
         """返回当前聚合方法名称。"""
-        return "uniform"
+        return ALGORITHM_NAME
 
     def compute_weights(
         self,
