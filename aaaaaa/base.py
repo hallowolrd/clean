@@ -404,6 +404,11 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "unique_name": True,
         "overwrite": False,
     },
+    "server_evidence": {
+        "size": 0,
+        "batch_size": 256,
+        "class_balanced": True,
+    },
     "logging": {
         "log_every": 1,
         "save_config": True,
@@ -843,6 +848,24 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_non_negative_int(cfg, "num_workers")
     _require_positive_int(cfg, "num_experts")
     _require_positive_int(cfg, "topk")
+
+    server_evidence_cfg = cfg.get("server_evidence", {})
+    if not isinstance(server_evidence_cfg, Mapping):
+        raise ConfigError("server_evidence 必须是 dict。")
+
+    server_evidence_size = server_evidence_cfg.get("size", 0)
+    if not isinstance(server_evidence_size, int) or server_evidence_size < 0:
+        raise ConfigError(
+            "server_evidence.size 必须是非负整数，"
+            f"当前值：{server_evidence_size}"
+        )
+
+    server_evidence_batch_size = server_evidence_cfg.get("batch_size", 256)
+    if not isinstance(server_evidence_batch_size, int) or server_evidence_batch_size <= 0:
+        raise ConfigError(
+            "server_evidence.batch_size 必须是正整数，"
+            f"当前值：{server_evidence_batch_size}"
+        )
 
     if int(cfg["topk"]) > int(cfg["num_experts"]):
         raise ConfigError(
@@ -2175,6 +2198,7 @@ class DatasetBundle:
     test_dataset: Any
     num_classes: int
     input_shape: Tuple[int, int, int]
+    server_evidence_dataset: Optional[Any] = None
 
 
 def build_datasets(cfg: Any) -> DatasetBundle:
@@ -2315,7 +2339,7 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             f"{len(train_dataset)} vs {len(train_evidence_dataset)}"
         )
 
-    return DatasetBundle(
+    bundle = DatasetBundle(
         name=dataset_name,
         train_dataset=train_dataset,
         train_evidence_dataset=train_evidence_dataset,
@@ -2323,6 +2347,144 @@ def build_datasets(cfg: Any) -> DatasetBundle:
         num_classes=int(info["num_classes"]),
         input_shape=tuple(info["input_shape"]),
     )
+
+    return apply_server_evidence_holdout(
+        cfg=cfg,
+        bundle=bundle,
+    )
+
+
+def apply_server_evidence_holdout(
+    cfg: Any,
+    bundle: DatasetBundle,
+) -> DatasetBundle:
+    """
+    Optionally reserve a deterministic server-side evidence subset from train data.
+
+    The default server_evidence.size=0 is a strict no-op: the original train and
+    train_evidence dataset objects are returned unchanged. When enabled, the same
+    indices are removed from both client-training views, while the reserved subset
+    is taken from the deterministic train_evidence_dataset view.
+    """
+    evidence_cfg = _cfg_get(cfg, "server_evidence", {})
+    evidence_size = int(_cfg_get(evidence_cfg, "size", 0))
+
+    if evidence_size <= 0:
+        return bundle
+
+    train_size = len(bundle.train_dataset)
+    if train_size != len(bundle.train_evidence_dataset):
+        raise RuntimeError(
+            "train_dataset 与 train_evidence_dataset 样本数不一致，"
+            "无法构建 server evidence holdout。"
+        )
+
+    if evidence_size >= train_size:
+        raise ValueError(
+            "server_evidence.size 必须小于训练集大小："
+            f"size={evidence_size}, train_size={train_size}"
+        )
+
+    num_clients = int(_cfg_get(cfg, "num_clients", 1))
+    if train_size - evidence_size < num_clients:
+        raise ValueError(
+            "server evidence holdout 后剩余训练样本少于客户端数量："
+            f"remaining={train_size - evidence_size}, num_clients={num_clients}"
+        )
+
+    targets = get_dataset_targets(bundle.train_evidence_dataset)
+    class_balanced = bool(_cfg_get(evidence_cfg, "class_balanced", True))
+    seed = int(_cfg_get(cfg, "seed", 0))
+
+    evidence_indices = select_server_evidence_indices(
+        targets=targets,
+        size=evidence_size,
+        seed=seed,
+        class_balanced=class_balanced,
+    )
+    evidence_index_set = set(evidence_indices)
+    client_indices = [
+        index
+        for index in range(train_size)
+        if index not in evidence_index_set
+    ]
+
+    return DatasetBundle(
+        name=bundle.name,
+        train_dataset=Subset(bundle.train_dataset, client_indices),
+        train_evidence_dataset=Subset(
+            bundle.train_evidence_dataset,
+            client_indices,
+        ),
+        test_dataset=bundle.test_dataset,
+        num_classes=bundle.num_classes,
+        input_shape=bundle.input_shape,
+        server_evidence_dataset=Subset(
+            bundle.train_evidence_dataset,
+            evidence_indices,
+        ),
+    )
+
+
+def select_server_evidence_indices(
+    targets: Sequence[int],
+    size: int,
+    seed: int,
+    class_balanced: bool = True,
+) -> List[int]:
+    """Select deterministic holdout indices without touching global RNG state."""
+    size = int(size)
+    if size < 0:
+        raise ValueError(f"size 不能小于 0，当前值：{size}")
+    if size > len(targets):
+        raise ValueError(
+            f"size 不能大于 targets 数量：size={size}, total={len(targets)}"
+        )
+    if size == 0:
+        return []
+
+    rng = np.random.default_rng(int(seed) + 300000)
+
+    if not class_balanced:
+        selected = rng.choice(len(targets), size=size, replace=False)
+        return sorted(int(index) for index in selected.tolist())
+
+    targets_array = np.asarray(targets, dtype=np.int64)
+    class_ids = sorted(int(value) for value in np.unique(targets_array).tolist())
+    if len(class_ids) == 0:
+        raise ValueError("targets 为空，无法构建 server evidence holdout。")
+
+    indices_by_class: Dict[int, List[int]] = {}
+    for class_id in class_ids:
+        class_indices = np.where(targets_array == class_id)[0].astype(np.int64)
+        rng.shuffle(class_indices)
+        indices_by_class[class_id] = [int(index) for index in class_indices.tolist()]
+
+    class_order = [int(value) for value in rng.permutation(class_ids).tolist()]
+    offsets = {class_id: 0 for class_id in class_ids}
+    selected_indices: List[int] = []
+
+    while len(selected_indices) < size:
+        made_progress = False
+        for class_id in class_order:
+            offset = offsets[class_id]
+            class_indices = indices_by_class[class_id]
+            if offset >= len(class_indices):
+                continue
+
+            selected_indices.append(class_indices[offset])
+            offsets[class_id] = offset + 1
+            made_progress = True
+
+            if len(selected_indices) >= size:
+                break
+
+        if not made_progress:
+            raise RuntimeError(
+                "无法从训练集选出请求数量的 server evidence 样本。"
+            )
+
+    return sorted(selected_indices)
 
 
 def build_train_transform(
@@ -2635,6 +2797,13 @@ def get_dataset_targets(dataset: Any) -> List[int]:
     CIFAR10 / CIFAR100 通常有 dataset.targets。
     为了更通用，也兼容 dataset.labels。
     """
+    if isinstance(dataset, Subset):
+        parent_targets = get_dataset_targets(dataset.dataset)
+        return [
+            int(parent_targets[int(index)])
+            for index in dataset.indices
+        ]
+
     if hasattr(dataset, "targets"):
         targets = dataset.targets
 
@@ -2644,7 +2813,7 @@ def get_dataset_targets(dataset: Any) -> List[int]:
     else:
         raise AttributeError(
             "无法从 dataset 中读取标签。"
-            "当前只支持包含 targets 或 labels 属性的数据集。"
+            "当前支持 Subset，或包含 targets / labels 属性的数据集。"
         )
 
     return [
@@ -2812,6 +2981,7 @@ class DataLoaderBundle:
     client_loaders: List[DataLoader]
     client_evidence_loaders: List[DataLoader]
     test_loader: DataLoader
+    server_evidence_loader: Optional[DataLoader]
     client_datasets: List[Subset]
     client_evidence_datasets: List[Subset]
     client_sample_counts: Dict[int, int]
@@ -2823,6 +2993,7 @@ def build_dataloaders(
     train_evidence_dataset: Dataset,
     test_dataset: Dataset,
     client_indices: Sequence[Sequence[int]],
+    server_evidence_dataset: Optional[Dataset] = None,
 ) -> DataLoaderBundle:
     """
     根据客户端样本索引构建 DataLoader。
@@ -2891,6 +3062,14 @@ def build_dataloaders(
         seed=seed,
     )
 
+    server_evidence_loader = build_server_evidence_loader(
+        cfg=cfg,
+        server_evidence_dataset=server_evidence_dataset,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        seed=seed,
+    )
+
     client_sample_counts = {
         client_id: len(client_dataset)
         for client_id, client_dataset in enumerate(client_datasets)
@@ -2900,6 +3079,7 @@ def build_dataloaders(
         client_loaders=client_loaders,
         client_evidence_loaders=client_evidence_loaders,
         test_loader=test_loader,
+        server_evidence_loader=server_evidence_loader,
         client_datasets=client_datasets,
         client_evidence_datasets=client_evidence_datasets,
         client_sample_counts=client_sample_counts,
@@ -3016,6 +3196,37 @@ def build_client_evidence_loaders(
         client_evidence_loaders.append(loader)
 
     return client_evidence_loaders
+
+
+def build_server_evidence_loader(
+    cfg: Any,
+    server_evidence_dataset: Optional[Dataset],
+    num_workers: int,
+    pin_memory: bool,
+    seed: int,
+) -> Optional[DataLoader]:
+    """Build the optional deterministic server-side method evidence loader."""
+    if server_evidence_dataset is None:
+        return None
+
+    if len(server_evidence_dataset) <= 0:
+        raise ValueError("server_evidence_dataset 不能为空。")
+
+    evidence_cfg = _cfg_get(cfg, "server_evidence", {})
+    batch_size = int(_cfg_get(evidence_cfg, "batch_size", 256))
+    persistent_workers = num_workers > 0
+
+    return DataLoader(
+        server_evidence_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=build_torch_generator(int(seed) + 300000),
+        persistent_workers=persistent_workers,
+    )
 
 
 def build_test_loader(
@@ -5532,6 +5743,23 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class MethodContext:
+    """
+    Generic server-side runtime context exposed to expert aggregation plugins.
+
+    base.py owns only common resources and lifecycle. A method plugin may read
+    the resources it needs without introducing method-name branches into base.py.
+    """
+
+    cfg: Any
+    device: torch.device
+    dataset_name: str
+    server_evidence_loader: Optional[DataLoader] = None
+    model_builder: Optional[Callable[[Any], nn.Module]] = None
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+
 class Aggregator(ABC):
     """
     聚合器基类。
@@ -5562,6 +5790,19 @@ class Aggregator(ABC):
         """
         self.cfg = cfg
         self.param_group_name = param_group_name
+        self.method_context: Optional[MethodContext] = None
+
+    def set_method_context(
+        self,
+        method_context: Optional[MethodContext],
+    ) -> None:
+        """Inject common server-side resources after the plugin is constructed."""
+        if method_context is not None and not isinstance(method_context, MethodContext):
+            raise TypeError(
+                "method_context 必须是 MethodContext 或 None，"
+                f"当前类型：{type(method_context).__name__}"
+            )
+        self.method_context = method_context
 
     @property
     @abstractmethod
@@ -5810,6 +6051,7 @@ ExpertAggregatorBuilder = Callable[[Any], Aggregator]
 def build_aggregators(
     cfg: Any,
     expert_aggregator_builder: ExpertAggregatorBuilder,
+    method_context: Optional[MethodContext] = None,
 ) -> AggregatorBundle:
     """Build fixed uniform non-expert aggregation and injected expert logic."""
     non_expert = FixedNonExpertUniformAggregator(
@@ -5827,6 +6069,8 @@ def build_aggregators(
         raise ValueError(
             "The injected aggregator must use param_group_name='expert'."
         )
+
+    expert.set_method_context(method_context)
 
     return AggregatorBundle(non_expert=non_expert, expert=expert)
 
@@ -5902,6 +6146,7 @@ class FLServer:
         client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
         expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
         method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
+        method_context: Optional[MethodContext] = None,
         global_model: Optional[nn.Module] = None,
     ) -> None:
         self.cfg = cfg
@@ -5930,10 +6175,12 @@ class FLServer:
 
         self.test_loader = test_loader
         self.method_client_diagnostics_builder = method_client_diagnostics_builder
+        self.method_context = method_context
 
         self.aggregators = build_aggregators(
             cfg=cfg,
             expert_aggregator_builder=expert_aggregator_builder,
+            method_context=method_context,
         )
 
         self.param_groups = build_param_groups(
@@ -7042,6 +7289,7 @@ def build_server(
     client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
     expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
     method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
+    method_context: Optional[MethodContext] = None,
 ) -> FLServer:
     """
     构建 FLServer。
@@ -7061,6 +7309,7 @@ def build_server(
         expert_aggregator_builder=expert_aggregator_builder,
         expert_evidence_collector=expert_evidence_collector,
         method_client_diagnostics_builder=method_client_diagnostics_builder,
+        method_context=method_context,
     )
 
 
@@ -7164,6 +7413,8 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--server-evidence-size", type=int, default=None)
+    parser.add_argument("--server-evidence-batch-size", type=int, default=None)
     if method_cli_argument_registrar is not None:
         method_cli_argument_registrar(parser)
     return parser.parse_args()
@@ -7195,6 +7446,17 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         v=getattr(args,an,None)
         if v is not None: opt[ck]=v
     if opt: overrides["optimizer"]=opt
+
+    server_evidence = {}
+    server_evidence_size = getattr(args, "server_evidence_size", None)
+    if server_evidence_size is not None:
+        server_evidence["size"] = server_evidence_size
+    server_evidence_batch_size = getattr(args, "server_evidence_batch_size", None)
+    if server_evidence_batch_size is not None:
+        server_evidence["batch_size"] = server_evidence_batch_size
+    if server_evidence:
+        overrides["server_evidence"] = server_evidence
+
     return overrides
 
 
@@ -7350,6 +7612,11 @@ def run_training(
         f"train_size={len(dataset_bundle.train_dataset)} | "
         f"test_size={len(dataset_bundle.test_dataset)}"
     )
+    if dataset_bundle.server_evidence_dataset is not None:
+        print(
+            "[Data] "
+            f"server_evidence_size={len(dataset_bundle.server_evidence_dataset)}"
+        )
 
     partition = partition_dataset(
         cfg=cfg,
@@ -7370,6 +7637,15 @@ def run_training(
         train_evidence_dataset=dataset_bundle.train_evidence_dataset,
         test_dataset=dataset_bundle.test_dataset,
         client_indices=partition.client_indices,
+        server_evidence_dataset=dataset_bundle.server_evidence_dataset,
+    )
+
+    method_context = MethodContext(
+        cfg=cfg,
+        device=device,
+        dataset_name=dataset_bundle.name,
+        server_evidence_loader=loader_bundle.server_evidence_loader,
+        model_builder=build_model,
     )
 
     server = build_server(
@@ -7383,6 +7659,7 @@ def run_training(
         expert_aggregator_builder=expert_aggregator_builder,
         expert_evidence_collector=expert_evidence_collector,
         method_client_diagnostics_builder=method_client_diagnostics_builder,
+        method_context=method_context,
     )
 
     train_result = server.train()

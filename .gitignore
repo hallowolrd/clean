@@ -8,3 +8,4 @@ outputs/
 *.xlsx
 pictures/
 outputs_bias/
+test/
