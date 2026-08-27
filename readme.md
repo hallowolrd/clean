@@ -9,13 +9,6 @@ CUDA_VISIBLE_DEVICES=0 python a/uniform.py \
   --backbone resnet_cifar \
   --output-dir outputs/cifar10_resnet18
 
-CUDA_VISIBLE_DEVICES=0 python train.py --config configs/sample_weighted.yaml
-CUDA_VISIBLE_DEVICES=0 python train.py --config configs/fisher_kfac_expert.yaml
-
-python tools/plot_compare_test_acc.py \
-  --runs \
-  uniform=outputs_bias/cifar10_c5_a0p1_resnet_sparse_moe_head_e4_top2_r100_ep5_neuniform_exuniform_s0/results.csv \
-  kfac=outputs_bias/cifar10_c5_a0p1_resnet_sparse_moe_head_e4_top2_r100_ep5_neuniform_exfisher_kfac_expert_s0/results.csv \
-  --window 1 \
-  --hide-raw \
-  --out pictures/include_bias_50_1.png
+python plot_compare_acc.py \
+  --input-dir outputs/cifar10_resnet_cifar \
+  --window 5
