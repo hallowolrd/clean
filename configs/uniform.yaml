@@ -1,8 +1,0 @@
-include: base.yaml
-
-agg:
-  non_expert:
-    method: uniform
-
-  expert:
-    method: uniform

@@ -398,7 +398,7 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "seed": EMBEDDED_DEFAULT_SEED,
     "deterministic": True,
     "device": "auto",
-    "output_dir": "outputs_bias",
+    "output_dir": "outputs",
     "run_name": "auto",
     "run": {
         "unique_name": True,
