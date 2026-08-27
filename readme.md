@@ -4,9 +4,13 @@ tmux attach -t train_clean1
 cd /home/cjq/Project/clean
 conda activate fl_moe
 
-CUDA_VISIBLE_DEVICES=0 python train.py --config configs/uniform.yaml
-CUDA_VISIBLE_DEVICES=2 python train.py --config configs/sample_weighted.yaml
-CUDA_VISIBLE_DEVICES=1 python train.py --config configs/fisher_kfac_expert.yaml
+CUDA_VISIBLE_DEVICES=0 python a/uniform.py \
+  --dataset cifar10 \
+  --backbone resnet_cifar \
+  --output-dir outputs/cifar10_resnet18
+
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/sample_weighted.yaml
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/fisher_kfac_expert.yaml
 
 python tools/plot_compare_test_acc.py \
   --runs \
