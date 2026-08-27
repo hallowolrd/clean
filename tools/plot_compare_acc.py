@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="可选。图片保存目录；默认保存到 --input-dir。",
+        help="可选。图片保存目录；默认保存到项目根目录 pictures。",
     )
     return parser.parse_args()
 
@@ -304,7 +304,7 @@ def main() -> int:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else input_dir
+        else Path(__file__).resolve().parent.parent / "pictures"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
