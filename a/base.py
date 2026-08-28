@@ -3584,6 +3584,46 @@ class MobileNetV2Backbone(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.feat_dim = int(last_channel)
 
+        # MobileNetV2 通常依赖 BatchNorm 稳定深层卷积的信号尺度。
+        # 当前版本明确保持 no-BN，因此在 MobileNetV2 内部单独使用
+        # 适合无归一化残差网络的初始化，避免图像相关特征在深层堆叠中塌缩。
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        # Conv + ReLU6 路径使用 fan-in Kaiming 初始化；所有 bias 从 0 开始。
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight,
+                    mode="fan_in",
+                    nonlinearity="relu",
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Inverted residual 的最后一层 projection 后没有激活。
+        # 非残差 transition block 使用线性 fan-in 初始化；
+        # 残差 block 的 projection 从 0 开始，使 block 初始为 identity，
+        # 防止无 BN 时残差分支在深层堆叠中放大或压垮信号。
+        for block in self.blocks:
+            projection = block.block[-1]
+            if not isinstance(projection, nn.Conv2d):
+                raise TypeError(
+                    "MobileNetV2 inverted residual projection 必须是 nn.Conv2d。"
+                )
+
+            if block.use_residual:
+                nn.init.zeros_(projection.weight)
+            else:
+                nn.init.kaiming_normal_(
+                    projection.weight,
+                    mode="fan_in",
+                    nonlinearity="linear",
+                )
+
+            if projection.bias is not None:
+                nn.init.zeros_(projection.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         x = self.blocks(x)
