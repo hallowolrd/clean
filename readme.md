@@ -26,3 +26,5 @@ femnist
 resnet_cifar
 mobilenet_v2
 vit_tiny
+
+kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
