@@ -3431,104 +3431,95 @@ class ResNetBackbone(nn.Module):
         return x
 
 
-class MobileNetV2NoBNConv(nn.Sequential):
-    """Conv + ReLU6 used by the no-BN MobileNetV2 variant."""
+class ConvNeXtLayerNorm2d(nn.Module):
+    """LayerNorm for NCHW image features."""
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        groups: int = 1,
+        num_channels: int,
+        eps: float = 1.0e-6,
     ) -> None:
-        padding = (int(kernel_size) - 1) // 2
-        super().__init__(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                # BatchNorm is intentionally removed. Keep a learnable bias so
-                # the convolution is not forced to rely on a following affine norm.
-                bias=True,
-            ),
-            nn.ReLU6(inplace=True),
+        super().__init__()
+        self.num_channels = int(num_channels)
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(
+            x,
+            normalized_shape=(self.num_channels,),
+            weight=self.weight,
+            bias=self.bias,
+            eps=self.eps,
         )
+        return x.permute(0, 3, 1, 2)
 
 
-class MobileNetV2NoBNInvertedResidual(nn.Module):
-    """MobileNetV2 inverted residual block with BatchNorm removed."""
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt residual block with depthwise convolution and LayerNorm."""
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
-        expand_ratio: int,
+        dim: int,
+        layer_scale_init_value: float = 1.0e-6,
     ) -> None:
         super().__init__()
 
-        if stride not in {1, 2}:
-            raise ValueError(f"MobileNetV2 stride 必须是 1 或 2，当前值：{stride}")
-
-        hidden_dim = int(round(in_channels * expand_ratio))
-        self.use_residual = stride == 1 and in_channels == out_channels
-
-        layers: List[nn.Module] = []
-        if expand_ratio != 1:
-            layers.append(
-                MobileNetV2NoBNConv(
-                    in_channels,
-                    hidden_dim,
-                    kernel_size=1,
-                    stride=1,
-                )
-            )
-
-        layers.append(
-            MobileNetV2NoBNConv(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=3,
-                stride=stride,
-                groups=hidden_dim,
-            )
+        self.dwconv = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=7,
+            padding=3,
+            groups=dim,
+            bias=True,
         )
-
-        # Linear bottleneck: projection has no activation after it.
-        layers.append(
-            nn.Conv2d(
-                hidden_dim,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=True,
-            )
+        self.norm = ConvNeXtLayerNorm2d(dim)
+        self.pwconv1 = nn.Conv2d(
+            dim,
+            4 * dim,
+            kernel_size=1,
+            bias=True,
         )
-
-        self.block = nn.Sequential(*layers)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(
+            4 * dim,
+            dim,
+            kernel_size=1,
+            bias=True,
+        )
+        self.gamma = nn.Parameter(
+            layer_scale_init_value * torch.ones(dim)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.block(x)
-        if self.use_residual:
-            out = x + out
-        return out
+        shortcut = x
+
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.gamma.view(1, -1, 1, 1) * x
+
+        return shortcut + x
 
 
-class MobileNetV2Backbone(nn.Module):
+class ConvNeXtTinyBackbone(nn.Module):
     """
-    Small-image-adapted MobileNetV2 backbone without BatchNorm.
+    Small-image-adapted ConvNeXt-Tiny backbone.
 
-    Design choices for the current federated setting:
-    - BatchNorm is completely removed (the requested C scheme).
+    ConvNeXt-Tiny scale:
+        depths = (3, 3, 9, 3)
+        dims = (96, 192, 384, 768)
+
+    Design choices for the current datasets:
     - 28/32px inputs use stem stride=1; larger inputs use stride=2.
-    - The standard MobileNetV2 inverted-residual stage configuration is kept.
-    - AdaptiveAvgPool2d(1) makes 28/32/64/96px inputs share one interface.
-    - Raw output dimension is 1280; SparseMoEClassifier adapts it to 512.
+    - Three 2x downsampling stages are retained.
+    - LayerNorm is used throughout; BatchNorm is not used.
+    - Global average pooling supports 28/32/64/96px inputs.
+    - Raw output dimension is 768; SparseMoEClassifier adapts it to 512.
     """
 
     def __init__(
@@ -3538,98 +3529,120 @@ class MobileNetV2Backbone(nn.Module):
     ) -> None:
         super().__init__()
 
+        depths = (3, 3, 9, 3)
+        dims = (96, 192, 384, 768)
         stem_stride = 1 if int(image_size) <= 32 else 2
-        input_channel = 32
-        last_channel = 1280
 
-        self.stem = MobileNetV2NoBNConv(
-            in_channels,
-            input_channel,
-            kernel_size=3,
-            stride=stem_stride,
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                dims[0],
+                kernel_size=3,
+                stride=stem_stride,
+                padding=1,
+                bias=True,
+            ),
+            ConvNeXtLayerNorm2d(dims[0]),
         )
 
-        # (expand_ratio, output_channels, repeats, first_stride)
-        stage_settings = (
-            (1, 16, 1, 1),
-            (6, 24, 2, 2),
-            (6, 32, 3, 2),
-            (6, 64, 4, 2),
-            (6, 96, 3, 1),
-            (6, 160, 3, 2),
-            (6, 320, 1, 1),
+        self.stage1 = self._make_stage(
+            dim=dims[0],
+            depth=depths[0],
         )
 
-        blocks: List[nn.Module] = []
-        for expand_ratio, out_channels, repeats, first_stride in stage_settings:
-            for repeat_id in range(repeats):
-                stride = first_stride if repeat_id == 0 else 1
-                blocks.append(
-                    MobileNetV2NoBNInvertedResidual(
-                        in_channels=input_channel,
-                        out_channels=out_channels,
-                        stride=stride,
-                        expand_ratio=expand_ratio,
-                    )
-                )
-                input_channel = out_channels
-
-        self.blocks = nn.Sequential(*blocks)
-        self.final_conv = MobileNetV2NoBNConv(
-            input_channel,
-            last_channel,
-            kernel_size=1,
-            stride=1,
+        self.downsample1 = nn.Sequential(
+            ConvNeXtLayerNorm2d(dims[0]),
+            nn.Conv2d(
+                dims[0],
+                dims[1],
+                kernel_size=2,
+                stride=2,
+                bias=True,
+            ),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.feat_dim = int(last_channel)
+        self.stage2 = self._make_stage(
+            dim=dims[1],
+            depth=depths[1],
+        )
 
-        # MobileNetV2 通常依赖 BatchNorm 稳定深层卷积的信号尺度。
-        # 当前版本明确保持 no-BN，因此在 MobileNetV2 内部单独使用
-        # 适合无归一化残差网络的初始化，避免图像相关特征在深层堆叠中塌缩。
+        self.downsample2 = nn.Sequential(
+            ConvNeXtLayerNorm2d(dims[1]),
+            nn.Conv2d(
+                dims[1],
+                dims[2],
+                kernel_size=2,
+                stride=2,
+                bias=True,
+            ),
+        )
+        self.stage3 = self._make_stage(
+            dim=dims[2],
+            depth=depths[2],
+        )
+
+        self.downsample3 = nn.Sequential(
+            ConvNeXtLayerNorm2d(dims[2]),
+            nn.Conv2d(
+                dims[2],
+                dims[3],
+                kernel_size=2,
+                stride=2,
+                bias=True,
+            ),
+        )
+        self.stage4 = self._make_stage(
+            dim=dims[3],
+            depth=depths[3],
+        )
+
+        self.norm = nn.LayerNorm(
+            dims[3],
+            eps=1.0e-6,
+        )
+        self.feat_dim = int(dims[3])
+
         self._init_weights()
 
+    @staticmethod
+    def _make_stage(
+        dim: int,
+        depth: int,
+    ) -> nn.Sequential:
+        return nn.Sequential(
+            *[
+                ConvNeXtBlock(dim=dim)
+                for _ in range(depth)
+            ]
+        )
+
     def _init_weights(self) -> None:
-        # Conv + ReLU6 路径使用 fan-in Kaiming 初始化；所有 bias 从 0 开始。
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(
+                nn.init.trunc_normal_(
                     module.weight,
-                    mode="fan_in",
-                    nonlinearity="relu",
+                    std=0.02,
                 )
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Inverted residual 的最后一层 projection 后没有激活。
-        # 非残差 transition block 使用线性 fan-in 初始化；
-        # 残差 block 的 projection 从 0 开始，使 block 初始为 identity，
-        # 防止无 BN 时残差分支在深层堆叠中放大或压垮信号。
-        for block in self.blocks:
-            projection = block.block[-1]
-            if not isinstance(projection, nn.Conv2d):
-                raise TypeError(
-                    "MobileNetV2 inverted residual projection 必须是 nn.Conv2d。"
-                )
-
-            if block.use_residual:
-                nn.init.zeros_(projection.weight)
-            else:
-                nn.init.kaiming_normal_(
-                    projection.weight,
-                    mode="fan_in",
-                    nonlinearity="linear",
-                )
-
-            if projection.bias is not None:
-                nn.init.zeros_(projection.bias)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        x = self.blocks(x)
-        x = self.final_conv(x)
-        x = self.pool(x)
-        return x.flatten(1)
+
+        x = self.stage1(x)
+
+        x = self.downsample1(x)
+        x = self.stage2(x)
+
+        x = self.downsample2(x)
+        x = self.stage3(x)
+
+        x = self.downsample3(x)
+        x = self.stage4(x)
+
+        x = x.mean(dim=(-2, -1))
+        x = self.norm(x)
+
+        return x
 
 
 class ViTTinyBlock(nn.Module):
@@ -3790,13 +3803,13 @@ def build_resnet_cifar_backbone(
     )
 
 
-def build_mobilenet_v2_backbone(
+def build_convnext_tiny_backbone(
     *,
     in_channels: int = 3,
     image_size: int = 32,
-) -> MobileNetV2Backbone:
-    """Build the requested no-BN, small-image-adapted MobileNetV2."""
-    return MobileNetV2Backbone(
+) -> ConvNeXtTinyBackbone:
+    """Build the small-image-adapted ConvNeXt-Tiny backbone."""
+    return ConvNeXtTinyBackbone(
         in_channels=in_channels,
         image_size=image_size,
     )
@@ -3816,7 +3829,7 @@ def build_vit_tiny_backbone(
 
 BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
     DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
-    "mobilenet_v2": build_mobilenet_v2_backbone,
+    "convnext_tiny": build_convnext_tiny_backbone,
     "vit_tiny": build_vit_tiny_backbone,
 }
 
@@ -4111,7 +4124,7 @@ class SparseMoEClassifier(nn.Module):
     为了让 backbone 对照实验中的 router / expert 参数规模保持一致，
     所有 backbone 都在进入 MoE 前统一成 512 维：
         resnet_cifar: 512 -> Identity
-        mobilenet_v2: 1280 -> Linear(1280, 512)
+        convnext_tiny: 768 -> Linear(768, 512)
         vit_tiny: 192 -> Linear(192, 512)
 
     backbone / backbone_adapter / router 都属于 non_expert 参数；

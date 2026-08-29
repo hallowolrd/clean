@@ -24,7 +24,7 @@ femnist
 
 支持的backbone：
 resnet_cifar
-mobilenet_v2
+convnext_tiny
 vit_tiny
 
 kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
