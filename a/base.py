@@ -3431,95 +3431,31 @@ class ResNetBackbone(nn.Module):
         return x
 
 
-class ConvNeXtLayerNorm2d(nn.Module):
-    """LayerNorm for NCHW image features."""
-
-    def __init__(
-        self,
-        num_channels: int,
-        eps: float = 1.0e-6,
-    ) -> None:
-        super().__init__()
-        self.num_channels = int(num_channels)
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
-        self.eps = float(eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0, 2, 3, 1)
-        x = F.layer_norm(
-            x,
-            normalized_shape=(self.num_channels,),
-            weight=self.weight,
-            bias=self.bias,
-            eps=self.eps,
-        )
-        return x.permute(0, 3, 1, 2)
-
-
-class ConvNeXtBlock(nn.Module):
-    """ConvNeXt residual block with depthwise convolution and LayerNorm."""
-
-    def __init__(
-        self,
-        dim: int,
-        layer_scale_init_value: float = 1.0e-6,
-    ) -> None:
-        super().__init__()
-
-        self.dwconv = nn.Conv2d(
-            dim,
-            dim,
-            kernel_size=7,
-            padding=3,
-            groups=dim,
-            bias=True,
-        )
-        self.norm = ConvNeXtLayerNorm2d(dim)
-        self.pwconv1 = nn.Conv2d(
-            dim,
-            4 * dim,
-            kernel_size=1,
-            bias=True,
-        )
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Conv2d(
-            4 * dim,
-            dim,
-            kernel_size=1,
-            bias=True,
-        )
-        self.gamma = nn.Parameter(
-            layer_scale_init_value * torch.ones(dim)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shortcut = x
-
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        x = self.gamma.view(1, -1, 1, 1) * x
-
-        return shortcut + x
-
-
-class ConvNeXtTinyBackbone(nn.Module):
+class VGG11Backbone(nn.Module):
     """
-    Small-image-adapted ConvNeXt-Tiny backbone.
+    VGG11 backbone without BatchNorm, adapted for the image sizes
+    used by this project.
 
-    ConvNeXt-Tiny scale:
-        depths = (3, 3, 9, 3)
-        dims = (96, 192, 384, 768)
+    Standard VGG11 convolution layout:
+        64
+        M
+        128
+        M
+        256
+        256
+        M
+        512
+        512
+        M
+        512
+        512
+        M
 
-    Design choices for the current datasets:
-    - 28/32px inputs use stem stride=1; larger inputs use stride=2.
-    - Three 2x downsampling stages are retained.
-    - LayerNorm is used throughout; BatchNorm is not used.
-    - Global average pooling supports 28/32/64/96px inputs.
-    - Raw output dimension is 768; SparseMoEClassifier adapts it to 512.
+    Design choices:
+    - BatchNorm is not used.
+    - 28/32px inputs skip the final MaxPool to avoid excessive downsampling.
+    - 64/96px inputs keep all five MaxPool stages.
+    - AdaptiveAvgPool2d(1) gives a fixed 512-dimensional feature vector.
     """
 
     def __init__(
@@ -3529,120 +3465,86 @@ class ConvNeXtTinyBackbone(nn.Module):
     ) -> None:
         super().__init__()
 
-        depths = (3, 3, 9, 3)
-        dims = (96, 192, 384, 768)
-        stem_stride = 1 if int(image_size) <= 32 else 2
+        image_size = int(image_size)
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                dims[0],
-                kernel_size=3,
-                stride=stem_stride,
-                padding=1,
-                bias=True,
-            ),
-            ConvNeXtLayerNorm2d(dims[0]),
-        )
+        layers: List[nn.Module] = []
+        current_channels = int(in_channels)
 
-        self.stage1 = self._make_stage(
-            dim=dims[0],
-            depth=depths[0],
-        )
-
-        self.downsample1 = nn.Sequential(
-            ConvNeXtLayerNorm2d(dims[0]),
-            nn.Conv2d(
-                dims[0],
-                dims[1],
-                kernel_size=2,
-                stride=2,
-                bias=True,
-            ),
-        )
-        self.stage2 = self._make_stage(
-            dim=dims[1],
-            depth=depths[1],
+        # Standard VGG11 / configuration A.
+        cfg: Sequence[int | str] = (
+            64,
+            "M",
+            128,
+            "M",
+            256,
+            256,
+            "M",
+            512,
+            512,
+            "M",
+            512,
+            512,
+            "M",
         )
 
-        self.downsample2 = nn.Sequential(
-            ConvNeXtLayerNorm2d(dims[1]),
-            nn.Conv2d(
-                dims[1],
-                dims[2],
-                kernel_size=2,
-                stride=2,
-                bias=True,
-            ),
-        )
-        self.stage3 = self._make_stage(
-            dim=dims[2],
-            depth=depths[2],
-        )
+        num_pools = 0
 
-        self.downsample3 = nn.Sequential(
-            ConvNeXtLayerNorm2d(dims[2]),
-            nn.Conv2d(
-                dims[2],
-                dims[3],
-                kernel_size=2,
-                stride=2,
-                bias=True,
-            ),
-        )
-        self.stage4 = self._make_stage(
-            dim=dims[3],
-            depth=depths[3],
-        )
+        for item in cfg:
+            if item == "M":
+                num_pools += 1
 
-        self.norm = nn.LayerNorm(
-            dims[3],
-            eps=1.0e-6,
-        )
-        self.feat_dim = int(dims[3])
+                # 28/32px images use four pooling stages.
+                # Larger images retain the standard five pooling stages.
+                if image_size <= 32 and num_pools == 5:
+                    continue
+
+                layers.append(
+                    nn.MaxPool2d(
+                        kernel_size=2,
+                        stride=2,
+                    )
+                )
+                continue
+
+            out_channels = int(item)
+
+            layers.append(
+                nn.Conv2d(
+                    current_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=True,
+                )
+            )
+            layers.append(
+                nn.ReLU(inplace=True)
+            )
+
+            current_channels = out_channels
+
+        self.features = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_dim = 512
 
         self._init_weights()
-
-    @staticmethod
-    def _make_stage(
-        dim: int,
-        depth: int,
-    ) -> nn.Sequential:
-        return nn.Sequential(
-            *[
-                ConvNeXtBlock(dim=dim)
-                for _ in range(depth)
-            ]
-        )
 
     def _init_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
-                nn.init.trunc_normal_(
+                nn.init.kaiming_normal_(
                     module.weight,
-                    std=0.02,
+                    mode="fan_out",
+                    nonlinearity="relu",
                 )
+
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-
-        x = self.stage1(x)
-
-        x = self.downsample1(x)
-        x = self.stage2(x)
-
-        x = self.downsample2(x)
-        x = self.stage3(x)
-
-        x = self.downsample3(x)
-        x = self.stage4(x)
-
-        x = x.mean(dim=(-2, -1))
-        x = self.norm(x)
-
-        return x
+        x = self.features(x)
+        x = self.pool(x)
+        return x.flatten(1)
 
 
 class ViTTinyBlock(nn.Module):
@@ -3803,13 +3705,13 @@ def build_resnet_cifar_backbone(
     )
 
 
-def build_convnext_tiny_backbone(
+def build_vgg11_backbone(
     *,
     in_channels: int = 3,
     image_size: int = 32,
-) -> ConvNeXtTinyBackbone:
-    """Build the small-image-adapted ConvNeXt-Tiny backbone."""
-    return ConvNeXtTinyBackbone(
+) -> VGG11Backbone:
+    """Build the no-BN, small-image-adapted VGG11 backbone."""
+    return VGG11Backbone(
         in_channels=in_channels,
         image_size=image_size,
     )
@@ -3829,7 +3731,7 @@ def build_vit_tiny_backbone(
 
 BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
     DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
-    "convnext_tiny": build_convnext_tiny_backbone,
+    "vgg11": build_vgg11_backbone,
     "vit_tiny": build_vit_tiny_backbone,
 }
 
@@ -4124,7 +4026,7 @@ class SparseMoEClassifier(nn.Module):
     为了让 backbone 对照实验中的 router / expert 参数规模保持一致，
     所有 backbone 都在进入 MoE 前统一成 512 维：
         resnet_cifar: 512 -> Identity
-        convnext_tiny: 768 -> Linear(768, 512)
+        vgg11: 512 -> Identity
         vit_tiny: 192 -> Linear(192, 512)
 
     backbone / backbone_adapter / router 都属于 non_expert 参数；

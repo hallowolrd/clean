@@ -9,8 +9,8 @@ CUDA_VISIBLE_DEVICES=0 python a/uniform.py \
   --backbone resnet_cifar \
   --output-dir outputs/cifar10_resnet18
 
-python plot_compare_acc.py \
-  --input-dir outputs/cifar10_resnet_cifar \
+python tools/plot_compare_acc.py \
+  --input-dir outputs/cifar10_convnext_tiny \
   --window 5
 
 支持的数据集：
@@ -24,7 +24,7 @@ femnist
 
 支持的backbone：
 resnet_cifar
-convnext_tiny
+vgg11
 vit_tiny
 
 kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
