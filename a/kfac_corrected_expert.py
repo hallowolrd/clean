@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-"""Fisher/K-FAC expert aggregation experiment.
+"""KFAC-Corrected expert aggregation experiment.
 
 All common experiment behavior is owned by base.py. This file preserves the
-expert-only Fisher/K-FAC aggregation implementation from commit 77e980c.
+expert-only KFAC-Corrected aggregation implementation from commit 77e980c.
 """
 
 # base.py must run its deterministic pre-PyTorch bootstrap first.
@@ -17,14 +17,14 @@ check_finite_state_dict = base.check_finite_state_dict
 clone_state_dict = base.clone_state_dict
 normalize_weights = base.normalize_weights
 
-ALGORITHM_NAME = "fisher_kfac_expert"
+ALGORITHM_NAME = "kfac_corrected_expert"
 
 EMBEDDED_METHOD_CONFIG = {
     "agg": {
         "non_expert": {"method": "uniform"},
         "expert": {"method": ALGORITHM_NAME},
     },
-    "kfac": {
+    "kfac_corrected": {
         "collect": True,
         "weight_mode": "sample_weighted",
         "solve_scope": "global_expert",
@@ -44,11 +44,14 @@ EMBEDDED_METHOD_CONFIG = {
         "fisher_timing": "after_train",
         "model_mode": "eval",
         "log_detail": True,
+        "power_max_iters": 50,
+        "power_tol": 1.0e-6,
+        "power_eps": 1.0e-12,
     },
 }
 
 METHOD_CONFIG_DEFAULTS = {
-    "kfac": {
+    "kfac_corrected": {
         "collect": False,
         "weight_mode": "sample_weighted",
         "solve_scope": "per_layer",
@@ -71,12 +74,15 @@ METHOD_CONFIG_DEFAULTS = {
         "use_server_validation": False,
         "model_selection": "final_step",
         "log_detail": True,
+        "power_max_iters": 50,
+        "power_tol": 1.0e-6,
+        "power_eps": 1.0e-12,
     },
 }
 
 import argparse
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -90,30 +96,27 @@ ConfigError = base.ConfigError
 
 
 # ============================================================================
-# Bundled from fl/kfac.py
+# Bundled from fl/kfac_corrected.py
 # ============================================================================
 
 
-KFACLayerPayload = Dict[str, Any]
-ExpertKFACPayload = Dict[str, KFACLayerPayload]
+KFACCorrectedLayerPayload = Dict[str, Any]
+ExpertKFACCorrectedPayload = Dict[str, KFACCorrectedLayerPayload]
 
 
 @dataclass
-class _KFACLayerBuffer:
-    """
-    单个 expert Linear 层的 K-FAC 统计缓存。
+class _KFACCorrectedLayerBuffer:
+    """Statistics for one expert Linear layer used by KFAC-Corrected.
 
-    对 Linear 层 z = W a + b：
-        A = E[a a^T]
-        B = E[delta delta^T]
+    The ordinary KFAC factors are
+        A = E[a a^T],  B = E[g g^T].
 
-    注意：
-        1. 这里累计的是 sum，最后导出时再除以 count 得到 mean。
-        2. include_bias=True 时，把 bias 合并到 activation 里：
-           a_aug = [a, 1]
-           W_aug = [W, b]
-        3. B 必须用每个样本/token 的 grad_output 外积后求和，
-           不能先平均 grad_output 再外积，否则会出现梯度抵消。
+    KFAC-Corrected additionally fits the dominant Kronecker product of the
+    residual Fisher block
+        F - A \\otimes B
+    with a matrix-free Power-SVD.  This requires pairing each routed sample's
+    activation a and output-gradient g.  We therefore keep only paired a/g
+    chunks on CPU; the full Fisher matrix is never formed.
     """
 
     module_name: str
@@ -121,11 +124,12 @@ class _KFACLayerBuffer:
     include_bias: bool
     A_sum: Optional[torch.Tensor] = None
     B_sum: Optional[torch.Tensor] = None
-    a_count: int = 0
-    b_count: int = 0
+    count: int = 0
+    activation_stack: List[torch.Tensor] = field(default_factory=list)
+    paired_a_chunks: List[torch.Tensor] = field(default_factory=list)
+    paired_g_chunks: List[torch.Tensor] = field(default_factory=list)
 
     def add_activation(self, activation: torch.Tensor) -> None:
-        """累计 A_sum += a^T a。"""
         if activation is None:
             return
 
@@ -134,222 +138,382 @@ class _KFACLayerBuffer:
             expected_dim=self.module.in_features,
             tensor_name=f"{self.module_name}.activation",
         )
-
         if a.numel() == 0 or a.size(0) <= 0:
             return
 
         a = a.detach().float()
-
         if self.include_bias and self.module.bias is not None:
-            ones = torch.ones(
-                a.size(0),
-                1,
-                device=a.device,
-                dtype=a.dtype,
-            )
+            ones = torch.ones(a.size(0), 1, device=a.device, dtype=a.dtype)
             a = torch.cat([a, ones], dim=1)
 
-        A_batch = a.transpose(0, 1).matmul(a)
-
-        if self.A_sum is None:
-            self.A_sum = torch.zeros_like(A_batch)
-
-        self.A_sum.add_(A_batch)
-        self.a_count += int(a.size(0))
+        # One module may be invoked more than once in a graph.  Backward visits
+        # those invocations in reverse order, so a stack gives the correct pair.
+        self.activation_stack.append(a)
 
     def add_grad_output(self, grad_output: torch.Tensor) -> None:
-        """累计 B_sum += delta^T delta。"""
-        if grad_output is None:
+        if grad_output is None or not self.activation_stack:
             return
 
-        delta = _flatten_last_dim(
+        g = _flatten_last_dim(
             tensor=grad_output,
             expected_dim=self.module.out_features,
             tensor_name=f"{self.module_name}.grad_output",
         )
-
-        if delta.numel() == 0 or delta.size(0) <= 0:
+        if g.numel() == 0 or g.size(0) <= 0:
+            self.activation_stack.pop()
             return
 
-        delta = delta.detach().float()
-        B_batch = delta.transpose(0, 1).matmul(delta)
+        a = self.activation_stack.pop()
+        g = g.detach().float()
 
+        if a.size(0) != g.size(0):
+            raise ValueError(
+                f"{self.module_name} 的 KFAC-Corrected activation/gradient "
+                f"样本数不匹配：a={a.size(0)}, g={g.size(0)}"
+            )
+
+        A_batch = a.transpose(0, 1).matmul(a)
+        B_batch = g.transpose(0, 1).matmul(g)
+
+        if self.A_sum is None:
+            self.A_sum = torch.zeros_like(A_batch)
         if self.B_sum is None:
             self.B_sum = torch.zeros_like(B_batch)
 
+        self.A_sum.add_(A_batch)
         self.B_sum.add_(B_batch)
-        self.b_count += int(delta.size(0))
+        self.count += int(a.size(0))
 
-    def to_payload(self, min_count: int) -> Optional[KFACLayerPayload]:
-        """
-        导出 A_mean / B_mean / count。
+        # Store the minimum information needed by the implicit residual operator.
+        # CPU storage prevents the evidence cache from occupying accelerator RAM.
+        self.paired_a_chunks.append(a.detach().cpu())
+        self.paired_g_chunks.append(g.detach().cpu())
 
-        count 使用 a_count 和 b_count 的较小值。
-        正常情况下两者应该相等；如果不等，说明某些 forward 没有对应 backward，
-        这里保守使用 min，避免服务端误放大证据。
-        """
-        if self.A_sum is None or self.B_sum is None:
+    def clear_pending_activations(self) -> None:
+        self.activation_stack.clear()
+
+    def to_payload(
+        self,
+        min_count: int,
+        power_max_iters: int,
+        power_tol: float,
+        power_eps: float,
+    ) -> Optional[KFACCorrectedLayerPayload]:
+        if self.A_sum is None or self.B_sum is None or self.count <= 0:
+            return None
+        if self.count < int(min_count):
+            return None
+        if not self.paired_a_chunks or not self.paired_g_chunks:
             return None
 
-        if self.a_count <= 0 or self.b_count <= 0:
+        A = (self.A_sum / float(self.count)).detach().cpu()
+        B = (self.B_sum / float(self.count)).detach().cpu()
+        A = _symmetrize_square(A)
+        B = _symmetrize_square(B)
+
+        if not torch.isfinite(A).all() or not torch.isfinite(B).all():
             return None
 
-        count = min(int(self.a_count), int(self.b_count))
+        correction = _compute_kfac_residual_correction(
+            a_chunks=self.paired_a_chunks,
+            g_chunks=self.paired_g_chunks,
+            A=A,
+            B=B,
+            max_iters=power_max_iters,
+            tol=power_tol,
+            eps=power_eps,
+        )
+        A_corr = correction["A_corr"]
+        B_corr = correction["B_corr"]
 
-        if count < int(min_count):
-            return None
-
-        A_mean = self.A_sum / float(self.a_count)
-        B_mean = self.B_sum / float(self.b_count)
-
-        if not torch.isfinite(A_mean).all():
-            return None
-
-        if not torch.isfinite(B_mean).all():
+        if not torch.isfinite(A_corr).all() or not torch.isfinite(B_corr).all():
             return None
 
         bias_name = None
         if self.module.bias is not None:
             bias_name = f"{self.module_name}.bias"
 
+        base_fro = float(A.float().norm().item()) * float(B.float().norm().item())
+        corr_fro = float(A_corr.float().norm().item()) * float(B_corr.float().norm().item())
+        corr_ratio = corr_fro / (base_fro + float(power_eps))
+
         return {
             "module_name": self.module_name,
             "weight_name": f"{self.module_name}.weight",
             "bias_name": bias_name,
-            "A": A_mean.detach().cpu(),
-            "B": B_mean.detach().cpu(),
-            "count": int(count),
-            "a_count": int(self.a_count),
-            "b_count": int(self.b_count),
+            "A": A,
+            "B": B,
+            "A_corr": A_corr,
+            "B_corr": B_corr,
+            "count": int(self.count),
+            "a_count": int(self.count),
+            "b_count": int(self.count),
+            "pair_count": int(self.count),
             "include_bias": bool(self.include_bias and self.module.bias is not None),
             "in_features": int(self.module.in_features),
             "out_features": int(self.module.out_features),
-            "trace_A": float(torch.trace(A_mean).detach().cpu().item()),
-            "trace_B": float(torch.trace(B_mean).detach().cpu().item()),
+            "trace_A": float(torch.trace(A).item()),
+            "trace_B": float(torch.trace(B).item()),
+            "trace_A_corr": float(torch.trace(A_corr).item()),
+            "trace_B_corr": float(torch.trace(B_corr).item()),
+            "norm_A_corr": float(A_corr.float().norm().item()),
+            "norm_B_corr": float(B_corr.float().norm().item()),
+            "correction_sigma": float(correction["sigma"]),
+            "power_iterations": int(correction["iterations"]),
+            "power_error": float(correction["error"]),
+            "power_relative_error": float(correction["relative_error"]),
+            "correction_fro_ratio": float(corr_ratio),
         }
 
 
-def collect_expert_kfac(
+def _fisher_z_matvec_from_pairs(
+    a_chunks: Sequence[torch.Tensor],
+    g_chunks: Sequence[torch.Tensor],
+    V: torch.Tensor,
+) -> torch.Tensor:
+    """Compute Z(F) vec(V) without constructing F or Z(F)."""
+    if len(a_chunks) != len(g_chunks) or len(a_chunks) == 0:
+        raise ValueError("KFAC-Corrected paired evidence 为空或长度不一致。")
+
+    out = torch.zeros(
+        a_chunks[0].size(1), a_chunks[0].size(1), dtype=torch.float32
+    )
+    count = 0
+    V = V.detach().cpu().float()
+
+    for a, g in zip(a_chunks, g_chunks):
+        a = a.float()
+        g = g.float()
+        if a.size(0) != g.size(0):
+            raise ValueError("KFAC-Corrected paired chunk 样本数不一致。")
+        coeff = torch.sum((g.matmul(V)) * g, dim=1)
+        out.add_(a.transpose(0, 1).matmul(a * coeff.unsqueeze(1)))
+        count += int(a.size(0))
+
+    if count <= 0:
+        return out
+    return out / float(count)
+
+
+def _fisher_z_t_matvec_from_pairs(
+    a_chunks: Sequence[torch.Tensor],
+    g_chunks: Sequence[torch.Tensor],
+    U: torch.Tensor,
+) -> torch.Tensor:
+    """Compute Z(F)^T vec(U) without constructing F or Z(F)."""
+    if len(a_chunks) != len(g_chunks) or len(a_chunks) == 0:
+        raise ValueError("KFAC-Corrected paired evidence 为空或长度不一致。")
+
+    out = torch.zeros(
+        g_chunks[0].size(1), g_chunks[0].size(1), dtype=torch.float32
+    )
+    count = 0
+    U = U.detach().cpu().float()
+
+    for a, g in zip(a_chunks, g_chunks):
+        a = a.float()
+        g = g.float()
+        if a.size(0) != g.size(0):
+            raise ValueError("KFAC-Corrected paired chunk 样本数不一致。")
+        coeff = torch.sum((a.matmul(U)) * a, dim=1)
+        out.add_(g.transpose(0, 1).matmul(g * coeff.unsqueeze(1)))
+        count += int(g.size(0))
+
+    if count <= 0:
+        return out
+    return out / float(count)
+
+
+def _residual_z_matvec(
+    a_chunks: Sequence[torch.Tensor],
+    g_chunks: Sequence[torch.Tensor],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    V: torch.Tensor,
+) -> torch.Tensor:
+    exact_part = _fisher_z_matvec_from_pairs(a_chunks, g_chunks, V)
+    kfac_scalar = torch.sum(B.float() * V.detach().cpu().float())
+    return _symmetrize_square(exact_part - kfac_scalar * A.float())
+
+
+def _residual_z_t_matvec(
+    a_chunks: Sequence[torch.Tensor],
+    g_chunks: Sequence[torch.Tensor],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    U: torch.Tensor,
+) -> torch.Tensor:
+    exact_part = _fisher_z_t_matvec_from_pairs(a_chunks, g_chunks, U)
+    kfac_scalar = torch.sum(A.float() * U.detach().cpu().float())
+    return _symmetrize_square(exact_part - kfac_scalar * B.float())
+
+
+def _compute_kfac_residual_correction(
+    a_chunks: Sequence[torch.Tensor],
+    g_chunks: Sequence[torch.Tensor],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    max_iters: int,
+    tol: float,
+    eps: float,
+) -> Dict[str, Any]:
+    """Dominant Kronecker correction of F - A⊗B via matrix-free Power-SVD."""
+    if max_iters <= 0:
+        return {
+            "A_corr": torch.zeros_like(A),
+            "B_corr": torch.zeros_like(B),
+            "sigma": 0.0,
+            "iterations": 0,
+            "error": 0.0,
+            "relative_error": 0.0,
+        }
+
+    # Deterministic cold start.  A warm start across rounds would require
+    # persistent client-method state, which the current generic plugin hook does
+    # not expose.
+    v = torch.ones_like(B, dtype=torch.float32)
+    v = _symmetrize_square(v)
+    v_norm = float(v.norm().item())
+    if v_norm <= eps:
+        return {
+            "A_corr": torch.zeros_like(A),
+            "B_corr": torch.zeros_like(B),
+            "sigma": 0.0,
+            "iterations": 0,
+            "error": 0.0,
+            "relative_error": 0.0,
+        }
+    v = v / v_norm
+
+    sigma = 0.0
+    error = float("inf")
+    relative_error = float("inf")
+    iterations = 0
+    u = torch.zeros_like(A, dtype=torch.float32)
+
+    for k in range(1, int(max_iters) + 1):
+        w = _residual_z_matvec(a_chunks, g_chunks, A, B, v)
+        w_norm = float(w.norm().item())
+        if (not math.isfinite(w_norm)) or w_norm <= eps:
+            sigma = 0.0
+            error = 0.0
+            relative_error = 0.0
+            iterations = k
+            u.zero_()
+            v.zero_()
+            break
+        u = w / w_norm
+
+        z = _residual_z_t_matvec(a_chunks, g_chunks, A, B, u)
+        sigma = float(z.norm().item())
+        if (not math.isfinite(sigma)) or sigma <= eps:
+            sigma = 0.0
+            error = 0.0
+            relative_error = 0.0
+            iterations = k
+            u.zero_()
+            v.zero_()
+            break
+        v = _symmetrize_square(z / sigma)
+        v = v / (v.norm() + float(eps))
+
+        residual = _residual_z_matvec(a_chunks, g_chunks, A, B, v) - sigma * u
+        error = float(residual.norm().item())
+        relative_error = float(error / (abs(sigma) + float(eps)))
+        iterations = k
+        if error <= float(tol):
+            break
+
+    if sigma <= eps or not torch.isfinite(u).all() or not torch.isfinite(v).all():
+        A_corr = torch.zeros_like(A)
+        B_corr = torch.zeros_like(B)
+        sigma = 0.0
+    else:
+        scale = math.sqrt(max(float(sigma), 0.0))
+        A_corr = _symmetrize_square(scale * u).to(dtype=A.dtype)
+        B_corr = _symmetrize_square(scale * v).to(dtype=B.dtype)
+
+    return {
+        "A_corr": A_corr.detach().cpu(),
+        "B_corr": B_corr.detach().cpu(),
+        "sigma": float(sigma),
+        "iterations": int(iterations),
+        "error": float(error if math.isfinite(error) else 0.0),
+        "relative_error": float(relative_error if math.isfinite(relative_error) else 0.0),
+    }
+
+
+def collect_expert_kfac_corrected(
     model: nn.Module,
     train_loader: DataLoader,
     criterion: Optional[nn.Module] = None,
     device: torch.device | str | None = None,
     cfg: Any = None,
-) -> ExpertKFACPayload:
-    """
-    在本地训练完成后的 local_model 上，额外跑一遍数据来采集 expert Linear 层的 K-FAC 因子。
-
-    返回格式：
-        {
-            "switch_layers.0.switch_ffn.experts.2.0": {
-                "module_name": ...,
-                "weight_name": "...weight",
-                "bias_name": "...bias",
-                "A": Tensor[in_dim(+1), in_dim(+1)],
-                "B": Tensor[out_dim, out_dim],
-                "count": int,
-                ...
-            },
-            ...
-        }
-
-    设计约束：
-        1. 只采集 module name 包含 experts. 的 nn.Linear。
-        2. 默认使用 CrossEntropyLoss(reduction="sum")，避免 mean loss 缩放梯度。
-        3. 默认 model.eval() 采集，避免 Dropout / BN 引入额外随机性。
-        4. 不修改训练逻辑，不做 optimizer.step()。
-        5. 这里只支持 after_train 采集时机，和 FedFisher 的“先得到本地模型再算 Fisher”流程对齐。
-    """
+) -> ExpertKFACCorrectedPayload:
+    """Collect KFAC factors and the dominant residual Kronecker correction."""
     if device is None:
         device = _infer_model_device(model)
-
     device = torch.device(device)
 
-    include_bias = bool(_cfg_get(cfg, "kfac.include_bias", True))
-    min_count = int(_cfg_get(cfg, "kfac.min_count", 1))
-    max_batches = int(_cfg_get(cfg, "kfac.max_batches", 0))
-    expert_name_pattern = str(_cfg_get(cfg, "kfac.expert_name_pattern", "experts."))
-    model_mode = str(_cfg_get(cfg, "kfac.model_mode", "eval")).lower().strip()
+    include_bias = bool(_cfg_get(cfg, "kfac_corrected.include_bias", True))
+    min_count = int(_cfg_get(cfg, "kfac_corrected.min_count", 1))
+    max_batches = int(_cfg_get(cfg, "kfac_corrected.max_batches", 0))
+    expert_name_pattern = str(
+        _cfg_get(cfg, "kfac_corrected.expert_name_pattern", "experts.")
+    )
+    model_mode = str(_cfg_get(cfg, "kfac_corrected.model_mode", "eval")).lower().strip()
     fisher_timing = str(
         _cfg_get(
             cfg,
-            "kfac.fisher_timing",
-            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
+            "kfac_corrected.fisher_timing",
+            _cfg_get(cfg, "kfac_corrected.collect_timing", "after_train"),
         )
     ).lower().strip()
+    power_max_iters = int(_cfg_get(cfg, "kfac_corrected.power_max_iters", 50))
+    power_tol = float(_cfg_get(cfg, "kfac_corrected.power_tol", 1.0e-6))
+    power_eps = float(_cfg_get(cfg, "kfac_corrected.power_eps", 1.0e-12))
 
     if fisher_timing != "after_train":
         raise ValueError(
-            "当前 collect_expert_kfac 只支持 kfac.fisher_timing=after_train。"
-            f"当前值：{fisher_timing}。"
-            "请在客户端本地训练完成后再单独采集 K-FAC。"
+            "当前 collect_expert_kfac_corrected 只支持 "
+            "kfac_corrected.fisher_timing=after_train。"
         )
-
     if min_count <= 0:
         min_count = 1
 
-    buffers: Dict[str, _KFACLayerBuffer] = {}
+    buffers: Dict[str, _KFACCorrectedLayerBuffer] = {}
     handles = []
-
     for module_name, module in model.named_modules():
-        if not _is_expert_linear(
-            module_name=module_name,
-            module=module,
-            expert_name_pattern=expert_name_pattern,
-        ):
+        if not _is_expert_linear(module_name, module, expert_name_pattern):
             continue
-
-        buffers[module_name] = _KFACLayerBuffer(
+        buffers[module_name] = _KFACCorrectedLayerBuffer(
             module_name=module_name,
             module=module,
             include_bias=include_bias,
         )
 
-    if len(buffers) == 0:
+    if not buffers:
         return {}
 
     for module_name, module_buffer in buffers.items():
         module = module_buffer.module
 
-        def forward_hook(
-            layer: nn.Module,
-            inputs: tuple[torch.Tensor, ...],
-            output: torch.Tensor,
-            name: str = module_name,
-        ) -> None:
-            if len(inputs) == 0:
-                return
+        def forward_hook(layer, inputs, output, name=module_name):
+            if inputs:
+                buffers[name].add_activation(inputs[0])
 
-            buffers[name].add_activation(inputs[0])
-
-        def backward_hook(
-            layer: nn.Module,
-            grad_input: tuple[Optional[torch.Tensor], ...],
-            grad_output: tuple[Optional[torch.Tensor], ...],
-            name: str = module_name,
-        ) -> None:
-            if len(grad_output) == 0:
-                return
-
-            buffers[name].add_grad_output(grad_output[0])
+        def backward_hook(layer, grad_input, grad_output, name=module_name):
+            if grad_output:
+                buffers[name].add_grad_output(grad_output[0])
 
         handles.append(module.register_forward_hook(forward_hook))
         handles.append(module.register_full_backward_hook(backward_hook))
 
     was_training = bool(model.training)
     model.to(device)
-
-    if model_mode == "train":
-        model.train()
-    else:
-        model.eval()
-
-    sum_criterion = _build_sum_criterion(
-        cfg=cfg,
-        fallback_criterion=criterion,
-    )
+    model.train() if model_mode == "train" else model.eval()
+    sum_criterion = _build_sum_criterion(cfg=cfg, fallback_criterion=criterion)
     sum_criterion.to(device)
-
     model.zero_grad(set_to_none=True)
 
     try:
@@ -357,58 +521,51 @@ def collect_expert_kfac(
             for batch_idx, batch in enumerate(train_loader):
                 if max_batches > 0 and batch_idx >= max_batches:
                     break
-
                 images, targets = unpack_batch(batch)
-
                 images = images.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-
                 model.zero_grad(set_to_none=True)
-
                 outputs = model(images)
                 logits = extract_logits(outputs)
-
                 loss = sum_criterion(logits, targets)
-
                 if not torch.isfinite(loss):
+                    for buffer in buffers.values():
+                        buffer.clear_pending_activations()
                     continue
-
                 loss.backward()
-
-                # 只采集 Fisher，不更新参数。
                 model.zero_grad(set_to_none=True)
     finally:
         for handle in handles:
             handle.remove()
-
+        for buffer in buffers.values():
+            buffer.clear_pending_activations()
         model.zero_grad(set_to_none=True)
         model.train(was_training)
 
-    payload: ExpertKFACPayload = {}
-
+    payload: ExpertKFACCorrectedPayload = {}
     for module_name, module_buffer in buffers.items():
-        layer_payload = module_buffer.to_payload(min_count=min_count)
-
+        layer_payload = module_buffer.to_payload(
+            min_count=min_count,
+            power_max_iters=power_max_iters,
+            power_tol=power_tol,
+            power_eps=power_eps,
+        )
         if layer_payload is None:
             continue
-
         layer_payload["fisher_timing"] = fisher_timing
         layer_payload["collect_timing"] = fisher_timing
         layer_payload["model_mode"] = model_mode
         layer_payload["max_batches"] = int(max_batches)
         layer_payload["expert_name_pattern"] = expert_name_pattern
-
+        layer_payload["power_max_iters"] = int(power_max_iters)
+        layer_payload["power_tol"] = float(power_tol)
         payload[module_name] = layer_payload
-
     return payload
 
 
-def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
-    """
-    生成轻量诊断信息，方便 client.py 或日志系统记录。
-
-    不包含 A/B tensor 本体。
-    """
+def summarize_expert_kfac_corrected(
+    payload: ExpertKFACCorrectedPayload,
+) -> Dict[str, Any]:
     if not payload:
         return {
             "num_layers": 0,
@@ -416,8 +573,10 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
             "mean_count": 0.0,
             "mean_trace_A": 0.0,
             "mean_trace_B": 0.0,
-            "max_trace_A": 0.0,
-            "max_trace_B": 0.0,
+            "mean_correction_sigma": 0.0,
+            "mean_correction_fro_ratio": 0.0,
+            "mean_power_iterations": 0.0,
+            "max_power_error": 0.0,
             "fisher_timing": "",
             "model_mode": "",
         }
@@ -425,21 +584,21 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
     counts = [int(item["count"]) for item in payload.values()]
     trace_A = [float(item["trace_A"]) for item in payload.values()]
     trace_B = [float(item["trace_B"]) for item in payload.values()]
+    sigmas = [float(item.get("correction_sigma", 0.0)) for item in payload.values()]
+    corr_ratios = [float(item.get("correction_fro_ratio", 0.0)) for item in payload.values()]
+    power_iters = [float(item.get("power_iterations", 0)) for item in payload.values()]
+    power_errors = [float(item.get("power_error", 0.0)) for item in payload.values()]
 
-    fisher_timings = sorted(
-        {
-            str(item.get("fisher_timing", item.get("collect_timing", "")))
-            for item in payload.values()
-            if str(item.get("fisher_timing", item.get("collect_timing", ""))) != ""
-        }
-    )
-    model_modes = sorted(
-        {
-            str(item.get("model_mode", ""))
-            for item in payload.values()
-            if str(item.get("model_mode", "")) != ""
-        }
-    )
+    fisher_timings = sorted({
+        str(item.get("fisher_timing", item.get("collect_timing", "")))
+        for item in payload.values()
+        if str(item.get("fisher_timing", item.get("collect_timing", "")))
+    })
+    model_modes = sorted({
+        str(item.get("model_mode", ""))
+        for item in payload.values()
+        if str(item.get("model_mode", ""))
+    })
 
     return {
         "num_layers": int(len(payload)),
@@ -447,18 +606,14 @@ def summarize_expert_kfac(payload: ExpertKFACPayload) -> Dict[str, Any]:
         "mean_count": float(sum(counts) / max(len(counts), 1)),
         "mean_trace_A": float(sum(trace_A) / max(len(trace_A), 1)),
         "mean_trace_B": float(sum(trace_B) / max(len(trace_B), 1)),
-        "max_trace_A": float(max(trace_A)),
-        "max_trace_B": float(max(trace_B)),
-        "fisher_timing": (
-            fisher_timings[0]
-            if len(fisher_timings) == 1
-            else ",".join(fisher_timings)
-        ),
-        "model_mode": (
-            model_modes[0]
-            if len(model_modes) == 1
-            else ",".join(model_modes)
-        ),
+        "mean_correction_sigma": _safe_mean(sigmas),
+        "max_correction_sigma": _safe_max(sigmas),
+        "mean_correction_fro_ratio": _safe_mean(corr_ratios),
+        "max_correction_fro_ratio": _safe_max(corr_ratios),
+        "mean_power_iterations": _safe_mean(power_iters),
+        "max_power_error": _safe_max(power_errors),
+        "fisher_timing": fisher_timings[0] if len(fisher_timings) == 1 else ",".join(fisher_timings),
+        "model_mode": model_modes[0] if len(model_modes) == 1 else ",".join(model_modes),
     }
 
 
@@ -552,150 +707,168 @@ def _infer_model_device(model: nn.Module) -> torch.device:
 
 
 def validate_method_config(cfg: Mapping[str, Any]) -> None:
-    """检查 K-FAC / FedFisher expert 聚合配置。"""
-    kfac_cfg = cfg.get("kfac", {})
+    """检查 KFAC-Corrected / FedFisher expert 聚合配置。"""
+    corrected_cfg = cfg.get("kfac_corrected", {})
 
-    if not isinstance(kfac_cfg, Mapping):
-        raise ConfigError("kfac 必须是 dict。")
+    if not isinstance(corrected_cfg, Mapping):
+        raise ConfigError("kfac_corrected 必须是 dict。")
 
-    weight_mode = str(kfac_cfg.get("weight_mode", "sample_weighted")).lower().strip()
+    weight_mode = str(corrected_cfg.get("weight_mode", "sample_weighted")).lower().strip()
     if weight_mode not in {"routed_count", "sample_weighted", "uniform"}:
         raise ConfigError(
-            f"不支持的 kfac.weight_mode：{weight_mode}。"
+            f"不支持的 kfac_corrected.weight_mode：{weight_mode}。"
             "当前支持：routed_count, sample_weighted, uniform"
         )
 
-    solve_scope = str(kfac_cfg.get("solve_scope", "per_layer")).lower().strip()
+    solve_scope = str(corrected_cfg.get("solve_scope", "per_layer")).lower().strip()
     if solve_scope not in {"per_layer", "global_expert"}:
         raise ConfigError(
-            f"不支持的 kfac.solve_scope：{solve_scope}。"
+            f"不支持的 kfac_corrected.solve_scope：{solve_scope}。"
             "当前支持：per_layer, global_expert"
         )
 
-    solve_mode = str(kfac_cfg.get("solve_mode", "cg")).lower().strip()
+    solve_mode = str(corrected_cfg.get("solve_mode", "cg")).lower().strip()
     if solve_mode not in {"cg", "gd", "adam"}:
         raise ConfigError(
-            f"不支持的 kfac.solve_mode：{solve_mode}。"
+            f"不支持的 kfac_corrected.solve_mode：{solve_mode}。"
             "当前支持：cg, gd, adam"
         )
 
     if solve_scope == "global_expert" and solve_mode == "cg":
         raise ConfigError(
-            "kfac.solve_scope=global_expert 时不建议使用 solve_mode=cg。"
+            "kfac_corrected.solve_scope=global_expert 时不建议使用 solve_mode=cg。"
             "请使用 gd 或 adam。"
         )
 
     if solve_scope == "per_layer" and solve_mode in {"gd", "adam"}:
         raise ConfigError(
-            "kfac.solve_scope=per_layer 当前只支持 solve_mode=cg。"
+            "kfac_corrected.solve_scope=per_layer 当前只支持 solve_mode=cg。"
             "如果要使用 gd/adam，请设置 solve_scope=global_expert。"
         )
 
-    server_steps = int(kfac_cfg.get("server_steps", 5))
+    server_steps = int(corrected_cfg.get("server_steps", 5))
     if server_steps < 0:
         raise ConfigError(
-            f"kfac.server_steps 不能小于 0，当前值：{server_steps}"
+            f"kfac_corrected.server_steps 不能小于 0，当前值：{server_steps}"
         )
 
-    server_lr = float(kfac_cfg.get("server_lr", 0.01))
+    server_lr = float(corrected_cfg.get("server_lr", 0.01))
     if server_lr <= 0:
         raise ConfigError(
-            f"kfac.server_lr 必须大于 0，当前值：{server_lr}"
+            f"kfac_corrected.server_lr 必须大于 0，当前值：{server_lr}"
         )
 
-    adam_beta1 = float(kfac_cfg.get("adam_beta1", 0.9))
-    adam_beta2 = float(kfac_cfg.get("adam_beta2", 0.99))
+    adam_beta1 = float(corrected_cfg.get("adam_beta1", 0.9))
+    adam_beta2 = float(corrected_cfg.get("adam_beta2", 0.99))
 
     if not (0.0 <= adam_beta1 < 1.0):
         raise ConfigError(
-            f"kfac.adam_beta1 必须在 [0, 1) 范围内，当前值：{adam_beta1}"
+            f"kfac_corrected.adam_beta1 必须在 [0, 1) 范围内，当前值：{adam_beta1}"
         )
 
     if not (0.0 <= adam_beta2 < 1.0):
         raise ConfigError(
-            f"kfac.adam_beta2 必须在 [0, 1) 范围内，当前值：{adam_beta2}"
+            f"kfac_corrected.adam_beta2 必须在 [0, 1) 范围内，当前值：{adam_beta2}"
         )
 
-    adam_eps = float(kfac_cfg.get("adam_eps", 0.01))
+    adam_eps = float(corrected_cfg.get("adam_eps", 0.01))
     if adam_eps <= 0:
         raise ConfigError(
-            f"kfac.adam_eps 必须大于 0，当前值：{adam_eps}"
+            f"kfac_corrected.adam_eps 必须大于 0，当前值：{adam_eps}"
         )
 
-    cg_tol = float(kfac_cfg.get("cg_tol", 1.0e-8))
+    cg_tol = float(corrected_cfg.get("cg_tol", 1.0e-8))
     if cg_tol < 0:
         raise ConfigError(
-            f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}"
+            f"kfac_corrected.cg_tol 不能小于 0，当前值：{cg_tol}"
         )
 
-    damping = float(kfac_cfg.get("damping", 0.0))
+    damping = float(corrected_cfg.get("damping", 0.0))
     if damping < 0:
         raise ConfigError(
-            f"kfac.damping 不能小于 0，当前值：{damping}"
+            f"kfac_corrected.damping 不能小于 0，当前值：{damping}"
         )
 
-    min_count = int(kfac_cfg.get("min_count", 1))
+    min_count = int(corrected_cfg.get("min_count", 1))
     if min_count <= 0:
         raise ConfigError(
-            f"kfac.min_count 必须大于 0，当前值：{min_count}"
+            f"kfac_corrected.min_count 必须大于 0，当前值：{min_count}"
         )
 
-    max_batches = int(kfac_cfg.get("max_batches", 0))
+    max_batches = int(corrected_cfg.get("max_batches", 0))
     if max_batches < 0:
         raise ConfigError(
-            f"kfac.max_batches 不能小于 0，当前值：{max_batches}"
+            f"kfac_corrected.max_batches 不能小于 0，当前值：{max_batches}"
         )
 
-    fallback = str(kfac_cfg.get("fallback", "none")).lower().strip()
+    power_max_iters = int(corrected_cfg.get("power_max_iters", 50))
+    if power_max_iters <= 0:
+        raise ConfigError(
+            f"kfac_corrected.power_max_iters 必须大于 0，当前值：{power_max_iters}"
+        )
+
+    power_tol = float(corrected_cfg.get("power_tol", 1.0e-6))
+    if power_tol < 0:
+        raise ConfigError(
+            f"kfac_corrected.power_tol 不能小于 0，当前值：{power_tol}"
+        )
+
+    power_eps = float(corrected_cfg.get("power_eps", 1.0e-12))
+    if power_eps <= 0:
+        raise ConfigError(
+            f"kfac_corrected.power_eps 必须大于 0，当前值：{power_eps}"
+        )
+
+    fallback = str(corrected_cfg.get("fallback", "none")).lower().strip()
     if fallback not in {"none", "sample_weighted"}:
         raise ConfigError(
-            f"不支持的 kfac.fallback：{fallback}。"
+            f"不支持的 kfac_corrected.fallback：{fallback}。"
             "当前支持：none, sample_weighted"
         )
 
-    fisher_timing = str(kfac_cfg.get("fisher_timing", "after_train")).lower().strip()
+    fisher_timing = str(corrected_cfg.get("fisher_timing", "after_train")).lower().strip()
     if fisher_timing != "after_train":
         raise ConfigError(
-            f"当前只支持 kfac.fisher_timing=after_train，当前值：{fisher_timing}"
+            f"当前只支持 kfac_corrected.fisher_timing=after_train，当前值：{fisher_timing}"
         )
 
-    model_mode = str(kfac_cfg.get("model_mode", "eval")).lower().strip()
+    model_mode = str(corrected_cfg.get("model_mode", "eval")).lower().strip()
     if model_mode not in {"eval", "train"}:
         raise ConfigError(
-            f"不支持的 kfac.model_mode：{model_mode}。"
+            f"不支持的 kfac_corrected.model_mode：{model_mode}。"
             "当前支持：eval, train"
         )
 
-    model_selection = str(kfac_cfg.get("model_selection", "final_step")).lower().strip()
+    model_selection = str(corrected_cfg.get("model_selection", "final_step")).lower().strip()
     if model_selection != "final_step":
         raise ConfigError(
             "当前主实验不支持 server validation 选 best，"
-            f"kfac.model_selection 必须是 final_step，当前值：{model_selection}"
+            f"kfac_corrected.model_selection 必须是 final_step，当前值：{model_selection}"
         )
 
-    use_server_validation = bool(kfac_cfg.get("use_server_validation", False))
+    use_server_validation = bool(corrected_cfg.get("use_server_validation", False))
     if use_server_validation:
         raise ConfigError(
             "当前主实验不使用 server validation，"
-            "请设置 kfac.use_server_validation=false。"
+            "请设置 kfac_corrected.use_server_validation=false。"
         )
 
 
 
-class FisherKFACExpertAggregator(Aggregator):
+class KFACCorrectedExpertAggregator(Aggregator):
     """
-    基于 K-FAC Fisher 的专家参数聚合器。
+    基于 KFAC-Corrected Fisher approximation 的专家参数聚合器。
 
     这个聚合器只用于 expert 参数聚合，不用于 non_expert 参数。
 
-    paper-like FedFisher 目标：
+    FedFisher expert objective：
         min_W sum_i p_i / 2 * <W - W_i, F_i(W - W_i)>
 
-    其中：
-        F_i ≈ A_i ⊗ B_i
+    其中每个 Linear layer 使用：
+        F_i ≈ A_i ⊗ B_i + A_corr_i ⊗ B_corr_i
 
-    对 Linear 层，K-FAC matvec 为：
-        F_i vec(W) ≈ vec(B_i @ W @ A_i)
+    因而矩阵形式的 matvec 为：
+        F_i(W) ≈ B_i @ W @ A_i + B_corr_i @ W @ A_corr_i
 
     默认 paper-like 模式不再把 routed count 当聚合权重，也不再默认加入
     damping 软正则。routed count 只用于判断该 expert layer 的 K-FAC 是否有效。
@@ -725,9 +898,9 @@ class FisherKFACExpertAggregator(Aggregator):
         为了满足 Aggregator 接口，返回样本数权重。
 
         注意：
-            fisher_kfac_expert 的主聚合逻辑不走普通加权 delta。
+            kfac_corrected_expert 的主聚合逻辑不走普通加权 delta。
             这里的权重主要用于 fallback=sample_weighted，以及
-            kfac.weight_mode=sample_weighted 时的客户端级权重。
+            kfac_corrected.weight_mode=sample_weighted 时的客户端级权重。
         """
         return build_sample_weights(client_updates)
 
@@ -740,7 +913,7 @@ class FisherKFACExpertAggregator(Aggregator):
         strict: bool = True,
     ) -> AggregationResult:
         """
-        执行 K-FAC expert 聚合。
+        执行 KFAC-Corrected expert 聚合。
 
         参数：
             global_state:
@@ -762,7 +935,7 @@ class FisherKFACExpertAggregator(Aggregator):
         self._validate_client_updates(client_updates)
 
         if self.param_group_name != "expert":
-            raise ValueError("fisher_kfac_expert 只能用于 expert 参数聚合。")
+            raise ValueError("kfac_corrected_expert 只能用于 expert 参数聚合。")
 
         target_param_names = _resolve_param_names(
             global_state=global_state,
@@ -778,56 +951,56 @@ class FisherKFACExpertAggregator(Aggregator):
         else:
             new_state_dict = clone_state_dict(base_state)
 
-        min_count = int(_cfg_get(self.cfg, "kfac.min_count", 512))
-        solver_steps = int(_cfg_get(self.cfg, "kfac.server_steps", 300))
-        cg_tol = float(_cfg_get(self.cfg, "kfac.cg_tol", 1.0e-8))
-        server_lr = float(_cfg_get(self.cfg, "kfac.server_lr", 0.003))
-        adam_beta1 = float(_cfg_get(self.cfg, "kfac.adam_beta1", 0.9))
-        adam_beta2 = float(_cfg_get(self.cfg, "kfac.adam_beta2", 0.99))
-        adam_eps = float(_cfg_get(self.cfg, "kfac.adam_eps", 0.01))
-        damping = float(_cfg_get(self.cfg, "kfac.damping", 0.01))
-        use_damping = bool(_cfg_get(self.cfg, "kfac.use_damping", True))
-        fallback = str(_cfg_get(self.cfg, "kfac.fallback", "none")).lower().strip()
-        weight_mode = str(_cfg_get(self.cfg, "kfac.weight_mode", "sample_weighted")).lower().strip()
-        solve_scope = str(_cfg_get(self.cfg, "kfac.solve_scope", "global_expert")).lower().strip()
-        solve_mode = str(_cfg_get(self.cfg, "kfac.solve_mode", "adam")).lower().strip()
-        fisher_timing = str(_cfg_get(self.cfg, "kfac.fisher_timing", "after_train")).lower().strip()
+        min_count = int(_cfg_get(self.cfg, "kfac_corrected.min_count", 512))
+        solver_steps = int(_cfg_get(self.cfg, "kfac_corrected.server_steps", 50))
+        cg_tol = float(_cfg_get(self.cfg, "kfac_corrected.cg_tol", 1.0e-8))
+        server_lr = float(_cfg_get(self.cfg, "kfac_corrected.server_lr", 0.003))
+        adam_beta1 = float(_cfg_get(self.cfg, "kfac_corrected.adam_beta1", 0.9))
+        adam_beta2 = float(_cfg_get(self.cfg, "kfac_corrected.adam_beta2", 0.99))
+        adam_eps = float(_cfg_get(self.cfg, "kfac_corrected.adam_eps", 0.01))
+        damping = float(_cfg_get(self.cfg, "kfac_corrected.damping", 0.01))
+        use_damping = bool(_cfg_get(self.cfg, "kfac_corrected.use_damping", True))
+        fallback = str(_cfg_get(self.cfg, "kfac_corrected.fallback", "none")).lower().strip()
+        weight_mode = str(_cfg_get(self.cfg, "kfac_corrected.weight_mode", "sample_weighted")).lower().strip()
+        solve_scope = str(_cfg_get(self.cfg, "kfac_corrected.solve_scope", "global_expert")).lower().strip()
+        solve_mode = str(_cfg_get(self.cfg, "kfac_corrected.solve_mode", "adam")).lower().strip()
+        fisher_timing = str(_cfg_get(self.cfg, "kfac_corrected.fisher_timing", "after_train")).lower().strip()
 
         if min_count <= 0:
             min_count = 1
 
         if solver_steps < 0:
-            raise ValueError(f"kfac.server_steps 不能小于 0，当前值：{solver_steps}")
+            raise ValueError(f"kfac_corrected.server_steps 不能小于 0，当前值：{solver_steps}")
 
         if cg_tol < 0:
-            raise ValueError(f"kfac.cg_tol 不能小于 0，当前值：{cg_tol}")
+            raise ValueError(f"kfac_corrected.cg_tol 不能小于 0，当前值：{cg_tol}")
 
         if server_lr < 0:
-            raise ValueError(f"kfac.server_lr 不能小于 0，当前值：{server_lr}")
+            raise ValueError(f"kfac_corrected.server_lr 不能小于 0，当前值：{server_lr}")
 
         if damping < 0:
-            raise ValueError(f"kfac.damping 不能小于 0，当前值：{damping}")
+            raise ValueError(f"kfac_corrected.damping 不能小于 0，当前值：{damping}")
 
         if not use_damping:
             damping = 0.0
 
         _validate_choice(
-            name="kfac.weight_mode",
+            name="kfac_corrected.weight_mode",
             value=weight_mode,
             choices=("routed_count", "sample_weighted", "uniform"),
         )
         _validate_choice(
-            name="kfac.solve_scope",
+            name="kfac_corrected.solve_scope",
             value=solve_scope,
             choices=("per_layer", "global_expert"),
         )
         _validate_choice(
-            name="kfac.solve_mode",
+            name="kfac_corrected.solve_mode",
             value=solve_mode,
             choices=("cg", "gd", "adam"),
         )
 
-        layer_names = _collect_kfac_layer_names(client_updates)
+        layer_names = _collect_corrected_layer_names(client_updates)
         layer_groups: List[Dict[str, Any]] = []
         skipped_layers: List[str] = []
 
@@ -871,8 +1044,8 @@ class FisherKFACExpertAggregator(Aggregator):
         solved_params = set()
         fallback_params = set()
         valid_client_ids = set()
-        kfac_client_counts: Dict[int, int] = {}
-        kfac_layer_weights: Dict[str, Dict[int, float]] = {}
+        corrected_client_counts: Dict[int, int] = {}
+        corrected_layer_weights: Dict[str, Dict[int, float]] = {}
 
         valid_layers = 0
         valid_client_layers = 0
@@ -886,6 +1059,28 @@ class FisherKFACExpertAggregator(Aggregator):
         solver_delta_norm_values: List[float] = []
         solver_grad_norm_values: List[float] = []
         solver_update_norm_values: List[float] = []
+
+        correction_entries = [
+            entry
+            for group in layer_groups
+            for entry in group.get("entries", [])
+        ]
+        correction_sigma_values = [
+            float(entry.get("correction_sigma", 0.0))
+            for entry in correction_entries
+        ]
+        correction_fro_ratio_values = [
+            float(entry.get("correction_fro_ratio", 0.0))
+            for entry in correction_entries
+        ]
+        power_iterations_values = [
+            float(entry.get("power_iterations", 0))
+            for entry in correction_entries
+        ]
+        power_error_values = [
+            float(entry.get("power_error", 0.0))
+            for entry in correction_entries
+        ]
 
         if len(layer_groups) > 0:
             if solve_scope == "global_expert":
@@ -946,8 +1141,8 @@ class FisherKFACExpertAggregator(Aggregator):
                     _accumulate_layer_diagnostics(
                         layer_diag=layer_result,
                         valid_client_ids=valid_client_ids,
-                        kfac_client_counts=kfac_client_counts,
-                        kfac_layer_weights=kfac_layer_weights,
+                        corrected_client_counts=corrected_client_counts,
+                        corrected_layer_weights=corrected_layer_weights,
                         trace_A_values=trace_A_values,
                         trace_B_values=trace_B_values,
                         residual_norm_values=residual_norm_values,
@@ -1003,8 +1198,8 @@ class FisherKFACExpertAggregator(Aggregator):
                     _accumulate_layer_diagnostics(
                         layer_diag=layer_diag,
                         valid_client_ids=valid_client_ids,
-                        kfac_client_counts=kfac_client_counts,
-                        kfac_layer_weights=kfac_layer_weights,
+                        corrected_client_counts=corrected_client_counts,
+                        corrected_layer_weights=corrected_layer_weights,
                         trace_A_values=trace_A_values,
                         trace_B_values=trace_B_values,
                         residual_norm_values=residual_norm_values,
@@ -1028,7 +1223,7 @@ class FisherKFACExpertAggregator(Aggregator):
 
             if fallback != "sample_weighted":
                 raise ValueError(
-                    f"不支持的 kfac.fallback：{fallback}。"
+                    f"不支持的 kfac_corrected.fallback：{fallback}。"
                     "当前支持：sample_weighted, none"
                 )
 
@@ -1055,11 +1250,11 @@ class FisherKFACExpertAggregator(Aggregator):
         mean_count = float(total_count / max(valid_client_layers, 1))
         result_weights = _build_result_client_weights(
             weight_mode=weight_mode,
-            client_counts=kfac_client_counts,
+            client_counts=corrected_client_counts,
             client_updates=client_updates,
             sample_weights=sample_weights,
         )
-        cos_kfac_uniform = _cos_kfac_uniform(
+        cos_corrected_uniform = _cos_corrected_uniform(
             global_state=global_state,
             new_state_dict=new_state_dict,
             client_updates=client_updates,
@@ -1075,19 +1270,19 @@ class FisherKFACExpertAggregator(Aggregator):
                 int(client_id): float(weight)
                 for client_id, weight in result_weights.items()
             },
-            "kfac_weight_mode": weight_mode,
+            "kfac_corrected_weight_mode": weight_mode,
             "weight_mode": weight_mode,
             "solve_scope": solve_scope,
             "solve_mode": solve_mode,
-            "kfac_client_sample_weights": {
+            "kfac_corrected_client_sample_weights": {
                 int(client_id): float(weight)
                 for client_id, weight in sample_weights.items()
             },
-            "kfac_client_counts": {
+            "corrected_client_counts": {
                 int(client_id): int(count)
-                for client_id, count in kfac_client_counts.items()
+                for client_id, count in corrected_client_counts.items()
             },
-            "kfac_layer_weights": kfac_layer_weights,
+            "corrected_layer_weights": corrected_layer_weights,
             "valid_layers": int(valid_layers),
             "valid_clients": int(len(valid_client_ids)),
             "skipped_layers": int(len(skipped_layers)),
@@ -1099,6 +1294,12 @@ class FisherKFACExpertAggregator(Aggregator):
             "mean_trace_B": _safe_mean(trace_B_values),
             "max_trace_A": _safe_max(trace_A_values),
             "max_trace_B": _safe_max(trace_B_values),
+            "mean_correction_sigma": _safe_mean(correction_sigma_values),
+            "max_correction_sigma": _safe_max(correction_sigma_values),
+            "mean_correction_fro_ratio": _safe_mean(correction_fro_ratio_values),
+            "max_correction_fro_ratio": _safe_max(correction_fro_ratio_values),
+            "mean_power_iterations": _safe_mean(power_iterations_values),
+            "max_power_error": _safe_max(power_error_values),
             "mean_residual_norm": _safe_mean(residual_norm_values),
             "max_residual_norm": _safe_max(residual_norm_values),
             # 兼容旧字段名：cg 时表示残差范数，gd/adam 时表示最终 FedFisher 梯度范数。
@@ -1113,7 +1314,7 @@ class FisherKFACExpertAggregator(Aggregator):
             "mean_global_delta_norm": _safe_mean(delta_norm_values),
             # mean_solver_delta_norm 表示 K-FAC 解相对 FedAvg 初始化点的修正幅度。
             "mean_solver_delta_norm": _safe_mean(solver_delta_norm_values),
-            "cos_kfac_uniform": float(cos_kfac_uniform),
+            "cos_corrected_uniform": float(cos_corrected_uniform),
             "solver_steps": int(solver_steps),
             "server_steps": int(solver_steps),
             "server_lr": float(server_lr),
@@ -1133,9 +1334,9 @@ class FisherKFACExpertAggregator(Aggregator):
             "fallback_params": int(len(fallback_params)),
         }
 
-        if bool(_cfg_get(self.cfg, "kfac.log_detail", True)):
+        if bool(_cfg_get(self.cfg, "kfac_corrected.log_detail", True)):
             print(
-                "[ExpertKFAC] "
+                "[ExpertKFACCorrected] "
                 f"weight_mode={diagnostics['weight_mode']} "
                 f"solve_scope={diagnostics['solve_scope']} "
                 f"solve_mode={diagnostics['solve_mode']} "
@@ -1146,6 +1347,10 @@ class FisherKFACExpertAggregator(Aggregator):
                 f"mean_count={diagnostics['mean_count']:.2f} "
                 f"mean_trace_A={diagnostics['mean_trace_A']:.6e} "
                 f"mean_trace_B={diagnostics['mean_trace_B']:.6e} "
+                f"mean_correction_sigma={diagnostics['mean_correction_sigma']:.6e} "
+                f"mean_correction_fro_ratio={diagnostics['mean_correction_fro_ratio']:.6e} "
+                f"mean_power_iterations={diagnostics['mean_power_iterations']:.2f} "
+                f"max_power_error={diagnostics['max_power_error']:.6e} "
                 f"server_steps={diagnostics['server_steps']} "
                 f"server_lr={diagnostics['server_lr']:.6e} "
                 f"damping={diagnostics['damping']:.6e} "
@@ -1157,7 +1362,7 @@ class FisherKFACExpertAggregator(Aggregator):
                 f"mean_solver_delta_norm={diagnostics['mean_solver_delta_norm']:.6e} "
                 f"global_expert_param_count={diagnostics['global_expert_param_count']} "
                 f"fallback_params={diagnostics['fallback_params']} "
-                f"cos_kfac_uniform={diagnostics['cos_kfac_uniform']:.6f}",
+                f"cos_corrected_uniform={diagnostics['cos_corrected_uniform']:.6f}",
                 flush=True,
             )
 
@@ -1188,10 +1393,11 @@ def _solve_kfac_linear_layer(
     use_damping: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
     """
-    对一个 Linear block 求解 K-FAC/Fisher 加权聚合结果。
+    对一个 Linear block 求解 KFAC-Corrected/Fisher 加权聚合结果。
 
     paper-like 方程：
-        sum_i p_i * B_i @ W @ A_i = sum_i p_i * B_i @ W_i @ A_i
+        sum_i p_i * [B_i W A_i + Bcorr_i W Acorr_i]
+        = sum_i p_i * [B_i W_i A_i + Bcorr_i W_i Acorr_i]
 
     只有 use_damping=True 且 damping>0 时才会额外加入：
         + damping * W = + damping * W_avg
@@ -1266,9 +1472,9 @@ def _solve_global_expert_layers(
     strict: bool,
 ) -> Dict[str, Any]:
     """
-    在所有 expert layer 上执行一个统一的 FedFisher K-FAC 服务端求解。
+    在所有 expert layer 上执行一个统一的 FedFisher KFAC-Corrected 服务端求解。
 
-    实现上仍然按 layer 做 K-FAC matvec，但 CG/GD/Adam 的梯度范数、
+    实现上仍然按 layer 做 KFAC-Corrected matvec，但 CG/GD/Adam 的梯度范数、
     更新范数和迭代过程是在所有 expert layer 的联合参数空间上完成的。
     """
     systems: List[Dict[str, Any]] = []
@@ -1359,13 +1565,12 @@ def _prepare_layer_system(
     damping: float,
     use_damping: bool,
 ) -> Dict[str, Any]:
-    """把某个 expert Linear layer 的 entries 转成可求解的 K-FAC 系统。"""
+    """Build one KFAC-Corrected FedFisher linear system."""
     if len(entries) == 0:
-        raise ValueError(f"{weight_name} 没有有效 K-FAC entries。")
+        raise ValueError(f"{weight_name} 没有有效 KFAC-Corrected entries。")
 
     device = global_state[weight_name].device
     dtype = global_state[weight_name].dtype
-
     processed_entries = []
     total_count = 0
 
@@ -1374,47 +1579,50 @@ def _prepare_layer_system(
         if count <= 0:
             continue
 
-        A = entry["A"].to(device=device, dtype=dtype)
-        B = entry["B"].to(device=device, dtype=dtype)
-
-        A = _symmetrize_square(A)
-        B = _symmetrize_square(B)
+        A = _symmetrize_square(entry["A"].to(device=device, dtype=dtype))
+        B = _symmetrize_square(entry["B"].to(device=device, dtype=dtype))
+        A_corr = _symmetrize_square(entry["A_corr"].to(device=device, dtype=dtype))
+        B_corr = _symmetrize_square(entry["B_corr"].to(device=device, dtype=dtype))
 
         local_weight = entry["local_weight"].to(device=device, dtype=dtype)
-
         local_bias = None
         if include_bias and bias_name is not None and entry.get("local_bias") is not None:
             local_bias = entry["local_bias"].to(device=device, dtype=dtype)
+        local_aug = _make_augmented_weight(local_weight, local_bias, include_bias)
 
-        local_aug = _make_augmented_weight(
-            weight=local_weight,
-            bias=local_bias,
-            include_bias=include_bias,
-        )
-
-        _validate_kfac_shapes(
+        _validate_corrected_shapes(
             A=A,
             B=B,
+            A_corr=A_corr,
+            B_corr=B_corr,
             W_aug=local_aug,
             layer_name=str(entry.get("layer_name", weight_name)),
         )
 
-        processed_entries.append(
-            {
-                "client_id": int(entry["client_id"]),
-                "layer_name": str(entry.get("layer_name", weight_name)),
-                "count": count,
-                "A": A,
-                "B": B,
-                "local_aug": local_aug,
-                "trace_A": float(torch.trace(A.detach().float()).item()),
-                "trace_B": float(torch.trace(B.detach().float()).item()),
-            }
-        )
+        base_fro = float(A.detach().float().norm().item()) * float(B.detach().float().norm().item())
+        corr_fro = float(A_corr.detach().float().norm().item()) * float(B_corr.detach().float().norm().item())
+        correction_fro_ratio = corr_fro / (base_fro + 1.0e-30)
+
+        processed_entries.append({
+            "client_id": int(entry["client_id"]),
+            "layer_name": str(entry.get("layer_name", weight_name)),
+            "count": count,
+            "A": A,
+            "B": B,
+            "A_corr": A_corr,
+            "B_corr": B_corr,
+            "local_aug": local_aug,
+            "trace_A": float(torch.trace(A.detach().float()).item()),
+            "trace_B": float(torch.trace(B.detach().float()).item()),
+            "correction_sigma": float(entry.get("correction_sigma", 0.0)),
+            "power_iterations": int(entry.get("power_iterations", 0)),
+            "power_error": float(entry.get("power_error", 0.0)),
+            "correction_fro_ratio": float(entry.get("correction_fro_ratio", correction_fro_ratio)),
+        })
         total_count += count
 
     if len(processed_entries) == 0 or total_count <= 0:
-        raise ValueError(f"{weight_name} 没有 count > 0 的有效 K-FAC entries。")
+        raise ValueError(f"{weight_name} 没有 count > 0 的有效 KFAC-Corrected entries。")
 
     weights = _compute_entry_weights(
         processed_entries=processed_entries,
@@ -1431,19 +1639,16 @@ def _prepare_layer_system(
     global_bias = None
     if include_bias and bias_name is not None and bias_name in global_state:
         global_bias = global_state[bias_name].to(device=device, dtype=dtype)
-
-    W_global_aug = _make_augmented_weight(
-        weight=global_weight,
-        bias=global_bias,
-        include_bias=include_bias,
-    )
+    W_global_aug = _make_augmented_weight(global_weight, global_bias, include_bias)
 
     rhs = torch.zeros_like(W_avg)
     for weight, entry in zip(weights, processed_entries):
-        rhs = rhs + float(weight) * _kfac_matvec(
+        rhs = rhs + float(weight) * _kfac_corrected_matvec(
             delta=entry["local_aug"],
             A=entry["A"],
             B=entry["B"],
+            A_corr=entry["A_corr"],
+            B_corr=entry["B_corr"],
             damping=0.0,
         )
 
@@ -1503,24 +1708,23 @@ def _compute_entry_weights(
     if weight_mode == "uniform":
         return [1.0 / float(len(processed_entries)) for _ in processed_entries]
 
-    raise ValueError(f"不支持的 kfac.weight_mode：{weight_mode}")
+    raise ValueError(f"不支持的 kfac_corrected.weight_mode：{weight_mode}")
 
 
 def _layer_matvec(system: Mapping[str, Any], x: torch.Tensor) -> torch.Tensor:
-    """计算当前 layer 系统的 sum_i p_i F_i x。"""
+    """Compute sum_i p_i (A_i⊗B_i + Aci⊗Bci) x plus damping."""
     result = torch.zeros_like(x)
-
     for weight, entry in zip(system["weights"], system["processed_entries"]):
-        result = result + float(weight) * _kfac_matvec(
+        result = result + float(weight) * _kfac_corrected_matvec(
             delta=x,
             A=entry["A"],
             B=entry["B"],
+            A_corr=entry["A_corr"],
+            B_corr=entry["B_corr"],
             damping=0.0,
         )
-
     if bool(system.get("use_damping", False)) and float(system.get("damping", 0.0)) > 0:
         result = result + float(system["damping"]) * x
-
     return result
 
 
@@ -1781,8 +1985,8 @@ def _build_solution_diagnostics(
 def _accumulate_layer_diagnostics(
     layer_diag: Mapping[str, Any],
     valid_client_ids: set[int],
-    kfac_client_counts: Dict[int, int],
-    kfac_layer_weights: Dict[str, Dict[int, float]],
+    corrected_client_counts: Dict[int, int],
+    corrected_layer_weights: Dict[str, Dict[int, float]],
     trace_A_values: List[float],
     trace_B_values: List[float],
     residual_norm_values: List[float],
@@ -1797,9 +2001,9 @@ def _accumulate_layer_diagnostics(
 
     for client_id, count in layer_diag.get("client_counts", {}).items():
         client_id = int(client_id)
-        kfac_client_counts[client_id] = int(kfac_client_counts.get(client_id, 0)) + int(count)
+        corrected_client_counts[client_id] = int(corrected_client_counts.get(client_id, 0)) + int(count)
 
-    kfac_layer_weights[layer_name] = {
+    corrected_layer_weights[layer_name] = {
         int(client_id): float(weight)
         for client_id, weight in layer_diag.get("layer_weights", {}).items()
     }
@@ -1819,26 +2023,19 @@ def _dict_dot(left: Mapping[str, torch.Tensor], right: Mapping[str, torch.Tensor
     return float(value)
 
 
-def _kfac_matvec(
+def _kfac_corrected_matvec(
     delta: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
+    A_corr: torch.Tensor,
+    B_corr: torch.Tensor,
     damping: float,
 ) -> torch.Tensor:
-    """
-    K-FAC 矩阵向量乘法。
-
-    对 Linear 层：
-        F vec(delta) ≈ vec(B @ delta @ A)
-
-    damping 使用简单的各向同性阻尼：
-        matvec = B @ delta @ A + damping * delta
-    """
+    """KFAC-Corrected matvec: B X A + B_corr X A_corr (+ damping X)."""
     result = B.matmul(delta).matmul(A)
-
+    result = result + B_corr.matmul(delta).matmul(A_corr)
     if damping > 0:
         result = result + float(damping) * delta
-
     return result
 
 
@@ -1850,14 +2047,14 @@ def _symmetrize_square(matrix: torch.Tensor) -> torch.Tensor:
     return matrix
 
 
-def _collect_kfac_layer_names(
+def _collect_corrected_layer_names(
     client_updates: Sequence[ClientUpdate],
 ) -> List[str]:
     """收集本轮所有客户端上传过的 K-FAC layer_name。"""
     layer_names = set()
 
     for update in client_updates:
-        payload = update.extra.get("expert_kfac", None)
+        payload = update.extra.get("expert_kfac_corrected", None)
 
         if not isinstance(payload, Mapping):
             continue
@@ -1880,7 +2077,7 @@ def _collect_valid_layer_entries(
     entries: List[Dict[str, Any]] = []
 
     for update in client_updates:
-        payload = update.extra.get("expert_kfac", None)
+        payload = update.extra.get("expert_kfac_corrected", None)
 
         if not isinstance(payload, Mapping):
             continue
@@ -1922,58 +2119,37 @@ def _build_layer_entry(
     target_param_set: set[str],
     min_count: int,
 ) -> Optional[Dict[str, Any]]:
-    """把客户端上传的单层 K-FAC payload 转成服务端可用 entry。"""
+    """Convert one client's KFAC-Corrected payload into a server entry."""
     count = int(item.get("count", 0))
-
     if count < int(min_count):
         return None
 
     weight_name = str(item.get("weight_name", ""))
     bias_name_raw = item.get("bias_name", None)
     bias_name = None if bias_name_raw is None else str(bias_name_raw)
-
-    if weight_name == "":
+    if not weight_name or weight_name not in target_param_set:
         return None
-
-    if weight_name not in target_param_set:
-        return None
-
-    if weight_name not in global_state:
-        return None
-
-    if weight_name not in update.model_delta:
+    if weight_name not in global_state or weight_name not in update.model_delta:
         return None
 
     A = item.get("A", None)
     B = item.get("B", None)
-
-    if not torch.is_tensor(A) or not torch.is_tensor(B):
+    A_corr = item.get("A_corr", None)
+    B_corr = item.get("B_corr", None)
+    factors = (A, B, A_corr, B_corr)
+    if not all(torch.is_tensor(x) for x in factors):
         return None
-
-    if not torch.isfinite(A).all():
-        return None
-
-    if not torch.isfinite(B).all():
+    if not all(torch.isfinite(x).all() for x in factors):
         return None
 
     global_weight = global_state[weight_name]
-    local_weight = global_weight.detach().cpu() + update.model_delta[
-        weight_name
-    ].detach().cpu()
+    local_weight = global_weight.detach().cpu() + update.model_delta[weight_name].detach().cpu()
 
     local_bias = None
     include_bias = bool(item.get("include_bias", False))
-
     if include_bias and bias_name is not None:
-        if (
-            bias_name in target_param_set
-            and bias_name in global_state
-            and bias_name in update.model_delta
-        ):
-            global_bias = global_state[bias_name]
-            local_bias = global_bias.detach().cpu() + update.model_delta[
-                bias_name
-            ].detach().cpu()
+        if bias_name in target_param_set and bias_name in global_state and bias_name in update.model_delta:
+            local_bias = global_state[bias_name].detach().cpu() + update.model_delta[bias_name].detach().cpu()
         else:
             include_bias = False
             bias_name = None
@@ -1987,6 +2163,12 @@ def _build_layer_entry(
         "count": int(count),
         "A": A.detach().cpu(),
         "B": B.detach().cpu(),
+        "A_corr": A_corr.detach().cpu(),
+        "B_corr": B_corr.detach().cpu(),
+        "correction_sigma": float(item.get("correction_sigma", 0.0)),
+        "power_iterations": int(item.get("power_iterations", 0)),
+        "power_error": float(item.get("power_error", 0.0)),
+        "correction_fro_ratio": float(item.get("correction_fro_ratio", 0.0)),
         "local_weight": local_weight,
         "local_bias": local_bias,
     }
@@ -2032,39 +2214,24 @@ def _split_augmented_weight(
     return W_aug, None
 
 
-def _validate_kfac_shapes(
+def _validate_corrected_shapes(
     A: torch.Tensor,
     B: torch.Tensor,
+    A_corr: torch.Tensor,
+    B_corr: torch.Tensor,
     W_aug: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """检查 A、B、W_aug 的形状是否匹配。"""
-    if A.dim() != 2 or A.size(0) != A.size(1):
-        raise ValueError(
-            f"{layer_name} 的 A 不是方阵，shape={tuple(A.shape)}"
-        )
-
-    if B.dim() != 2 or B.size(0) != B.size(1):
-        raise ValueError(
-            f"{layer_name} 的 B 不是方阵，shape={tuple(B.shape)}"
-        )
-
+    """Validate KFAC and correction factor shapes against the augmented weight."""
+    for name, matrix in (("A", A), ("B", B), ("A_corr", A_corr), ("B_corr", B_corr)):
+        if matrix.dim() != 2 or matrix.size(0) != matrix.size(1):
+            raise ValueError(f"{layer_name} 的 {name} 不是方阵，shape={tuple(matrix.shape)}")
     if W_aug.dim() != 2:
-        raise ValueError(
-            f"{layer_name} 的 W_aug 不是二维矩阵，shape={tuple(W_aug.shape)}"
-        )
-
-    if B.size(0) != W_aug.size(0):
-        raise ValueError(
-            f"{layer_name} 的 B 和 W_aug 输出维度不匹配："
-            f"B={tuple(B.shape)}, W_aug={tuple(W_aug.shape)}"
-        )
-
-    if A.size(0) != W_aug.size(1):
-        raise ValueError(
-            f"{layer_name} 的 A 和 W_aug 输入维度不匹配："
-            f"A={tuple(A.shape)}, W_aug={tuple(W_aug.shape)}"
-        )
+        raise ValueError(f"{layer_name} 的 W_aug 不是二维矩阵，shape={tuple(W_aug.shape)}")
+    if B.size(0) != W_aug.size(0) or B_corr.size(0) != W_aug.size(0):
+        raise ValueError(f"{layer_name} 的 B/B_corr 和 W_aug 输出维度不匹配。")
+    if A.size(0) != W_aug.size(1) or A_corr.size(0) != W_aug.size(1):
+        raise ValueError(f"{layer_name} 的 A/A_corr 和 W_aug 输入维度不匹配。")
 
 
 def _sample_weighted_param(
@@ -2140,13 +2307,13 @@ def _build_result_client_weights(
             for update in client_updates
         }
 
-    return _normalize_kfac_client_counts(
+    return _normalize_corrected_client_counts(
         client_counts=client_counts,
         client_updates=client_updates,
     )
 
 
-def _normalize_kfac_client_counts(
+def _normalize_corrected_client_counts(
     client_counts: Mapping[int, int],
     client_updates: Sequence[ClientUpdate],
 ) -> Dict[int, float]:
@@ -2180,7 +2347,7 @@ def _normalize_kfac_client_counts(
     return result
 
 
-def _cos_kfac_uniform(
+def _cos_corrected_uniform(
     global_state: Mapping[str, torch.Tensor],
     new_state_dict: Mapping[str, torch.Tensor],
     client_updates: Sequence[ClientUpdate],
@@ -2314,34 +2481,34 @@ def collect_method_evidence(
     cfg: Any,
 ) -> Dict[str, Any]:
     """Collect the same post-train expert evidence previously owned by base.py."""
-    expert_kfac_timing = str(
+    expert_kfac_corrected_timing = str(
         _cfg_get(
             cfg,
-            "kfac.fisher_timing",
-            _cfg_get(cfg, "kfac.collect_timing", "after_train"),
+            "kfac_corrected.fisher_timing",
+            _cfg_get(cfg, "kfac_corrected.collect_timing", "after_train"),
         )
     ).lower().strip()
 
-    if expert_kfac_timing != "after_train":
+    if expert_kfac_corrected_timing != "after_train":
         raise ValueError(
-            "当前 K-FAC 采集只支持 kfac.fisher_timing=after_train。"
-            f"当前值：{expert_kfac_timing}。"
+            "当前 K-FAC 采集只支持 kfac_corrected.fisher_timing=after_train。"
+            f"当前值：{expert_kfac_corrected_timing}。"
             "请不要在本地训练过程中混合统计 K-FAC。"
         )
 
-    expert_kfac = collect_expert_kfac(
+    expert_kfac_corrected = collect_expert_kfac_corrected(
         model=model,
         train_loader=evidence_loader,
         criterion=criterion,
         device=device,
         cfg=cfg,
     )
-    expert_kfac_summary = summarize_expert_kfac(expert_kfac)
+    expert_kfac_corrected_summary = summarize_expert_kfac_corrected(expert_kfac_corrected)
 
     return {
-        "expert_kfac": expert_kfac,
-        "expert_kfac_summary": expert_kfac_summary,
-        "expert_kfac_timing": expert_kfac_timing,
+        "expert_kfac_corrected": expert_kfac_corrected,
+        "expert_kfac_corrected_summary": expert_kfac_corrected_summary,
+        "expert_kfac_corrected_timing": expert_kfac_corrected_timing,
     }
 
 
@@ -2351,13 +2518,13 @@ def build_method_client_diagnostics(
     """Expose only lightweight method diagnostics to the shared server summary."""
     extra = dict(update.extra or {})
     return {
-        "expert_kfac_summary": extra.get("expert_kfac_summary", None),
+        "expert_kfac_corrected_summary": extra.get("expert_kfac_corrected_summary", None),
     }
 
 
 
 def register_method_cli_arguments(parser: argparse.ArgumentParser) -> None:
-    """Register Fisher/K-FAC-only command-line overrides."""
+    """Register KFAC-Corrected-only command-line overrides."""
     parser.add_argument("--server-lr", type=float, default=None)
     parser.add_argument("--server-steps", type=int, default=None)
     parser.add_argument(
@@ -2382,6 +2549,9 @@ def register_method_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--damping", type=float, default=None)
     parser.add_argument("--min-count", type=int, default=None)
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--power-max-iters", type=int, default=None)
+    parser.add_argument("--power-tol", type=float, default=None)
+    parser.add_argument("--power-eps", type=float, default=None)
     parser.add_argument(
         "--fallback",
         choices=("none", "sample_weighted"),
@@ -2395,8 +2565,8 @@ def register_method_cli_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_method_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
-    """Map explicit Fisher CLI values to the nested kfac configuration."""
-    kfac_overrides: Dict[str, Any] = {}
+    """Map explicit CLI values to the nested kfac_corrected configuration."""
+    corrected_overrides: Dict[str, Any] = {}
 
     mappings = (
         ("server_lr", "server_lr"),
@@ -2411,6 +2581,9 @@ def build_method_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         ("damping", "damping"),
         ("min_count", "min_count"),
         ("max_batches", "max_batches"),
+        ("power_max_iters", "power_max_iters"),
+        ("power_tol", "power_tol"),
+        ("power_eps", "power_eps"),
         ("fallback", "fallback"),
         ("model_mode", "model_mode"),
     )
@@ -2418,17 +2591,17 @@ def build_method_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     for arg_name, config_key in mappings:
         value = getattr(args, arg_name, None)
         if value is not None:
-            kfac_overrides[config_key] = value
+            corrected_overrides[config_key] = value
 
-    if not kfac_overrides:
+    if not corrected_overrides:
         return {}
 
-    return {"kfac": kfac_overrides}
+    return {"kfac_corrected": corrected_overrides}
 
 
 def build_expert_aggregator(cfg: Any) -> base.Aggregator:
-    """Build the expert-only Fisher/K-FAC aggregator injected into base.py."""
-    return FisherKFACExpertAggregator(
+    """Build the expert-only KFAC-Corrected aggregator injected into base.py."""
+    return KFACCorrectedExpertAggregator(
         cfg=cfg,
         param_group_name="expert",
     )
