@@ -13,6 +13,11 @@ python tools/plot_compare_acc.py \
   --input-dir outputs/cifar10_convnext_tiny \
   --window 5
 
+python tools/paper_draw.py \
+  --input-dir outputs/cifar10_resnet_cifar \
+  --window 5 \
+  --output-dir ./paper_pictures
+
 支持的数据集：
 cifar10
 cifar100
