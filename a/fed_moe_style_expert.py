@@ -55,8 +55,8 @@ ADAPTATION_DEFAULT_MOVING_RATE = 0.5
 
 METHOD_CONFIG_DEFAULTS = {
     "server_evidence": {
-        "size": 1000,
-        "class_balanced": True,
+        "size": 250,
+        "class_balanced": False,
         "batch_size": 256,
     },
     "fed_moe": {
