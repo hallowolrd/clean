@@ -36,7 +36,7 @@ METHODS = [
         "color": "#38C7CB",
     },
     {
-        "name": "TKFAC",
+        "name": "CurvFedMoE",
         "values": [69.53, 80.39, 84.89],
         "color": "#FFD200",
     },

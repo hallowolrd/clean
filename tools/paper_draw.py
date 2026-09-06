@@ -87,7 +87,7 @@ PLOT_STYLES = [
 # =========================
 LEGEND_NAMES = {
     "Uniform": "FedAvg-MoE",
-    "Fisher/K-FAC": "TKFAC",
+    "Fisher/K-FAC": "CurvFedMoE",
     "Fed-MoE": "Fed-MoE",
     "FedMoE-DA": "FedMoE-DA",
     "SOMFed": "SOMFed",
