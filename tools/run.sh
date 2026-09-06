@@ -15,10 +15,10 @@ SCRIPT_DIR="$PROJECT_ROOT/a"
 DATASET="cifar10"
 BACKBONE="resnet_cifar"
 ROUNDS=50
-ALPHA=0.1
+ALPHA=0.3
 SEED=0
 
-OUTPUT_DIR="$PROJECT_ROOT/outputs/${DATASET}_${BACKBONE}"
+OUTPUT_DIR="$PROJECT_ROOT/outputs_tkfac/${DATASET}_${BACKBONE}_alpha03"
 LAUNCH_LOG_DIR="$OUTPUT_DIR/launcher_logs"
 
 # ------------------------------------------------------------
@@ -30,11 +30,11 @@ LAUNCH_LOG_DIR="$OUTPUT_DIR/launcher_logs"
 # 以后增删算法、修改 GPU 或算法专属参数，只需要改这里。
 # ------------------------------------------------------------
 EXPERIMENTS=(
-    "uniform|0|uniform.py|"
-    "fisher|0|fisher_kfac_expert.py|--server-steps 300"
-    "fed_moe|0|fed_moe_style_expert.py|"
-    "fedmoe_da|1|fedmoe_da_style_expert.py|"
-    "somfed|1|somfed_style_expert.py|"
+    "uniform|2|uniform.py|"
+    "fisher|2|tkfac_expert.py|"
+    "fed_moe|2|fed_moe_style_expert.py|"
+    "fedmoe_da|2|fedmoe_da_style_expert.py|"
+    "somfed|2|somfed_style_expert.py|"
 )
 
 mkdir -p "$LAUNCH_LOG_DIR"
