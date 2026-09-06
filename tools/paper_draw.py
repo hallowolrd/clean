@@ -78,6 +78,36 @@ PLOT_STYLES = [
 ]
 
 
+# =========================
+# 图例显示名称
+#
+# 以后如果只想修改图例里的算法名称，
+# 只需要修改这里右侧的字符串即可。
+# 左侧名称是脚本内部用于识别算法的固定名称，不要改。
+# =========================
+LEGEND_NAMES = {
+    "Uniform": "FedAvg-MoE",
+    "Fisher/K-FAC": "TKFAC",
+    "Fed-MoE": "Fed-MoE",
+    "FedMoE-DA": "FedMoE-DA",
+    "SOMFed": "SOMFed",
+}
+
+# =========================
+# 图例显示顺序
+#
+# 这里使用的是脚本内部固定名称。
+# 如果以后只改“图例名字”，不需要改这里。
+# =========================
+LEGEND_ORDER = [
+    "Fisher/K-FAC",
+    "Uniform",
+    "Fed-MoE",
+    "SOMFed",
+    "FedMoE-DA",
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare test_acc curves from federated-learning results.csv files."
@@ -471,37 +501,38 @@ def main() -> int:
 
     handles, labels = ax.get_legend_handles_labels()
 
-    # 只调整图例中的显示位置；
-    # 不改变曲线本身的绘制顺序、颜色、线型和数据。
-    if "Uniform" in labels and "Fisher/K-FAC" in labels:
-        uniform_index = labels.index("Uniform")
-        fisher_index = labels.index("Fisher/K-FAC")
+    # 图例顺序和图例显示名称彻底解耦。
+    # 以后只改 LEGEND_NAMES，就能修改图例文字；
+    # 不需要再改 friendly_method_name()、method_order() 或这里的排序逻辑。
+    legend_items = {
+        label: handle
+        for handle, label in zip(handles, labels)
+    }
 
-        handles[uniform_index], handles[fisher_index] = (
-            handles[fisher_index],
-            handles[uniform_index],
-        )
-        labels[uniform_index], labels[fisher_index] = (
-            labels[fisher_index],
-            labels[uniform_index],
-        )
+    ordered_internal_labels = [
+        label
+        for label in LEGEND_ORDER
+        if label in legend_items
+    ]
 
-    if "FedMoE-DA" in labels and "SOMFed" in labels:
-        fedmoe_da_index = labels.index("FedMoE-DA")
-        somfed_index = labels.index("SOMFed")
+    # 如果出现不在 LEGEND_ORDER 中的新算法，也保留在图例中。
+    for label in labels:
+        if label not in ordered_internal_labels:
+            ordered_internal_labels.append(label)
 
-        handles[fedmoe_da_index], handles[somfed_index] = (
-            handles[somfed_index],
-            handles[fedmoe_da_index],
-        )
-        labels[fedmoe_da_index], labels[somfed_index] = (
-            labels[somfed_index],
-            labels[fedmoe_da_index],
-        )
+    ordered_handles = [
+        legend_items[label]
+        for label in ordered_internal_labels
+    ]
+
+    display_labels = [
+        LEGEND_NAMES.get(label, label)
+        for label in ordered_internal_labels
+    ]
 
     legend = ax.legend(
-        handles,
-        labels,
+        ordered_handles,
+        display_labels,
         loc="lower right",
         ncol=2,
         frameon=True,

@@ -11,3 +11,5 @@ outputs_bias/
 test/
 paper_pictures/
 paper_bar/
+outputs_tkfac
+tkfac_paper_pictures
