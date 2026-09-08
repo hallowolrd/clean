@@ -68,10 +68,10 @@ plt.rcParams.update(
         ],
         "mathtext.fontset": "stix",
 
-        "font.size": 13,
-        "axes.labelsize": 18,
-        "xtick.labelsize": 17,
-        "ytick.labelsize": 17,
+        "font.size": 15,
+        "axes.labelsize": 21,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
         "legend.fontsize": 13,
 
         "axes.linewidth": 1.8,
@@ -276,7 +276,7 @@ def main() -> int:
         handleheight=0.95,
         handletextpad=0.12,
 
-        fontsize=11.5,
+        fontsize=12.5,
     )
 
     legend.get_frame().set_linewidth(1.2)
