@@ -142,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="可选。图片保存目录；默认保存到项目根目录 pictures。",
     )
+    parser.add_argument(
+        "--max-round",
+        type=int,
+        default=None,
+        help="可选。只绘制到指定通信轮数，例如 50 或 60；默认绘制全部轮数。",
+    )
     return parser.parse_args()
 
 
@@ -312,6 +318,11 @@ def main() -> int:
     if args.window <= 0:
         raise ValueError(f"--window 必须大于 0，当前值：{args.window}")
 
+    if args.max_round is not None and args.max_round <= 0:
+        raise ValueError(
+            f"--max-round 必须大于 0，当前值：{args.max_round}"
+        )
+
     csv_files = sorted(input_dir.rglob("results.csv"))
     if not csv_files:
         raise FileNotFoundError(f"在 {input_dir} 下没有找到任何 results.csv。")
@@ -382,6 +393,22 @@ def main() -> int:
 
     for index, (method, csv_path) in enumerate(selected):
         rounds, test_acc = read_test_acc(csv_path)
+
+        if args.max_round is not None:
+            filtered = [
+                (round_id, acc)
+                for round_id, acc in zip(rounds, test_acc)
+                if round_id <= args.max_round
+            ]
+
+            if not filtered:
+                raise ValueError(
+                    f"{csv_path} 在 round <= {args.max_round} 范围内没有数据。"
+                )
+
+            rounds = [item[0] for item in filtered]
+            test_acc = [item[1] for item in filtered]
+
         smoothed = moving_average(test_acc, args.window)
         label = friendly_method_name(method)
 
@@ -414,16 +441,17 @@ def main() -> int:
     ax.set_xlabel("Training Round", fontsize=21, labelpad=6)
     ax.set_ylabel("Test Accuracy (%)", fontsize=21, labelpad=6)
 
-    if max_round <= 60:
-        x_step = 10
-    elif max_round <= 120:
-        x_step = 20
-    elif max_round <= 250:
-        x_step = 50
-    else:
-        x_step = 100
+    x_ticks = [
+        max_round * i / 5
+        for i in range(6)
+    ]
+    x_tick_labels = [
+        f"{int(round(tick))}" if abs(tick - round(tick)) < 1e-9 else f"{tick:g}"
+        for tick in x_ticks
+    ]
 
-    ax.set_xticks(list(range(0, max_round + 1, x_step)))
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_tick_labels)
     ax.set_xlim(0, max_round)
 
     if not all_smoothed:

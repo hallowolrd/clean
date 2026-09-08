@@ -14,9 +14,10 @@ python tools/plot_compare_acc.py \
   --window 5
 
 python tools/paper_draw.py \
-  --input-dir outputs/cifar10_resnet_cifar \
+  --input-dir outputs_tkfac/cifar10_resnet_cifar \
   --window 5 \
-  --output-dir ./paper_pictures
+  --max-round 50 \
+  --output-dir ./tkfac_paper_pictures
 
 支持的数据集：
 cifar10
