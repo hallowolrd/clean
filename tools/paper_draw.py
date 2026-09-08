@@ -29,10 +29,10 @@ plt.rcParams.update(
             "DejaVu Serif",
         ],
         # 更接近 GAPSL 成图比例
-        "font.size": 13,
-        "axes.labelsize": 17,
-        "xtick.labelsize": 15,
-        "ytick.labelsize": 15,
+        "font.size": 15,
+        "axes.labelsize": 22,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
         "legend.fontsize": 14,
         "axes.linewidth": 2.0,
         "xtick.direction": "in",
@@ -411,8 +411,8 @@ def main() -> int:
             f"<- {csv_path}"
         )
 
-    ax.set_xlabel("Training Round", labelpad=6)
-    ax.set_ylabel("Test Accuracy (%)", labelpad=6)
+    ax.set_xlabel("Training Round", fontsize=21, labelpad=6)
+    ax.set_ylabel("Test Accuracy (%)", fontsize=21, labelpad=6)
 
     if max_round <= 60:
         x_step = 10
@@ -441,8 +441,8 @@ def main() -> int:
     if y_upper - y_max < 1.0:
         y_upper += 1
 
-    # 内部刻度尽量控制在约 4~5 个区间，最后一个刻度单独用 y_upper。
-    raw_step = (y_upper - y_lower) / 4
+    # 内部刻度尽量控制在约 3 个区间，最后一个刻度单独用 y_upper。
+    raw_step = (y_upper - y_lower) / 3
     nice_steps = [5, 10, 15, 20, 25, 30]
     y_step = min(
         nice_steps,
