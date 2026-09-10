@@ -86,7 +86,7 @@ LEGEND_ORDER = [
 # 输出设置
 # ============================================================
 
-OUTPUT_DIR = Path("./paper_bar")
+OUTPUT_DIR = Path("./paper_pic/bar")
 OUTPUT_NAME = "dirichlet_best_accuracy_r50"
 
 
