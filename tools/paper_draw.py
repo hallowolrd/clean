@@ -77,6 +77,27 @@ PLOT_STYLES = [
     },
 ]
 
+# 颜色与原始线型绑定：
+# 调换 METHOD_COLORS 中的颜色时，对应线型会一起跟随该颜色。
+STYLE_BY_COLOR = {
+    style["color"]: style
+    for style in PLOT_STYLES
+}
+
+# =========================
+# 每个算法对应的颜色
+#
+# 以后如果只想调换颜色，只修改这里即可。
+# 使用脚本内部固定名称。
+# =========================
+METHOD_COLORS = {
+    "Uniform": "#8A8A8A",
+    "Fisher/K-FAC": "#A500A5",
+    "Fed-MoE": "#19C4C7",
+    "FedMoE-DA": "#F4BE00",
+    "SOMFed": "#1689D8",
+}
+
 
 # =========================
 # 图例显示名称
@@ -101,11 +122,21 @@ LEGEND_NAMES = {
 # =========================
 LEGEND_ORDER = [
     "Fisher/K-FAC",
-    "Uniform",
     "Fed-MoE",
+    "Uniform",
     "SOMFed",
     "FedMoE-DA",
 ]
+
+# =========================
+# 不绘制的算法
+#
+# 使用脚本内部固定名称。
+# 空集合表示全部绘制。
+# =========================
+HIDDEN_METHODS = {
+    "Uniform",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -392,6 +423,11 @@ def main() -> int:
     max_round = 0
 
     for index, (method, csv_path) in enumerate(selected):
+        label = friendly_method_name(method)
+
+        if label in HIDDEN_METHODS:
+            continue
+
         rounds, test_acc = read_test_acc(csv_path)
 
         if args.max_round is not None:
@@ -410,16 +446,17 @@ def main() -> int:
             test_acc = [item[1] for item in filtered]
 
         smoothed = moving_average(test_acc, args.window)
-        label = friendly_method_name(method)
 
-        style = PLOT_STYLES[index % len(PLOT_STYLES)]
+        fallback_style = PLOT_STYLES[index % len(PLOT_STYLES)]
+        color = METHOD_COLORS.get(label, fallback_style["color"])
+        style = STYLE_BY_COLOR.get(color, fallback_style)
 
         ax.plot(
             rounds,
             smoothed,
             linewidth=style["linewidth"],
             linestyle=style["linestyle"],
-            color=style["color"],
+            color=color,
             label=label,
             solid_capstyle="butt",
             dash_capstyle="butt",

@@ -18,28 +18,67 @@ METHODS = [
     {
         "name": "FedAvg-MoE",
         "values": [63.08, 78.38, 83.74, 86.29, 87.04],
-        "color": "#A000A0",
     },
     {
         "name": "SOMFed",
         "values": [63.09, 79.14, 84.23, 85.89, 87.23],
-        "color": "#8A8A8A",
     },
     {
         "name": "Fed-MoE",
         "values": [63.57, 78.34, 83.07, 86.17, 87.68],
-        "color": "#1689D8",
     },
     {
         "name": "FedMoE-DA",
         "values": [59.56, 76.96, 83.63, 86.08, 86.83],
-        "color": "#38C7CB",
     },
     {
         "name": "CurvFedMoE",
         "values": [70.25, 80.37, 85.72, 87.48, 88.45],
-        "color": "#FFD200",
     },
+]
+
+# ============================================================
+# 颜色配置
+#
+# 保持下面 5 种颜色不变时，
+# 以后只需要修改 METHOD_COLORS 中的对应关系即可调换颜色。
+# ============================================================
+COLORS = {
+    "purple": "#A000A0",
+    "gray": "#8A8A8A",
+    "blue": "#1689D8",
+    "cyan": "#38C7CB",
+    "yellow": "#FFD200",
+}
+
+METHOD_COLORS = {
+    "FedAvg-MoE": COLORS["gray"],
+    "SOMFed": COLORS["purple"],
+    "Fed-MoE": COLORS["blue"],
+    "FedMoE-DA": COLORS["cyan"],
+    "CurvFedMoE": COLORS["yellow"],
+}
+
+# ============================================================
+# 不绘制的算法
+# 空集合表示全部绘制
+# ============================================================
+HIDDEN_METHODS = {
+    "FedAvg-MoE",
+}
+
+# ============================================================
+# 图例显示顺序
+#
+# 两列图例下，下面的顺序会显示为：
+# CurvFedMoE    SOMFed
+# Fed-MoE       FedMoE-DA
+# ============================================================
+LEGEND_ORDER = [
+    "CurvFedMoE",
+    "Fed-MoE",
+    "SOMFed",
+    "FedMoE-DA",
 ]
 
 
@@ -126,6 +165,12 @@ def main() -> int:
         dtype=float,
     )
 
+    active_methods = [
+        method
+        for method in METHODS
+        if method["name"] not in HIDDEN_METHODS
+    ]
+
     # 参考图中 5 根柱子较紧凑，
     # 但柱子之间仍保留细小空隙。
     bar_width = 0.115
@@ -133,10 +178,10 @@ def main() -> int:
 
     offsets = (
         np.arange(
-            len(METHODS),
+            len(active_methods),
             dtype=float,
         )
-        - (len(METHODS) - 1) / 2.0
+        - (len(active_methods) - 1) / 2.0
     ) * bar_step
 
     fig, ax = plt.subplots(
@@ -147,12 +192,12 @@ def main() -> int:
     # 分组柱状图
     # ========================================================
 
-    for index, method in enumerate(METHODS):
+    for index, method in enumerate(active_methods):
         ax.bar(
             x + offsets[index],
             method["values"],
             width=bar_width,
-            color=method["color"],
+            color=METHOD_COLORS[method["name"]],
             edgecolor="black",
             linewidth=1.15,
             zorder=3,
@@ -239,19 +284,32 @@ def main() -> int:
     # 图例
     # ========================================================
 
+    legend_methods = [
+        next(
+            method
+            for method in active_methods
+            if method["name"] == name
+        )
+        for name in LEGEND_ORDER
+        if any(
+            method["name"] == name
+            for method in active_methods
+        )
+    ]
+
     legend_handles = [
         Patch(
-            facecolor=method["color"],
+            facecolor=METHOD_COLORS[method["name"]],
             edgecolor="black",
             linewidth=1.0,
             label=method["name"],
         )
-        for method in METHODS
+        for method in legend_methods
     ]
 
     legend_labels = [
         method["name"]
-        for method in METHODS
+        for method in legend_methods
     ]
 
     legend = ax.legend(
@@ -259,7 +317,7 @@ def main() -> int:
         labels=legend_labels,
 
         loc="upper right",
-        ncol=3,
+        ncol=2,
 
         frameon=True,
         fancybox=False,
