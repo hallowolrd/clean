@@ -3547,6 +3547,124 @@ class VGG11Backbone(nn.Module):
         return x.flatten(1)
 
 
+class VGG11075Backbone(nn.Module):
+    """
+    VGG11-0.75x backbone without BatchNorm.
+
+    This keeps the existing VGG11 topology unchanged and only scales every
+    convolutional channel width by 0.75:
+        48
+        M
+        96
+        M
+        192
+        192
+        M
+        384
+        384
+        M
+        384
+        384
+        M
+
+    Design choices are identical to VGG11Backbone:
+    - BatchNorm is not used.
+    - 28/32px inputs skip the final MaxPool to avoid excessive downsampling.
+    - 64/96px inputs keep all five MaxPool stages.
+    - AdaptiveAvgPool2d(1) gives a fixed 384-dimensional feature vector.
+
+    SparseMoEClassifier will automatically apply Linear(384, 512) before the
+    shared router/expert head, so the MoE parameterization remains unchanged.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        image_size: int = 32,
+    ) -> None:
+        super().__init__()
+
+        image_size = int(image_size)
+
+        layers: List[nn.Module] = []
+        current_channels = int(in_channels)
+
+        # VGG11 / configuration A with all convolution widths scaled by 0.75.
+        cfg: Sequence[int | str] = (
+            48,
+            "M",
+            96,
+            "M",
+            192,
+            192,
+            "M",
+            384,
+            384,
+            "M",
+            384,
+            384,
+            "M",
+        )
+
+        num_pools = 0
+
+        for item in cfg:
+            if item == "M":
+                num_pools += 1
+
+                # Keep the existing VGG11 small-image pooling rule unchanged.
+                if image_size <= 32 and num_pools == 5:
+                    continue
+
+                layers.append(
+                    nn.MaxPool2d(
+                        kernel_size=2,
+                        stride=2,
+                    )
+                )
+                continue
+
+            out_channels = int(item)
+
+            layers.append(
+                nn.Conv2d(
+                    current_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=True,
+                )
+            )
+            layers.append(
+                nn.ReLU(inplace=True)
+            )
+
+            current_channels = out_channels
+
+        self.features = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_dim = 384
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight,
+                    mode="fan_out",
+                    nonlinearity="relu",
+                )
+
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return x.flatten(1)
+
+
 class ViTTinyBlock(nn.Module):
     """Pre-norm Transformer encoder block for the small-image ViT-Tiny."""
 
@@ -4327,6 +4445,18 @@ def build_vgg11_backbone(
     )
 
 
+def build_vgg11_075_backbone(
+    *,
+    in_channels: int = 3,
+    image_size: int = 32,
+) -> VGG11075Backbone:
+    """Build the no-BN VGG11 backbone with 0.75x channel widths."""
+    return VGG11075Backbone(
+        in_channels=in_channels,
+        image_size=image_size,
+    )
+
+
 def build_vit_tiny_backbone(
     *,
     in_channels: int = 3,
@@ -4354,6 +4484,7 @@ def build_swin_tiny_backbone(
 BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
     DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
     "vgg11": build_vgg11_backbone,
+    "vgg11_075": build_vgg11_075_backbone,
     "vit_tiny": build_vit_tiny_backbone,
     "swin_tiny": build_swin_tiny_backbone,
 }
