@@ -12,13 +12,13 @@ SCRIPT_DIR="$PROJECT_ROOT/a"
 # ------------------------------------------------------------
 # 实验公共配置
 # ------------------------------------------------------------
-DATASET="cifar10"
-BACKBONE="resnet_cifar"
-ROUNDS=50
-ALPHA=0.3
+DATASET="cifar100"
+BACKBONE="vgg11_075"
+ROUNDS=100
+ALPHA=0.1
 SEED=0
 
-OUTPUT_DIR="$PROJECT_ROOT/outputs_tkfac/${DATASET}_${BACKBONE}_alpha03"
+OUTPUT_DIR="$PROJECT_ROOT/outputs_tkfac/${DATASET}_${BACKBONE}"
 LAUNCH_LOG_DIR="$OUTPUT_DIR/launcher_logs"
 
 # ------------------------------------------------------------
@@ -30,11 +30,10 @@ LAUNCH_LOG_DIR="$OUTPUT_DIR/launcher_logs"
 # 以后增删算法、修改 GPU 或算法专属参数，只需要改这里。
 # ------------------------------------------------------------
 EXPERIMENTS=(
-    "uniform|2|uniform.py|"
-    "fisher|2|tkfac_expert.py|"
-    "fed_moe|2|fed_moe_style_expert.py|"
-    "fedmoe_da|2|fedmoe_da_style_expert.py|"
-    "somfed|2|somfed_style_expert.py|"
+    "fisher|0|tkfac_expert.py|"
+    "fed_moe|0|fed_moe_style_expert.py|"
+    "fedmoe_da|1|fedmoe_da_style_expert.py|"
+    "somfed|1|somfed_style_expert.py|"
 )
 
 mkdir -p "$LAUNCH_LOG_DIR"
