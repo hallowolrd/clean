@@ -108,7 +108,7 @@ METHOD_COLORS = {
 # =========================
 LEGEND_NAMES = {
     "Uniform": "FedAvg-MoE",
-    "Fisher/K-FAC": "CurvFedMoE",
+    "Fisher/K-FAC": "GEA-FedMoE",
     "Fed-MoE": "Fed-MoE",
     "FedMoE-DA": "FedMoE-DA",
     "SOMFed": "SOMFed",
