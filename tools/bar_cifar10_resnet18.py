@@ -17,23 +17,23 @@ ALPHAS = [0.1, 0.2, 0.3, 0.4, 0.5]
 METHODS = [
     {
         "name": "FedAvg-MoE",
-        "values": [50.84, 56.10, 61.24, 62.73, 63.72],
+        "values": [62.93, 78.15, 82.71, 85.35, 86.50],
     },
     {
         "name": "SOMFed",
-        "values": [50.06, 56.10, 61.24, 62.73, 63.72],
+        "values": [60.94, 77.29, 82.51, 84.98, 86.03],
     },
     {
         "name": "Fed-MoE",
-        "values": [44.26, 50.96, 60.07, 63.68, 67.63],
+        "values": [58.26, 75.58, 80.61, 84.99, 86.30],
     },
     {
         "name": "FedMoE-DA",
-        "values": [48.32, 53.60, 57.44, 63.35, 62.69],
+        "values": [55.85, 75.60, 82.32, 84.42, 85.86],
     },
     {
         "name": "CurvFedMoE",
-        "values": [53.39, 57.31, 62.82, 67.05, 67.23],
+        "values": [69.49, 79.33, 85.09, 86.60, 87.48],
     },
 ]
 
@@ -43,6 +43,7 @@ METHODS = [
 # 保持下面 5 种颜色不变时，
 # 以后只需要修改 METHOD_COLORS 中的对应关系即可调换颜色。
 # ============================================================
+
 COLORS = {
     "purple": "#A000A0",
     "gray": "#8A8A8A",
@@ -63,8 +64,25 @@ METHOD_COLORS = {
 # 不绘制的算法
 # 空集合表示全部绘制
 # ============================================================
+
 HIDDEN_METHODS = {
     "FedAvg-MoE",
+}
+
+# ============================================================
+# 图例显示名称
+#
+# 左侧是脚本内部固定名称，不要改。
+# 以后如果只想修改图例里的显示名称，
+# 只需要修改右侧字符串即可。
+# ============================================================
+
+LEGEND_NAMES = {
+    "FedAvg-MoE": "FedAvg-MoE",
+    "SOMFed": "SOMFed",
+    "Fed-MoE": "Fed-MoE",
+    "FedMoE-DA": "FedMoE-DA",
+    "CurvFedMoE": "GEA-FedMoE",
 }
 
 # ============================================================
@@ -74,6 +92,7 @@ HIDDEN_METHODS = {
 # CurvFedMoE    SOMFed
 # Fed-MoE       FedMoE-DA
 # ============================================================
+
 LEGEND_ORDER = [
     "CurvFedMoE",
     "Fed-MoE",
@@ -87,7 +106,7 @@ LEGEND_ORDER = [
 # ============================================================
 
 OUTPUT_DIR = Path("./paper_pic/bar")
-OUTPUT_NAME = "cifar10_vittiny_dirichlet_best_accuracy_r40"
+OUTPUT_NAME = "cifar10_resnet18_dirichlet_best_accuracy_r40"
 
 
 # ============================================================
@@ -106,22 +125,18 @@ plt.rcParams.update(
             "DejaVu Serif",
         ],
         "mathtext.fontset": "stix",
-
         "font.size": 15,
         "axes.labelsize": 21,
         "xtick.labelsize": 18,
         "ytick.labelsize": 18,
         "legend.fontsize": 13,
-
         "axes.linewidth": 1.8,
-
         "xtick.direction": "in",
         "ytick.direction": "in",
         "xtick.major.width": 1.6,
         "ytick.major.width": 1.6,
         "xtick.major.size": 4.0,
         "ytick.major.size": 4.0,
-
         "legend.frameon": True,
     }
 )
@@ -227,10 +242,10 @@ def main() -> int:
     )
 
     # 与参考图一致
-    ax.set_ylim(40, 75)
+    ax.set_ylim(50, 98)
 
     ax.set_yticks(
-        [40, 50, 60, 70]
+        [50, 60, 70, 80, 90]
     )
 
     ax.set_xlim(
@@ -308,32 +323,29 @@ def main() -> int:
     ]
 
     legend_labels = [
-        method["name"]
+        LEGEND_NAMES.get(
+            method["name"],
+            method["name"],
+        )
         for method in legend_methods
     ]
 
     legend = ax.legend(
         handles=legend_handles,
         labels=legend_labels,
-
         loc="upper right",
         ncol=2,
-
         frameon=True,
         fancybox=False,
         framealpha=1.0,
-
         edgecolor="black",
         facecolor="white",
-
         borderpad=0.12,
         labelspacing=0.08,
         columnspacing=0.45,
-
         handlelength=0.50,
         handleheight=0.95,
         handletextpad=0.12,
-
         fontsize=12.5,
     )
 
